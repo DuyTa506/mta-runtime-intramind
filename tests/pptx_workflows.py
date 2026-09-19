@@ -24,3 +24,16 @@ async def checkpoint_context(ctx: TaskContext, inputs: dict) -> dict:
     context = await ctx.run_child(key="context", task_type="pptx.context/v1",
                                   task_queue=ctx.task_queue, inputs=prepared)
     return await ctx.activity("test.pptx.context-publish/v1", common | {"input": context}, key="publish")
+
+
+@durable_task(name="pptx-planning-checkpoint", version=1, policy=TaskPolicy(max_iterations=1))
+async def checkpoint_planning(ctx: TaskContext, inputs: dict) -> dict:
+    common = {"tenant_id": ctx.tenant_id}
+    prepared = await ctx.activity("pptx.prepare/v1", common | {
+        "input": inputs, "root_id": ctx.root_id, "configuration": ctx.configuration,
+        "started_at": ctx.started_at.isoformat()}, key="prepare")
+    context = await ctx.run_child(key="context", task_type="pptx.context/v1",
+                                  task_queue=ctx.task_queue, inputs=prepared)
+    plan = await ctx.run_child(key="planning", task_type="pptx.planning/v1",
+                              task_queue=ctx.task_queue, inputs=context)
+    return await ctx.activity("test.pptx.planning-publish/v1", common | {"input": plan}, key="publish")
