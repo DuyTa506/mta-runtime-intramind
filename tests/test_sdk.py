@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from intramind_runtime import sdk
 
@@ -64,6 +65,90 @@ async def test_attempt_policy_does_not_shorten_durable_wait_or_change_legacy_com
         assert command["attempt_timeout_seconds"] == seconds
     assert execute.await_args.kwargs["start_to_close_timeout"] == timedelta(hours=1)
     assert execute.await_args.kwargs["schedule_to_close_timeout"] == timedelta(hours=1)
+    assert "deadline" not in command
+
+
+async def test_operation_deadline_bounds_the_phase_wait_without_changing_attempt_timeout(
+    runtime_clock, monkeypatch
+):
+    now, _ = runtime_clock
+    ctx = context(now)
+    execute = AsyncMock(return_value={})
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+    deadline = now + timedelta(seconds=90)
+    await ctx.llm(
+        key="call", payload={"key": "payload", "sha256": "a" * 64, "size": 5},
+        model_profile="test", input_tokens_bound=10, max_output_tokens=20,
+        expected_cost=15, deadline=deadline,
+    )
+    assert datetime.fromisoformat(execute.await_args.args[1]["deadline"]) == deadline
+    assert execute.await_args.kwargs["start_to_close_timeout"] == timedelta(seconds=90)
+    assert execute.await_args.kwargs["schedule_to_close_timeout"] == timedelta(seconds=90)
+
+
+async def test_operation_deadline_failure_cannot_be_replayed_as_a_model_repair(
+    runtime_clock, monkeypatch
+):
+    ctx = context(runtime_clock[0])
+    failure = failed_activity(ApplicationError(
+        "operation_deadline_exceeded", type="OperationFailed", non_retryable=True))
+    monkeypatch.setattr(sdk.workflow, "execute_activity", AsyncMock(side_effect=failure))
+    with pytest.raises(sdk.OperationDeadlineExceeded):
+        await ctx.llm_outcome(
+            key="call", payload={"key": "payload", "sha256": "a" * 64, "size": 5},
+            model_profile="test", input_tokens_bound=10, max_output_tokens=20, expected_cost=15,
+        )
+
+
+async def test_unavailable_broker_cannot_extend_a_phase_or_trigger_model_repair(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    ctx = context(now)
+
+    async def execute(*args, **kwargs):
+        monkeypatch.setattr(sdk.workflow, "now", lambda: now + timedelta(seconds=90))
+        raise failed_activity(ActivityTimeoutError("timed out", type=None, last_heartbeat_details=[]))
+
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+    with pytest.raises(sdk.OperationDeadlineExceeded):
+        await ctx.llm_outcome(
+            key="call", payload={"key": "payload", "sha256": "a" * 64, "size": 5},
+            model_profile="test", input_tokens_bound=10, max_output_tokens=20, expected_cost=15,
+            deadline=now + timedelta(seconds=90),
+        )
+
+
+async def test_phase_activity_uses_one_absolute_deadline_across_attempts(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    ctx = context(now)
+    execute = AsyncMock(return_value={})
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+    deadline = now + timedelta(seconds=90)
+    await ctx.activity("search", {}, key="evidence", timeout_seconds=300, deadline=deadline)
+    assert execute.await_args.kwargs["schedule_to_close_timeout"] == timedelta(seconds=90)
+    assert execute.await_args.kwargs["start_to_close_timeout"] == timedelta(seconds=90)
+    monkeypatch.setattr(sdk.workflow, "now", lambda: now + timedelta(seconds=80))
+    await ctx.activity("search", {}, key="evidence-2", timeout_seconds=300, deadline=deadline)
+    assert execute.await_args.kwargs["schedule_to_close_timeout"] == timedelta(seconds=10)
+    with pytest.raises(sdk.OperationDeadlineExceeded):
+        await ctx.activity("search", {}, key="late", deadline=now)
+    assert execute.await_count == 2
+
+
+@pytest.mark.parametrize("elapsed", [10, 90])
+async def test_activity_timeout_is_a_phase_expiry_only_after_its_original_deadline(
+    runtime_clock, monkeypatch, elapsed
+):
+    now, _ = runtime_clock
+    ctx = context(now)
+
+    async def execute(*args, **kwargs):
+        monkeypatch.setattr(sdk.workflow, "now", lambda: now + timedelta(seconds=elapsed))
+        raise failed_activity(ActivityTimeoutError("timed out", type=None, last_heartbeat_details=[]))
+
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+    error = sdk.OperationDeadlineExceeded if elapsed == 90 else ActivityError
+    with pytest.raises(error):
+        await ctx.activity("search", {}, key="search", deadline=now + timedelta(seconds=90))
 
 
 async def test_configuration_survives_children_and_rollover(runtime_clock, monkeypatch):

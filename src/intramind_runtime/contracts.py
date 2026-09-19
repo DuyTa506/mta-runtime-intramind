@@ -73,8 +73,16 @@ class _OperationSpec(Contract):
     expected_cost: int = Field(gt=0)
     max_attempts: int = Field(default=3, ge=1, le=10)
     attempt_timeout_seconds: AttemptTimeout = DEFAULT_ATTEMPT_TIMEOUT_SECONDS
+    deadline: datetime | None = None
     capacity_profile_id: str | None = None
     required_capabilities: frozenset[str] = frozenset()
+
+    @field_validator("deadline")
+    @classmethod
+    def aware_deadline(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("operation deadline must include timezone")
+        return value
 
     @field_serializer("required_capabilities")
     def ordered_capabilities(self, value):

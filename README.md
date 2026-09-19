@@ -84,6 +84,21 @@ worker builds. Reservation now includes its derived `attempt_deadline`; no new
 database column is needed because attempt creation time, operation policy and
 root deadline are already durable.
 
+An optional absolute `deadline` on `ctx.llm`, `ctx.speech` and `ctx.activity`
+bounds a feature phase across queueing, retries and worker recovery. Derive it
+once from the workflow clock and reuse it for every effect in that phase.
+`OperationDeadlineExceeded` lets the feature apply its explicit timeout policy;
+it is never replayed as a model error that permits schema repair. A broker outage
+cannot extend this wait. Operations already submitted retain their ledger and
+deadline even when the waiting activity times out.
+
+Expiry marks the operation terminal while independently running compute remains
+accounted for. Late output is retained as `late_terminal`, usage settles once,
+and neither lease recovery nor a late result can resurrect the operation. Only
+confirmed not-sent work can refund its reservation. Calls without a phase deadline
+keep their prior activity command shape. This is a source contract addition;
+upgrade the API, broker and SDK together and retain pinned workers for old histories.
+
 Speech uses `TaskContext.speech` / `speech_outcome` with the same operation/attempt
 ledger, root attempt limit and resource-group admission. Its character budget is
 separate from LLM tokens: the trusted task catalog must allocate

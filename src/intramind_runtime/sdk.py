@@ -14,9 +14,14 @@ from typing import Any, NoReturn
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy, VersioningBehavior
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 with workflow.unsafe.imports_passed_through():
     from .contracts import Artifact, OperationSpec, SpeechOperationSpec
+
+
+class OperationDeadlineExceeded(TimeoutError):
+    """The operation has expired; backend cleanup and accounting may still be pending."""
 
 
 @dataclass(frozen=True)
@@ -102,19 +107,35 @@ class TaskContext:
         timeout_seconds: int = 300,
         max_attempts: int = 3,
         task_queue: str | None = None,
+        deadline: datetime | None = None,
     ) -> Any:
         if timeout_seconds <= 0 or not 1 <= max_attempts <= 100:
             raise ValueError("activity timeout and retry policy must be finite and positive")
+        remaining = self.remaining()
+        timeout = timedelta(seconds=timeout_seconds)
+        if deadline is not None:
+            if deadline.tzinfo is None:
+                raise ValueError("activity deadline must include timezone")
+            remaining = min(remaining, deadline - workflow.now())
+            if remaining.total_seconds() <= 0:
+                raise OperationDeadlineExceeded("activity deadline exceeded")
+            timeout = min(timeout, remaining)
         with self._command():
-            return await workflow.execute_activity(
-                name,
-                inputs,
-                activity_id=self.key(key),
-                task_queue=task_queue,
-                start_to_close_timeout=timedelta(seconds=timeout_seconds),
-                schedule_to_close_timeout=self.remaining(),
-                retry_policy=RetryPolicy(maximum_attempts=max_attempts),
-            )
+            try:
+                return await workflow.execute_activity(
+                    name,
+                    inputs,
+                    activity_id=self.key(key),
+                    task_queue=task_queue,
+                    start_to_close_timeout=timeout,
+                    schedule_to_close_timeout=remaining,
+                    retry_policy=RetryPolicy(maximum_attempts=max_attempts),
+                )
+            except ActivityError as exc:
+                if (deadline is not None and deadline <= workflow.now()
+                    and isinstance(exc.cause, ActivityTimeoutError)):
+                    raise OperationDeadlineExceeded("activity deadline exceeded") from exc
+                raise
 
     async def llm(
         self,
@@ -127,6 +148,7 @@ class TaskContext:
         expected_cost: int,
         capacity_profile_id: str | None = None,
         attempt_timeout_seconds: float | None = None,
+        deadline: datetime | None = None,
     ) -> dict[str, Any]:
         spec = OperationSpec(
             operation_id=self.key(key),
@@ -138,6 +160,7 @@ class TaskContext:
             max_output_tokens=max_output_tokens,
             expected_cost=expected_cost,
             capacity_profile_id=capacity_profile_id,
+            deadline=deadline,
             **(
                 {"attempt_timeout_seconds": attempt_timeout_seconds}
                 if attempt_timeout_seconds is not None else {}
@@ -147,11 +170,14 @@ class TaskContext:
         if attempt_timeout_seconds is None:
             # Existing histories omitted this policy field; keep that command shape.
             payload.pop("attempt_timeout_seconds")
+        if deadline is None:
+            payload.pop("deadline")
         return await self._inference("runtime.submit_or_attach_llm", payload)
 
     async def speech(
         self, *, key: str, payload: dict, model_profile: str, capacity_profile_id: str,
         characters_bound: int, expected_cost: int, attempt_timeout_seconds: float,
+        deadline: datetime | None = None,
     ) -> dict[str, Any]:
         """A speech operation inherits root identity and waits without holding a worker slot."""
         spec = SpeechOperationSpec(
@@ -159,8 +185,12 @@ class TaskContext:
             payload=Artifact.model_validate(payload), model_profile=model_profile,
             capacity_profile_id=capacity_profile_id, characters_bound=characters_bound,
             expected_cost=expected_cost, attempt_timeout_seconds=attempt_timeout_seconds,
+            deadline=deadline,
         )
-        return await self._inference("runtime.submit_or_attach_speech", spec.model_dump(mode="json"))
+        payload = spec.model_dump(mode="json")
+        if deadline is None:
+            payload.pop("deadline")
+        return await self._inference("runtime.submit_or_attach_speech", payload)
 
     async def speech_outcome(self, **request: Any) -> dict[str, Any]:
         """Permit the feature's voice fallback only after a terminal transport failure."""
@@ -175,18 +205,34 @@ class TaskContext:
             raise
 
     async def _inference(self, name: str, payload: dict) -> dict:
+        deadline = datetime.fromisoformat(payload["deadline"]) if payload.get("deadline") else None
+        remaining = self.remaining()
+        if deadline is not None:
+            remaining = min(remaining, deadline - workflow.now())
+            if remaining.total_seconds() <= 0:
+                raise OperationDeadlineExceeded("operation deadline exceeded")
         with self._command():
-            return await workflow.execute_activity(
-                name,
-                payload,
-                activity_id=payload["operation_id"],
-                task_queue=self.control_queue,
-                start_to_close_timeout=self.remaining(),
-                schedule_to_close_timeout=self.remaining(),
-                retry_policy=RetryPolicy(
-                    initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=30)
-                ),
-            )
+            try:
+                return await workflow.execute_activity(
+                    name,
+                    payload,
+                    activity_id=payload["operation_id"],
+                    task_queue=self.control_queue,
+                    start_to_close_timeout=remaining,
+                    schedule_to_close_timeout=remaining,
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=30)
+                    ),
+                )
+            except ActivityError as exc:
+                cause = exc.cause
+                if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
+                    and cause.message == "operation_deadline_exceeded"):
+                    raise OperationDeadlineExceeded(cause.message) from exc
+                if (deadline is not None and deadline <= workflow.now()
+                    and isinstance(cause, ActivityTimeoutError)):
+                    raise OperationDeadlineExceeded("operation deadline exceeded") from exc
+                raise
 
     async def run_child(
         self, *, task_type: str, task_queue: str, key: str, inputs: dict

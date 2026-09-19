@@ -7,7 +7,9 @@ from uuid import uuid4
 
 import pytest
 from conftest import pool, root, temporal_test_client
+from deadline_workflows import deadline_feature
 from fakes import IndependentEngine, MemoryArtifacts
+from feature_harness import feature_environment
 from temporalio.api.workflowservice.v1 import (
     SetWorkerDeploymentCurrentVersionRequest,
 )
@@ -21,6 +23,42 @@ from intramind_runtime.executor import Executor
 from intramind_runtime.temporal_adapter import BrokerActivities, OutboxPublisher
 
 pytestmark = pytest.mark.integration
+
+
+async def test_phase_expiry_completes_and_replays_while_backend_cleanup_is_pending(store):
+    gate, completed, jobs = asyncio.Event(), [], []
+
+    async def respond(reservation, payload):
+        async def compute():
+            await gate.wait()
+            completed.append(reservation.attempt_id)
+            return {"choices": [{"message": {"content": "late"}}]}
+
+        task = asyncio.create_task(compute())
+        jobs.append(task)
+        return await asyncio.shield(task)
+
+    try:
+        async with feature_environment(
+            store, name="deadline-contract", workflows=[deadline_feature],
+            build_activities=lambda factory: [], respond=respond,
+        ) as env:
+            status, _ = await env.submit({"messages": [{"role": "user", "content": "review"}]})
+            assert status["state"] == "PARTIAL"
+            assert status["terminal_reason"] == "assessment_timeout"
+            assert status["cleanup_pending"] and status["reserved"] == 30
+            assert len(env.calls) == 1 and completed == []
+            await env.replay(status["root_id"])
+            assert len(env.calls) == 1 and completed == []
+            gate.set()
+            await asyncio.gather(*jobs)
+            await store.confirm_epoch_stopped("p", "e1", "all isolated engine jobs joined")
+            state = await store.run(status["root_id"], "user:test")
+            assert state["state"] == "PARTIAL"
+            assert not state["cleanup_pending"] and state["spent"] == 30
+    finally:
+        gate.set()
+        await asyncio.gather(*jobs)
 
 
 async def test_real_temporal_async_completion_and_replay(store):
