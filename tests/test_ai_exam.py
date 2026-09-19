@@ -6,19 +6,23 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
-from feature_harness import feature_environment
+from feature_harness import feature_environment, peak_children
 
 pytestmark = pytest.mark.integration
 
 
-async def test_exam_replays_quality_gates_and_retries_export_without_new_inference(store, monkeypatch):
+async def test_exam_replays_quality_gates_and_retries_export_without_new_inference(
+    store, monkeypatch
+):
     if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
         pytest.skip("explicit AI dependency environment and opt-in required")
     from agents.exam_generation.durable.leaves import LEAVES
     from api.background.common.models import ModelActivities
     from api.background.exam import activities as exam_activities
     from api.background.exam.activities import ExamActivities
+    from api.background.exam.policy import ExamPolicy
     from api.background.exam.workflows import WORKFLOWS
+    from api.config import settings
     from api.services.exam.documents import ExamCorpus
     from tests.test_exam_generation.test_engine import DOC, _FakeLLM
 
@@ -51,23 +55,45 @@ async def test_exam_replays_quality_gates_and_retries_export_without_new_inferen
 
     def activities(factory):
         exam = ExamActivities(
-            factory, model_profile="test", source_loader=source, publication=publish,
+            factory,
+            model_profile="test",
+            source_loader=source,
+            publication=publish,
             embedder_factory=lambda: None,
-            template_directory=lambda: str(Path(__file__).resolve().parents[2] / "mta-ai-intramind/templates_docx"),
+            template_directory=lambda: str(
+                Path(__file__).resolve().parents[2] / "mta-ai-intramind/templates_docx"
+            ),
         )
         return [*exam.registered(), ModelActivities(factory, leaves=LEAVES).plan]
 
     async with feature_environment(
-        store, name="exam", workflows=WORKFLOWS, build_activities=activities, respond=respond,
+        store,
+        name="exam",
+        workflows=WORKFLOWS,
+        build_activities=activities,
+        respond=respond,
     ) as env:
-        status, result = await env.submit({
-            "document_ids": ["d1"], "mode": "quality", "n_questions": 6, "preset": "mcq_only",
-        })
+        monkeypatch.setattr(settings.exam, "generate_concurrency", 1)
+        monkeypatch.setattr(settings.exam, "verify_concurrency", 1)
+        policy = ExamPolicy.capture(settings.exam, "test").model_dump(mode="json")
+        monkeypatch.setattr(settings.exam, "enabled", False)
+        monkeypatch.setattr(settings.exam, "verify_concurrency", 8)
+        status, result = await env.submit(
+            {
+                "document_ids": ["d1"],
+                "mode": "quality",
+                "n_questions": 6,
+                "preset": "mcq_only",
+            },
+            configuration=policy,
+        )
         assert status["state"] in {"SUCCEEDED", "PARTIAL"}
         assert sources == [["d1"]]
         assert len(exports) == 2 and exports[0] == exports[1] == fake.calls
         assert len(publications) == 1
         assert len(env.calls) == fake.calls == result["llm_call_count"]
+        history = await env.temporal.get_workflow_handle(status["root_id"]).fetch_history()
+        assert peak_children(history) == 1
         assert fake.by_stage["evidence_verdict"] > 0
         assert fake.by_stage["blind_solve"] > 0
         assert result["artifact_id"] == "exam-artifact"

@@ -55,6 +55,15 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
+Submission may include a separate immutable `configuration` artifact selected by
+the trusted application. Request identity remains the input digest and submission
+key; concurrent retries retain the first committed configuration and one start
+event. `TaskContext.configuration` carries that reference through children and
+Continue-As-New. Keep enable flags and credentials outside this snapshot.
+`map_children(window=...)` bounds each feature phase within `TaskPolicy.child_window`;
+it does not reserve inference capacity. These additions require matching API/SDK
+builds and are not present in the previously published wheel.
+
 Service commands are `intramind-runtime api|worker|executor|outbox|reconciler|configure`.
 They require explicit `RUNTIME_*` configuration. An application installs matching
 schema migrations and provisions its namespace, storage bucket and pools before

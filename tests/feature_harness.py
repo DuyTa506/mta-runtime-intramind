@@ -24,6 +24,24 @@ from intramind_runtime.preparation import LlamaCppPromptSizer
 from intramind_runtime.temporal_adapter import BrokerActivities, OutboxPublisher
 
 
+def peak_children(history):
+    active, peak = 0, 0
+    for event in history.events:
+        if event.HasField("start_child_workflow_execution_initiated_event_attributes"):
+            active += 1
+            peak = max(active, peak)
+        elif any(
+            event.HasField(f"child_workflow_execution_{state}_event_attributes")
+            for state in ("completed", "failed", "canceled", "timed_out", "terminated")
+        ):
+            active -= 1
+        elif event.HasField("start_child_workflow_execution_failed_event_attributes"):
+            active -= 1
+        assert active >= 0
+    assert active == 0
+    return peak
+
+
 @asynccontextmanager
 async def feature_environment(
     store, *, name, workflows, build_activities, respond, allow_tool_calls=False
@@ -103,13 +121,14 @@ async def feature_environment(
             await executor.tick()
             await asyncio.sleep(0.01)
 
-    async def submit(source, *, tenant="user:test"):
+    async def submit(source, *, tenant="user:test", configuration=None):
         api = runtime_client(tenant)
         try:
             ref = await api.put_json(source)
-            result = await api.submit(
-                {"task_type": name + "/v1", "submission_key": uid, "input": ref}
-            )
+            submission = {"task_type": name + "/v1", "submission_key": uid, "input": ref}
+            if configuration is not None:
+                submission["configuration"] = await api.put_json(configuration)
+            result = await api.submit(submission)
             runs.append(result["run_id"])
             for _ in range(2000):
                 status = await api.get_run(result["run_id"])

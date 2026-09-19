@@ -6,17 +6,20 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
-from feature_harness import feature_environment
+from feature_harness import feature_environment, peak_children
 
 pytestmark = pytest.mark.integration
 
 
-async def test_teaching_both_retries_publication_without_repeating_generation_or_render(store, monkeypatch):
+async def test_teaching_both_retries_publication_without_repeating_generation_or_render(
+    store, monkeypatch
+):
     if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
         pytest.skip("explicit AI dependency environment and opt-in required")
     from agents.teaching_docs.durable.leaves import LEAVES
     from api.background.common.models import ModelActivities
     from api.background.teaching.activities import TeachingActivities
+    from api.background.teaching.policy import TeachingPolicy
     from api.background.teaching.workflows import WORKFLOWS
     from api.config import settings
     from api.services.teaching.documents import TeachingCorpus
@@ -63,7 +66,14 @@ async def test_teaching_both_retries_publication_without_repeating_generation_or
     async with feature_environment(
         store, name="teaching", workflows=WORKFLOWS, build_activities=activities, respond=respond
     ) as env:
-        status, result = await env.submit({"document_ids": ["d1"], "kind": "both"})
+        monkeypatch.setattr(settings.teaching, "map_concurrency", 1)
+        monkeypatch.setattr(settings.teaching, "module_concurrency", 1)
+        policy = TeachingPolicy.capture(settings.teaching, "test").model_dump(mode="json")
+        monkeypatch.setattr(settings.teaching, "enabled", False)
+        monkeypatch.setattr(settings.teaching, "module_concurrency", 8)
+        status, result = await env.submit(
+            {"document_ids": ["d1"], "kind": "both"}, configuration=policy
+        )
         assert status["state"] == "SUCCEEDED"
         assert len(result["artifacts"]) == 2
         assert len({item["artifact_id"] for item in result["artifacts"]}) == 2
@@ -71,6 +81,8 @@ async def test_teaching_both_retries_publication_without_repeating_generation_or
         assert len(publication_attempts) == 3
         assert source_reads == [["d1"]]
         assert len(env.calls) == len(fake.calls) == result["llm_call_count"]
+        history = await env.temporal.get_workflow_handle(status["root_id"]).fetch_history()
+        assert peak_children(history) == 1
         for item in result["artifacts"]:
             data = env.blobs.data[item["object_key"]]
             with ZipFile(BytesIO(data)) as document:

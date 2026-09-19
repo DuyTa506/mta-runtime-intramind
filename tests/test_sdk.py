@@ -44,6 +44,71 @@ def context(now: datetime, *, policy: sdk.TaskPolicy | None = None, **extra) -> 
     return sdk.TaskContext(envelope, policy or sdk.TaskPolicy(max_iterations=3))
 
 
+async def test_configuration_survives_children_and_rollover(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    ref = {"key": "config", "sha256": "a" * 64, "size": 5, "content_type": "application/json"}
+    ctx = context(now, configuration=ref)
+    assert ctx.configuration == ref
+    execute = AsyncMock(return_value={})
+    monkeypatch.setattr(sdk.workflow, "execute_child_workflow", execute)
+    await ctx.run_child(task_type="child/v1", task_queue="features", key="child", inputs={})
+    child = execute.await_args.args[1]
+    assert child["configuration"] == ref
+    assert sdk.TaskContext(child, ctx.policy).configuration == ref
+    rollover = MagicMock()
+    monkeypatch.setattr(sdk.workflow, "continue_as_new", rollover)
+    ctx.continue_as_new({"cursor": 1})
+    assert rollover.call_args.args[0]["configuration"] == ref
+
+
+@pytest.mark.parametrize("window,expected", [(1, 1), (3, 3), (8, 4), (None, 4)])
+async def test_feature_window_bounds_materialization_and_preserves_order(
+    runtime_clock, monkeypatch, window, expected
+):
+    now, _ = runtime_clock
+    ctx = context(now, policy=sdk.TaskPolicy(max_iterations=2, child_window=4))
+    active, peak = 0, 0
+
+    async def child(**kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.001)
+        active -= 1
+        return kwargs["inputs"]
+
+    monkeypatch.setattr(ctx, "run_child", child)
+    items = [{"index": i} for i in range(9)]
+    result = await ctx.map_children(
+        task_type="child/v1",
+        task_queue="features",
+        items=items,
+        item_key="index",
+        key="phase",
+        window=window,
+    )
+    assert result == items
+    assert peak == expected
+
+
+@pytest.mark.parametrize("window", [0, -1, True, 2.5])
+async def test_invalid_feature_window_cannot_start_children(runtime_clock, monkeypatch, window):
+    now, _ = runtime_clock
+    ctx = context(now)
+    child = AsyncMock()
+    monkeypatch.setattr(ctx, "run_child", child)
+    with pytest.raises(ValueError, match="window"):
+        await ctx.map_children(
+            task_type="child/v1",
+            task_queue="features",
+            items=[{"id": 1}],
+            item_key="id",
+            key="phase",
+            window=window,
+        )
+    child.assert_not_called()
+
+
 def test_child_identity_preserves_component_boundaries(runtime_clock):
     now, _ = runtime_clock
     nested = context(now, child_path=["section", "repair"])

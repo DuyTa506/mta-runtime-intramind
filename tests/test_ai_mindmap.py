@@ -4,7 +4,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from feature_harness import feature_environment
+from feature_harness import feature_environment, peak_children
 
 pytestmark = pytest.mark.integration
 
@@ -23,7 +23,7 @@ async def test_mindmap_replays_every_phase_with_no_source_or_inference_repeated(
     llm = MagicMock()
     llm.get_model_info.return_value = {"model_name": "test", "provider": "fake"}
     llm.agenerate = AsyncMock(side_effect=AssertionError("activity attempted inference"))
-    tool = MindmapTool(llm, {"context_window": 16384, "embedder": None})
+    tool = MindmapTool(llm, {"context_window": 16384, "embedder": None, "map_concurrency": 1})
     tool._get_document_text = AsyncMock(
         return_value="Báo cáo có thời hạn, trách nhiệm và ngoại lệ. " * 20
     )
@@ -37,6 +37,7 @@ async def test_mindmap_replays_every_phase_with_no_source_or_inference_repeated(
     )
 
     async def respond(reservation, payload):
+        tool.processor.config["map_concurrency"] = 16
         text = next(replies, "### Công việc\n#### Giữ đúng thời hạn và điều kiện phê duyệt")
         return {"choices": [{"message": {"content": text}}]}
 
@@ -54,6 +55,8 @@ async def test_mindmap_replays_every_phase_with_no_source_or_inference_repeated(
         assert set(result["formats"]) == {"markdown", "json", "mermaid", "html"}
         calls = len(env.calls)
         assert 3 <= calls <= 5
+        history = await env.temporal.get_workflow_handle(status["root_id"]).fetch_history()
+        assert peak_children(history) == 1
         await env.replay(status["root_id"])
         assert len(env.calls) == calls
         tool._get_document_text.assert_awaited_once_with("d")

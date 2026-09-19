@@ -19,6 +19,7 @@ class Submission(Contract):
     task_type: str = Field(min_length=1, max_length=120)
     submission_key: str = Field(min_length=1, max_length=200)
     input: Artifact
+    configuration: Artifact | None = None
 
 
 def create_app(
@@ -121,6 +122,10 @@ def create_app(
         if not request.input.key.startswith(tenant_prefix(tenant_id)):
             raise NotFound("input")
         await artifacts.get(request.input)
+        if request.configuration:
+            if not request.configuration.key.startswith(tenant_prefix(tenant_id)):
+                raise NotFound("configuration")
+            await artifacts.get(request.configuration)
         root_id = sha256(f"{tenant_id}\x00{request.submission_key}".encode()).hexdigest()
         deadline = datetime.now(UTC) + timedelta(seconds=definition["deadline_seconds"])
         root = RootSpec(
@@ -142,6 +147,8 @@ def create_app(
                 "input": request.input.model_dump(mode="json"),
             },
         }
+        if request.configuration:
+            spec["input"]["configuration"] = request.configuration.model_dump(mode="json")
         run_id = await store.submit_run(root, request.submission_key, request.input.sha256, spec)
         return {"task_id": run_id, "run_id": run_id, "status": "submitted", "owner": "temporal"}
 

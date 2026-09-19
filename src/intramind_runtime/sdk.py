@@ -40,6 +40,11 @@ class TaskContext:
     def __init__(self, envelope: dict, policy: TaskPolicy):
         self.root_id = envelope["root_id"]
         self.tenant_id = envelope["tenant_id"]
+        self.configuration = (
+            Artifact.model_validate(envelope["configuration"]).model_dump(mode="json")
+            if envelope.get("configuration")
+            else None
+        )
         child_path = envelope.get("child_path", [])
         if not isinstance(child_path, (list, tuple)):
             raise ValueError("child path must be a sequence of identity components")
@@ -161,6 +166,7 @@ class TaskContext:
                     "deadline": self.deadline.isoformat(),
                     "control_queue": self.control_queue,
                     "input": inputs,
+                    **({"configuration": self.configuration} if self.configuration else {}),
                 },
                 id=self.key(key),
                 task_queue=task_queue,
@@ -213,14 +219,28 @@ class TaskContext:
         raise AssertionError("model step did not return or exhaust its bound")
 
     async def map_children(
-        self, *, task_type: str, task_queue: str, items: list[dict], item_key: str, key: str
+        self,
+        *,
+        task_type: str,
+        task_queue: str,
+        items: list[dict],
+        item_key: str,
+        key: str,
+        window: int | None = None,
     ) -> list[dict[str, Any]]:
+        if window is not None and (type(window) is not int or window <= 0):
+            raise ValueError("child window must be a positive integer")
+        limit = (
+            min(window, self.policy.child_window)
+            if window is not None
+            else self.policy.child_window
+        )
         identities = [str(item[item_key]) for item in items]
         if len(set(identities)) != len(identities):
             raise ValueError("duplicate child identity")
         result = []
         # Only a window of child starts is materialized in history at a time.
-        for start in range(0, len(items), self.policy.child_window):
+        for start in range(0, len(items), limit):
             result.extend(
                 await asyncio.gather(
                     *(
@@ -230,7 +250,7 @@ class TaskContext:
                             key=json.dumps([key, identities[i]], ensure_ascii=False),
                             inputs=items[i],
                         )
-                        for i in range(start, min(start + self.policy.child_window, len(items)))
+                        for i in range(start, min(start + limit, len(items)))
                     )
                 )
             )
@@ -280,6 +300,7 @@ class TaskContext:
             "rollovers": self.rollovers + 1,
             "pending_events": self._events,
             "input": checkpoint,
+            **({"configuration": self.configuration} if self.configuration else {}),
         }
         if len(json.dumps(envelope, ensure_ascii=False).encode()) > 64 * 1024:
             raise ValueError("rollover manifest exceeds 64 KiB; persist large values as artifacts")

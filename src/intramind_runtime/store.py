@@ -29,6 +29,13 @@ def encode(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _submission_identity(spec: dict) -> dict:
+    # Configuration is chosen by the accepting service, not part of the caller's
+    # request identity. The first committed snapshot wins, even across a retry
+    # after deployment or a concurrent submit handled by another service replica.
+    return spec | {"input": {k: v for k, v in spec["input"].items() if k != "configuration"}}
+
+
 async def row(c: AsyncConnection, sql: str, **params):
     return (await c.execute(text(sql), params)).mappings().first()
 
@@ -104,7 +111,8 @@ class Store:
             old = await row(c, """SELECT * FROM runtime_submissions
                 WHERE tenant_id=:tenant AND submission_key=:key""", tenant=root.tenant_id, key=key)
             if old:
-                if old["input_digest"] != input_digest or old["spec"] != spec:
+                if (old["input_digest"] != input_digest
+                    or _submission_identity(old["spec"]) != _submission_identity(spec)):
                     raise RuntimeConflict("submission key/input conflict")
                 return old["run_id"]
             await self._root(c, root)
@@ -191,7 +199,7 @@ class Store:
         async with self.engine.connect() as c:
             root = await row(c, """SELECT r.root_id,r.state,r.deadline,r.reserved,r.spent,
                 r.budget_limit,r.cancel_requested,r.result,r.terminal_reason,r.finished_at,
-                s.spec->>'workflow_type' AS task_type
+                s.spec->>'workflow_type' AS task_type,s.input_digest
                 FROM runtime_roots r LEFT JOIN runtime_submissions s ON s.run_id=r.root_id
                 WHERE r.root_id=:id AND r.tenant_id=:tenant""", id=root_id, tenant=tenant_id)
             if not root:

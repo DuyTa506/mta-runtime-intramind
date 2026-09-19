@@ -13,6 +13,7 @@ import httpx
 import pytest
 from conftest import pool
 from fakes import MemoryArtifacts
+from feature_harness import peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
 from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
@@ -45,6 +46,7 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
     client = await Client.connect(address, namespace=namespace)
     blobs = MemoryArtifacts()
     settings = RewriteSettings()
+    settings.llm.concurrency = 1
     settings.limits.segment_target_chars = 200
     monkeypatch.setattr(rewrite_activities.config, "get_settings", lambda: settings)
     source = "\n\n".join(f"Đoạn văn số {i} trình bày công tác quản lý đô thị trên địa bàn phường "
@@ -75,6 +77,7 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
 
         async def execute(self, reservation, payload):
             self.calls.append(reservation.attempt_id)
+            settings.llm.concurrency = 16
             user = payload["messages"][-1]["content"]
             body = user.split('"""')[1].strip("\n")
             return EngineResult(body={"choices": [{"message": {"content": body}}]},
@@ -130,6 +133,7 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
                 handle = client.get_workflow_handle(submission["run_id"])
                 await asyncio.wait_for(handle.result(), timeout=10)
                 history = await handle.fetch_history()
+                assert peak_children(history) == 1
                 await Replayer(workflows=WORKFLOWS).replay_workflow(history)
                 for event in history.events:
                     if event.HasField("child_workflow_execution_started_event_attributes"):
