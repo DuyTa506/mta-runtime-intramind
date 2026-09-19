@@ -63,6 +63,11 @@ candidate and must not replace an earlier wheel
 under the same filename. Commit each passing phase, build immutable images from
 that commit, then deploy and smoke-test those images before the next phase.
 
+The AI translation integration suite exercises partial batch acceptance, finite
+repair, publication retry and Continue-As-New through real Temporal/PostgreSQL.
+It uses fake inference and the application's real Markdown parser/renderer;
+these tests do not declare a production migration or measured serving capacity.
+
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
 validated response formats and tool support. Persist it with agent planning state
