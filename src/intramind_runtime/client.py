@@ -58,13 +58,20 @@ class RuntimeClient:
         response.raise_for_status()
         return response.content
 
-    async def prepare(self, *, model_profile: str, payload: dict, max_output_tokens: int):
+    async def prepare(
+        self, *, model_profile: str, payload: dict, max_output_tokens: int,
+        attempt_timeout_seconds: float | None = None,
+    ):
         response = await self.client.post(
             "/v1/requests/prepare",
             json={
                 "model_profile": model_profile,
                 "payload": payload,
                 "max_output_tokens": max_output_tokens,
+                **(
+                    {"attempt_timeout_seconds": attempt_timeout_seconds}
+                    if attempt_timeout_seconds is not None else {}
+                ),
             },
         )
         response.raise_for_status()

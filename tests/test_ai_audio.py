@@ -36,6 +36,7 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         audio_overview_max_documents=5,
         audio_overview_high_quality_voice=False,
         audio_overview_tts_batch_size=1,
+        audio_overview_script_timeout_seconds=27.5,
     )
     monkeypatch.setattr(
         SummaryTool, "_init_tokenizer", lambda self: setattr(self, "tokenizer", None)
@@ -93,6 +94,8 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
 
     async def respond(reservation, payload):
         if reservation.operation.max_output_tokens == 12000:
+            assert reservation.operation.attempt_timeout_seconds == 27.5
+            config.audio_overview_script_timeout_seconds = 1
             reply = json.dumps(turns, ensure_ascii=False)
         else:
             reply = "Nội dung nén giữ đúng căn cứ và ngoại lệ của nguồn. " * 3

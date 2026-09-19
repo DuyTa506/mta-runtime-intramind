@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -13,6 +13,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+DEFAULT_ATTEMPT_TIMEOUT_SECONDS = 1800.0
+AttemptTimeout = Annotated[float, Field(gt=0, le=86400, allow_inf_nan=False, strict=True)]
 
 
 def digest(data: bytes) -> str:
@@ -68,6 +71,7 @@ class OperationSpec(Contract):
     max_output_tokens: int = Field(gt=0)
     expected_cost: int = Field(gt=0)
     max_attempts: int = Field(default=3, ge=1, le=10)
+    attempt_timeout_seconds: AttemptTimeout = DEFAULT_ATTEMPT_TIMEOUT_SECONDS
     capacity_profile_id: str | None = None
     required_capabilities: frozenset[str] = frozenset()
 
@@ -114,6 +118,14 @@ class Reservation(Contract):
     model_revision: str
     owner_id: str
     lease_epoch: int
+    attempt_deadline: datetime
+
+    @field_validator("attempt_deadline")
+    @classmethod
+    def aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("attempt deadline must include timezone")
+        return value
 
 
 class EngineResult(Contract):

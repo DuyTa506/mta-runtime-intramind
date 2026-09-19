@@ -160,7 +160,7 @@ class Store:
             old = await row(c, "SELECT spec FROM runtime_operations WHERE operation_id=:id",
                             id=spec.operation_id)
             if old:
-                if old["spec"] != spec.model_dump(mode="json"):
+                if OperationSpec.model_validate(old["spec"]) != spec:
                     raise RuntimeConflict("operation identity/input conflict")
                 return spec.operation_id
             root = await row(c, "SELECT * FROM runtime_roots WHERE root_id=:id AND tenant_id=:tenant",
@@ -231,7 +231,7 @@ class Store:
             # Tenant service history is aggregated first, so splitting a job
             # into many roots does not gain priority over another tenant.
             candidates = await rows(c, """SELECT o.*,r.spec AS root_spec,r.reserved,r.spent,
-                r.budget_limit,r.attempts AS root_attempts
+                r.budget_limit,r.attempts AS root_attempts,r.deadline AS root_deadline
                 FROM runtime_operations o JOIN runtime_roots r USING(root_id)
                 WHERE o.state IN ('READY','RETRY_WAIT') AND (o.retry_at IS NULL OR o.retry_at<=now())
                 AND r.state='RUNNING' AND NOT r.cancel_requested AND r.deadline>now()
@@ -269,10 +269,11 @@ class Store:
                     continue
                 attempt_id = str(uuid4())
                 number = candidate["attempts"] + 1
-                await execute(c, """INSERT INTO runtime_attempts
+                attempt = await row(c, """INSERT INTO runtime_attempts
                     (attempt_id,operation_id,pool_id,engine_epoch,attempt_number,owner_id,
-                     lease_epoch,lease_expires_at,budget_bound)
-                    VALUES (:id,:op,:pool,:epoch,:number,:owner,:fence,:lease,:bound)""",
+                     lease_epoch,lease_expires_at,budget_bound,created_at)
+                    VALUES (:id,:op,:pool,:epoch,:number,:owner,:fence,:lease,:bound,clock_timestamp())
+                    RETURNING created_at""",
                     id=attempt_id, op=spec.operation_id, pool=pool_id, epoch=pool["engine_epoch"],
                     number=number, fence=number, owner=owner_id, lease=datetime.now(UTC)+timedelta(seconds=self.lease_seconds),
                     bound=spec.budget_bound)
@@ -286,12 +287,15 @@ class Store:
                     bound=spec.budget_bound, clock=clock, id=spec.root_id)
                 return Reservation(attempt_id=attempt_id, operation=spec, pool_id=pool_id,
                     engine_epoch=pool["engine_epoch"], model_revision=pool["spec"]["model_revision"],
-                    owner_id=owner_id, lease_epoch=number)
+                    owner_id=owner_id, lease_epoch=number,
+                    attempt_deadline=min(candidate["root_deadline"], attempt["created_at"]
+                        + timedelta(seconds=spec.attempt_timeout_seconds)))
             return None
 
     async def _owned(self, c, reservation: Reservation):
         attempt = await row(c, """SELECT a.*,o.root_id,o.tenant_id,o.active_attempt,
-            o.state AS operation_state,r.cancel_requested,r.state AS root_state,r.deadline FROM runtime_attempts a
+            o.state AS operation_state,o.spec AS operation_spec,r.cancel_requested,
+            r.state AS root_state,r.deadline,clock_timestamp() AS observed_at FROM runtime_attempts a
             JOIN runtime_operations o USING(operation_id) JOIN runtime_roots r USING(root_id)
             WHERE a.attempt_id=:id""", id=reservation.attempt_id)
         if (not attempt or attempt["owner_id"] != reservation.owner_id
@@ -303,8 +307,10 @@ class Store:
     async def mark_send(self, reservation: Reservation):
         async with self.transaction() as c:
             a = await self._owned(c, reservation)
+            spec = OperationSpec.model_validate(a["operation_spec"])
+            deadline = min(a["deadline"], a["created_at"] + timedelta(seconds=spec.attempt_timeout_seconds))
             if (a["state"] != "RESERVED" or a["lease_expires_at"] <= datetime.now(UTC)
-                or a["cancel_requested"] or a["root_state"] != "RUNNING" or a["deadline"] <= datetime.now(UTC)):
+                or a["cancel_requested"] or a["root_state"] != "RUNNING" or deadline <= a["observed_at"]):
                 raise RuntimeConflict("attempt cannot send")
             await execute(c, """UPDATE runtime_attempts SET state='SEND_INTENT',send_intent_at=now()
                 WHERE attempt_id=:id""", id=reservation.attempt_id)

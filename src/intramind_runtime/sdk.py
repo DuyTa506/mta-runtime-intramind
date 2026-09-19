@@ -126,6 +126,7 @@ class TaskContext:
         max_output_tokens: int,
         expected_cost: int,
         capacity_profile_id: str | None = None,
+        attempt_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         spec = OperationSpec(
             operation_id=self.key(key),
@@ -137,11 +138,19 @@ class TaskContext:
             max_output_tokens=max_output_tokens,
             expected_cost=expected_cost,
             capacity_profile_id=capacity_profile_id,
+            **(
+                {"attempt_timeout_seconds": attempt_timeout_seconds}
+                if attempt_timeout_seconds is not None else {}
+            ),
         )
+        payload = spec.model_dump(mode="json")
+        if attempt_timeout_seconds is None:
+            # Existing histories omitted this policy field; keep that command shape.
+            payload.pop("attempt_timeout_seconds")
         with self._command():
             return await workflow.execute_activity(
                 "runtime.submit_or_attach_llm",
-                spec.model_dump(mode="json"),
+                payload,
                 activity_id=self.key(key),
                 task_queue=self.control_queue,
                 start_to_close_timeout=self.remaining(),

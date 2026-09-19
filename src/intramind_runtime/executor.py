@@ -5,6 +5,7 @@ import json
 import logging
 import random
 from contextlib import suppress
+from datetime import UTC, datetime
 
 from .artifacts import ArtifactPort
 from .contracts import RuntimeConflict
@@ -39,10 +40,20 @@ class Executor:
         heartbeat = asyncio.create_task(self._heartbeat(reservation))
         send_marked = False
         try:
-            payload = json.loads(await self.artifacts.get(reservation.operation.payload))
-            await self.store.mark_send(reservation)
-            send_marked = True
-            result = await self.driver.execute(reservation, payload)
+            remaining = (reservation.attempt_deadline - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                raise DriverFailure("attempt_deadline_exceeded", not_sent=True, retry=True)
+            try:
+                async with asyncio.timeout(remaining) as deadline:
+                    payload = json.loads(await self.artifacts.get(reservation.operation.payload))
+                    await self.store.mark_send(reservation)
+                    send_marked = True
+                    result = await self.driver.execute(reservation, payload)
+            except TimeoutError as exc:
+                raise DriverFailure(
+                    "attempt_deadline_exceeded" if deadline.expired() else "transport_timeout",
+                    not_sent=not send_marked, retry=not send_marked,
+                ) from exc
             # A completed inference is never retried to repair persistence.
             data = encode(result.model_dump(mode="json")).encode()
             termination_recorded = False

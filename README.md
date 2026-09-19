@@ -64,6 +64,24 @@ Continue-As-New. Keep enable flags and credentials outside this snapshot.
 it does not reserve inference capacity. These additions require matching API/SDK
 builds and are not present in the previously published wheel.
 
+`prepare(..., attempt_timeout_seconds=...)` carries a trusted total attempt limit
+outside the model payload. Values must be finite, positive numbers up to 86,400
+seconds. Existing operations without this field retain a 1,800-second default;
+the root deadline can shorten it. These are runtime bounds, not GPU capacity
+recommendations. Reservation time comes from PostgreSQL, and send intent rechecks
+expiry against its clock. The executor converts the remaining duration to an
+asyncio timer for payload loading and transport, then stops that timer before
+persisting a completed result. Transport timeouts remain separate limits.
+
+Expiry before transport permits retry/refund; expiry after send enters `UNKNOWN`
+and retains compute/budget accounting until termination is established. Neither
+the attempt deadline nor the worker lease proves that a backend has stopped.
+SDK calls without an explicit attempt limit retain the earlier activity command
+shape; new feature histories and policy schemas still require matching pinned
+worker builds. Reservation now includes its derived `attempt_deadline`; no new
+database column is needed because attempt creation time, operation policy and
+root deadline are already durable.
+
 Service commands are `intramind-runtime api|worker|executor|outbox|reconciler|configure`.
 They require explicit `RUNTIME_*` configuration. An application installs matching
 schema migrations and provisions its namespace, storage bucket and pools before

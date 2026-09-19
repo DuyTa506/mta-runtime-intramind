@@ -42,6 +42,7 @@ async def test_teaching_both_retries_publication_without_repeating_generation_or
         return "artifact-" + key
 
     async def respond(reservation, payload):
+        assert reservation.operation.attempt_timeout_seconds == 37
         messages = payload["messages"]
         text = await fake.agenerate(
             user_prompt=messages[-1]["content"],
@@ -68,9 +69,11 @@ async def test_teaching_both_retries_publication_without_repeating_generation_or
     ) as env:
         monkeypatch.setattr(settings.teaching, "map_concurrency", 1)
         monkeypatch.setattr(settings.teaching, "module_concurrency", 1)
+        monkeypatch.setattr(settings.teaching, "llm_timeout_seconds", 37)
         policy = TeachingPolicy.capture(settings.teaching, "test").model_dump(mode="json")
         monkeypatch.setattr(settings.teaching, "enabled", False)
         monkeypatch.setattr(settings.teaching, "module_concurrency", 8)
+        monkeypatch.setattr(settings.teaching, "llm_timeout_seconds", 1)
         status, result = await env.submit(
             {"document_ids": ["d1"], "kind": "both"}, configuration=policy
         )

@@ -46,6 +46,7 @@ async def test_exam_replays_quality_gates_and_retries_export_without_new_inferen
     monkeypatch.setattr(exam_activities, "_render", export)
 
     async def respond(reservation, payload):
+        assert reservation.operation.attempt_timeout_seconds == 29
         text = await fake.agenerate(
             user_prompt=payload["messages"][-1]["content"],
             system_prompt=payload["messages"][0]["content"],
@@ -75,9 +76,11 @@ async def test_exam_replays_quality_gates_and_retries_export_without_new_inferen
     ) as env:
         monkeypatch.setattr(settings.exam, "generate_concurrency", 1)
         monkeypatch.setattr(settings.exam, "verify_concurrency", 1)
+        monkeypatch.setattr(settings.exam.llm, "timeout_seconds", 29)
         policy = ExamPolicy.capture(settings.exam, "test").model_dump(mode="json")
         monkeypatch.setattr(settings.exam, "enabled", False)
         monkeypatch.setattr(settings.exam, "verify_concurrency", 8)
+        monkeypatch.setattr(settings.exam.llm, "timeout_seconds", 1)
         status, result = await env.submit(
             {
                 "document_ids": ["d1"],

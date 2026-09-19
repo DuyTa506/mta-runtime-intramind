@@ -10,13 +10,14 @@ import json
 import httpx
 from pydantic import Field
 
-from .contracts import AdmissionDenied, Contract
+from .contracts import AdmissionDenied, AttemptTimeout, Contract
 
 
 class PrepareRequest(Contract):
     model_profile: str = Field(min_length=1, max_length=120)
     payload: dict
     max_output_tokens: int = Field(gt=0, le=1_000_000)
+    attempt_timeout_seconds: AttemptTimeout | None = None
 
 
 class LlamaCppPromptSizer:
@@ -138,6 +139,10 @@ class LlamaCppPromptSizer:
             "max_output_tokens": request.max_output_tokens,
             "expected_cost": bound + min(request.max_output_tokens, self.expected_output),
             "capacity_profile_id": self.profile_id,
+            **(
+                {"attempt_timeout_seconds": request.attempt_timeout_seconds}
+                if request.attempt_timeout_seconds is not None else {}
+            ),
         }
 
 

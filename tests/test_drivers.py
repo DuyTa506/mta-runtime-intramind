@@ -1,6 +1,6 @@
 import httpx
 import pytest
-from conftest import operation
+from conftest import operation, root
 
 from intramind_runtime.contracts import Reservation
 from intramind_runtime.drivers import DriverFailure, OpenAICompletionDriver
@@ -8,7 +8,8 @@ from intramind_runtime.drivers import DriverFailure, OpenAICompletionDriver
 
 def reservation():
     return Reservation(attempt_id="attempt", operation=operation(), pool_id="pool", engine_epoch="e1",
-                       model_revision="model-1", owner_id="executor", lease_epoch=1)
+                       model_revision="model-1", owner_id="executor", lease_epoch=1,
+                       attempt_deadline=root().deadline)
 
 
 async def test_transport_never_retries_and_timeout_is_unknown():

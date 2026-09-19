@@ -47,6 +47,7 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
     blobs = MemoryArtifacts()
     settings = RewriteSettings()
     settings.llm.concurrency = 1
+    settings.llm.timeout_seconds = 13
     settings.limits.segment_target_chars = 200
     monkeypatch.setattr(rewrite_activities.config, "get_settings", lambda: settings)
     source = "\n\n".join(f"Đoạn văn số {i} trình bày công tác quản lý đô thị trên địa bàn phường "
@@ -74,10 +75,13 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
 
     class EchoEngine:
         calls = []
+        timeouts = []
 
         async def execute(self, reservation, payload):
             self.calls.append(reservation.attempt_id)
+            self.timeouts.append(reservation.operation.attempt_timeout_seconds)
             settings.llm.concurrency = 16
+            settings.llm.timeout_seconds = 1
             user = payload["messages"][-1]["content"]
             body = user.split('"""')[1].strip("\n")
             return EngineResult(body={"choices": [{"message": {"content": body}}]},
@@ -129,6 +133,7 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
                 assert result["segments_rewritten"] >= 2
                 assert result["segments_failed"] == 0
                 assert len(engine.calls) == result["llm_calls"]
+                assert engine.timeouts == [13] * result["llm_calls"]
                 before = len(engine.calls)
                 handle = client.get_workflow_handle(submission["run_id"])
                 await asyncio.wait_for(handle.result(), timeout=10)
@@ -142,6 +147,10 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
                         await Replayer(workflows=WORKFLOWS).replay_workflow(child_history)
                 assert len(engine.calls) == before
             finally:
+                with suppress(RPCError):
+                    handle = client.get_workflow_handle(submission["run_id"])
+                    if (await handle.describe()).close_time is None:
+                        await handle.terminate("disposable rewrite test cleanup")
                 work.cancel()
                 with suppress(asyncio.CancelledError):
                     await work

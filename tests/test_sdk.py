@@ -44,6 +44,28 @@ def context(now: datetime, *, policy: sdk.TaskPolicy | None = None, **extra) -> 
     return sdk.TaskContext(envelope, policy or sdk.TaskPolicy(max_iterations=3))
 
 
+@pytest.mark.parametrize("seconds", [None, 12.5])
+async def test_attempt_policy_does_not_shorten_durable_wait_or_change_legacy_command(
+    runtime_clock, monkeypatch, seconds
+):
+    now, _ = runtime_clock
+    ctx = context(now)
+    execute = AsyncMock(return_value={})
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+    ref = {"key": "payload", "sha256": "a" * 64, "size": 5}
+    await ctx.llm(
+        key="call", payload=ref, model_profile="test", input_tokens_bound=10,
+        max_output_tokens=20, expected_cost=15, attempt_timeout_seconds=seconds,
+    )
+    command = execute.await_args.args[1]
+    if seconds is None:
+        assert "attempt_timeout_seconds" not in command
+    else:
+        assert command["attempt_timeout_seconds"] == seconds
+    assert execute.await_args.kwargs["start_to_close_timeout"] == timedelta(hours=1)
+    assert execute.await_args.kwargs["schedule_to_close_timeout"] == timedelta(hours=1)
+
+
 async def test_configuration_survives_children_and_rollover(runtime_clock, monkeypatch):
     now, _ = runtime_clock
     ref = {"key": "config", "sha256": "a" * 64, "size": 5, "content_type": "application/json"}

@@ -2,6 +2,10 @@
 
 ## 0.1.0 — unreleased
 
+- Accepted configuration artifacts retained across retries, children and rollover.
+- Per-feature child windows bounded by the workflow's hard cap.
+- Total attempt deadlines derived from the ledger, preserving UNKNOWN accounting
+  after send and retaining completed output through persistence failures.
 - Durable task facade for activities, LLM operations, child workflows and waits.
 - Stable identities and root accounting across children and Continue-As-New.
 - PostgreSQL operation, attempt, reservation and budget ledger.
