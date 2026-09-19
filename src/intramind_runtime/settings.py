@@ -1,6 +1,8 @@
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .artifacts import MAX_ARTIFACT_BYTES
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RUNTIME_", extra="ignore")
@@ -11,6 +13,8 @@ class Settings(BaseSettings):
     minio_secret_key: SecretStr
     minio_bucket: str
     minio_secure: bool = True
+    artifact_max_bytes: int = Field(default=MAX_ARTIFACT_BYTES, gt=0, le=MAX_ARTIFACT_BYTES)
+    artifact_upload_concurrency: int = Field(default=2, ge=1, le=8)
     temporal_address: str = "temporal:7233"
     temporal_namespace: str = "intramind"
     temporal_queue: str = "intramind-control"

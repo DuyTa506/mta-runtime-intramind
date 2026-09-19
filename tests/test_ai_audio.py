@@ -33,7 +33,13 @@ async def test_audio_unknown_voice_does_not_fall_back_or_refund_on_cancel(store,
     await audio_case(store, monkeypatch, compress=False, high_quality=True, drop_response=True)
 
 
-async def audio_case(store, monkeypatch, *, compress, high_quality, drop_response=False):
+async def test_large_wav_fallback_persists_through_runtime_artifact_api(store, monkeypatch):
+    await audio_case(store, monkeypatch, compress=False, high_quality=False,
+                     wave_frames=5 * 1024 * 1024)
+
+
+async def audio_case(store, monkeypatch, *, compress, high_quality, drop_response=False,
+                     wave_frames=2400):
     if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
         pytest.skip("explicit AI dependency environment and opt-in required")
     from api.background.audio.activities import AudioActivities
@@ -82,7 +88,7 @@ async def audio_case(store, monkeypatch, *, compress, high_quality, drop_respons
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(24000)
-        wav.writeframes(b"\x00\x00" * 2400)
+        wav.writeframes(b"\x00\x00" * wave_frames)
 
     async def voice_response(request):
         body = json.loads(request.content)
@@ -152,7 +158,7 @@ async def audio_case(store, monkeypatch, *, compress, high_quality, drop_respons
         respond=respond,
         speech_profile=SpeechProfile(
             model_profile="test-voice", capacity_profile_id="voice-v1", character_limit=2000,
-            sample_rate=24000, max_audio_bytes=100_000,
+            sample_rate=24000, max_audio_bytes=max(100_000, len(buffer.getvalue())),
             voices={"vi_female", "vi_male", "vi_female_hq", "vi_male_hq"},
         ),
         respond_speech=voice_response,
@@ -211,6 +217,8 @@ async def audio_case(store, monkeypatch, *, compress, high_quality, drop_respons
                    for operation in voice_operations)
         assert len(encodings) == 2 and encodings[0] == encodings[1]
         assert uploads == [result["object_key"]]
+        if wave_frames > 2400:
+            assert len(stored[result["object_key"]]) > 16 * 1024 * 1024
         assert result["object_key"].startswith("audio-overviews/42/")
         with wave.open(BytesIO(stored[result["object_key"]]), "rb") as wav:
             assert wav.getnframes() > 0

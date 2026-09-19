@@ -31,6 +31,7 @@ neither replaces storage nor migrates buckets.
 | `executor` / `drivers` | One transport attempt and separate result persistence |
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
+| `uploads` | Bounded temporary files and concurrency for artifact ingestion |
 | `admin` | Namespace and pinned worker deployment administration |
 | `controller` | Pure feedback policy, requiring installation-specific telemetry/profiles |
 | `release_gate` | Application-supplied migration and qualification evidence validation |
@@ -109,6 +110,23 @@ accounting. Headers are termination evidence, not idempotency or remote fencing.
 There is no backend status/cancel API; unresolved compute still needs reconciliation.
 WAV bytes and their result manifest are immutable, separately recorded artifacts;
 persistence retry never synthesizes again. Binary data never enters workflow history.
+
+Artifact uploads stream into a temporary file before MinIO publication. JSON and
+`+json` media types retain a 16 MiB input limit; binary artifacts default to 128 MiB
+to cover long WAV fallback. `RUNTIME_ARTIFACT_MAX_BYTES` may lower the shared API
+and storage limit, and `RUNTIME_ARTIFACT_UPLOAD_CONCURRENCY` defaults to two uploads
+per API process. Excess uploads receive 503 with Retry-After before reading the
+body. Declared and received lengths are checked independently. MinIO multipart
+upload uses one part worker, and checksum verification reads fixed-size chunks.
+Temporary files and upload capacity are retained until storage I/O has stopped
+on cancellation; only verified objects produce a reference. Orphan immutable
+objects from lost responses still need the artifact retention/cleanup policy.
+
+Provision temporary storage for the configured simultaneous uploads (256 MiB at
+the defaults). If `/tmp` is a tmpfs, that space counts against container memory;
+this upload bound does not qualify download/render memory or GPU capacity. Custom
+`ArtifactPort` adapters must support seekable, caller-owned files via `put_file`.
+The existing published wheel does not include this contract extension.
 
 Service commands are `intramind-runtime api|worker|executor|outbox|reconciler|configure`.
 They require explicit `RUNTIME_*` configuration. An application installs matching

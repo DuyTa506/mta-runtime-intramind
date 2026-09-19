@@ -9,11 +9,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import Field
 
-from .artifacts import ArtifactPort, tenant_prefix
+from .artifacts import MAX_ARTIFACT_BYTES, ArtifactPort, tenant_prefix
 from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
 from .preparation import PrepareRequest
 from .speech import SpeechPrepareRequest
 from .store import Store, row
+from .uploads import ArtifactUploads
 
 
 class Submission(Contract):
@@ -33,6 +34,8 @@ def create_app(
     *,
     manage_lifecycle=False,
     speech_preparers=None,
+    artifact_max_bytes=MAX_ARTIFACT_BYTES,
+    artifact_upload_concurrency=2,
 ) -> FastAPI:
     if len(service_token) < 32:
         raise ValueError("service token must contain at least 32 characters")
@@ -50,6 +53,8 @@ def create_app(
                 await store.close()
 
     app = FastAPI(title="Intramind Runtime", version="0.1.0", lifespan=lifespan)
+    uploads = ArtifactUploads(artifacts, max_bytes=artifact_max_bytes,
+                              concurrency=artifact_upload_concurrency)
 
     async def tenant(request: Request):
         provided = request.headers.get("authorization", "")
@@ -117,15 +122,7 @@ def create_app(
 
     @app.post("/v1/artifacts", response_model=Artifact)
     async def upload(request: Request, tenant_id=Depends(tenant)):
-        chunks, size = [], 0
-        async for chunk in request.stream():
-            size += len(chunk)
-            if size > 16 * 1024 * 1024:
-                raise HTTPException(413, "input payload exceeds 16 MiB")
-            chunks.append(chunk)
-        return await artifacts.put(
-            tenant_id, b"".join(chunks), request.headers.get("content-type", "application/json")
-        )
+        return await uploads.receive(request, tenant_id)
 
     @app.post("/v1/artifacts/read")
     async def download(ref: Artifact, tenant_id=Depends(tenant)):

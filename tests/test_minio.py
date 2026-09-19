@@ -1,5 +1,7 @@
 import asyncio
 import os
+from hashlib import sha256
+from tempfile import TemporaryFile
 from uuid import uuid4
 
 import pytest
@@ -40,6 +42,17 @@ async def test_minio_roundtrip_checksum_and_tenant_isolation():
         finally:
             response.close()
             response.release_conn()
+        # A fallback WAV can exceed both the former HTTP and storage limits.
+        with TemporaryFile() as source:
+            checksum = sha256()
+            block = b"a" * (1024 * 1024)
+            for _ in range(65):
+                source.write(block)
+                checksum.update(block)
+            audio = await blobs.put_file("tenant-a", source, "audio/wav")
+            assert audio.size == 65 * 1024 * 1024
+            assert audio.sha256 == checksum.hexdigest()
+            assert sha256(await blobs.get(audio)).hexdigest() == audio.sha256
     finally:
         def cleanup():
             for obj in client.list_objects(bucket, recursive=True):

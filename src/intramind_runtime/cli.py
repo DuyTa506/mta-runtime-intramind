@@ -40,6 +40,7 @@ def artifacts(settings):
             secure=settings.minio_secure,
         ),
         settings.minio_bucket,
+        max_bytes=settings.artifact_max_bytes,
     )
 
 
@@ -221,6 +222,8 @@ def main():
             manage_lifecycle=True,
             speech_preparers={key: SpeechPreparer(profile)
                               for key, profile in speech_profiles(config).items()},
+            artifact_max_bytes=settings.artifact_max_bytes,
+            artifact_upload_concurrency=settings.artifact_upload_concurrency,
         )
         uvicorn.run(app, host="0.0.0.0", port=8070)
     else:

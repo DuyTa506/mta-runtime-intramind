@@ -2,6 +2,8 @@
 
 ## 0.1.0 — unreleased
 
+- Bounded file-based artifact uploads support 128 MiB binary results while retaining
+  the 16 MiB JSON limit, with incremental checksum verification and cancellation cleanup.
 - Speech operations with independent character budgets, shared root/group accounting,
   bounded WAV artifacts and a serving termination contract; migration `0002` retains
   legacy token reservations. Audio integration covers confirmed fallback and UNKNOWN cancellation.
