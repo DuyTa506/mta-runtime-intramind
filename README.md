@@ -83,8 +83,11 @@ designated-primary selection and root accounting across all replayed histories.
 `tests/test_ai_pptx_planning.py` extends reading through deck planning, recorded
 schema repair, split batches and publication retry. It replays every child and
 planning rollover, verifies retained policy/output limits and settled root usage.
-Model responses and artifact storage are fixtures; manuscript, audit, render and
-public PPTX cutover remain application migration work.
+`tests/test_ai_pptx_manuscript.py` qualifies manuscript waves, bounded native
+parse/audit repairs and a failed batch retaining the other slides. Lost join and
+publication acknowledgements, rollover and replay keep root usage settled without
+new inference. Model responses and artifact storage are fixtures; whole-deck
+audit, render and public PPTX cutover remain application migration work.
 
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
