@@ -11,11 +11,10 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from conftest import pool
+from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
 from feature_harness import peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
@@ -38,12 +37,9 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
     from api.background.rewrite.workflows import WORKFLOWS
     from api.config import RewriteSettings
 
-    address = os.environ["RUNTIME_TEST_TEMPORAL_ADDRESS"]
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("disposable loopback Temporal required")
-    uid, namespace = uuid4().hex, "intramind-runtime-test"
+    client = await temporal_test_client()
+    uid, namespace = uuid4().hex, client.namespace
     queue, token = "rewrite-test-" + uid, "rewrite-test-service-token-1234567890"
-    client = await Client.connect(address, namespace=namespace)
     blobs = MemoryArtifacts()
     settings = RewriteSettings()
     settings.llm.concurrency = 1

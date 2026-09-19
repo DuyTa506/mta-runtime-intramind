@@ -1,23 +1,19 @@
 """Two real Temporal histories share one inference operation and root budget."""
 
 import asyncio
-import os
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from conftest import pool, root
+from conftest import pool, root, temporal_test_client
 from fakes import IndependentEngine, MemoryArtifacts
-from google.protobuf.duration_pb2 import Duration
 from rollover_workflows import rollover_feature
 from temporalio.api.workflowservice.v1 import (
-    RegisterNamespaceRequest,
     SetWorkerDeploymentCurrentVersionRequest,
 )
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
-from temporalio.service import RPCError, RPCStatusCode
+from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 
 from intramind_runtime.executor import Executor
@@ -27,23 +23,8 @@ pytestmark = pytest.mark.integration
 
 
 async def test_rollover_attaches_operation_preserves_signal_and_replays_both_histories(store):
-    address = os.environ.get("RUNTIME_TEST_TEMPORAL_ADDRESS")
-    if not address:
-        pytest.skip("explicit disposable RUNTIME_TEST_TEMPORAL_ADDRESS required")
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("test requires a disposable loopback Temporal endpoint")
-    namespace = "intramind-runtime-test"
-    client = await Client.connect(address, namespace=namespace)
-    try:
-        await client.workflow_service.register_namespace(
-            RegisterNamespaceRequest(
-                namespace=namespace,
-                workflow_execution_retention_period=Duration(seconds=86400),
-            )
-        )
-    except RPCError as exc:
-        if exc.status != RPCStatusCode.ALREADY_EXISTS:
-            raise
+    client = await temporal_test_client()
+    namespace = client.namespace
 
     uid = uuid4().hex
     queue = "runtime-rollover-" + uid

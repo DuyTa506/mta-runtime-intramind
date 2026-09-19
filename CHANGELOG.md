@@ -2,6 +2,10 @@
 
 ## 0.1.0 — unreleased
 
+- Speech operations with independent character budgets, shared root/group accounting,
+  bounded WAV artifacts and a serving termination contract; migration `0002` retains
+  legacy token reservations. Audio integration covers confirmed fallback and UNKNOWN cancellation.
+- Per-session test namespaces avoid accumulating worker deployments against one namespace's limit.
 - Accepted configuration artifacts retained across retries, children and rollover.
 - Per-feature child windows bounded by the workflow's hard cap.
 - Total attempt deadlines derived from the ledger, preserving UNKNOWN accounting

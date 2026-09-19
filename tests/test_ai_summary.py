@@ -8,11 +8,10 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from conftest import pool
+from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
 from feature_harness import peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
@@ -37,12 +36,9 @@ async def test_summary_children_retry_publication_without_repeating_inference(
     from api.background.summary.workflows import WORKFLOWS
     from tools.summary import SummaryTool
 
-    address = os.environ["RUNTIME_TEST_TEMPORAL_ADDRESS"]
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("disposable loopback Temporal required")
-    namespace, uid = "intramind-runtime-test", uuid4().hex
+    client = await temporal_test_client()
+    namespace, uid = client.namespace, uuid4().hex
     queue, token = "summary-test-" + uid, "summary-test-service-token-1234567890"
-    client = await Client.connect(address, namespace=namespace)
     blobs = MemoryArtifacts()
     spec = pool(target=1).model_copy(update={"context_limit": 16384})
     await store.configure_pool(spec, 1)

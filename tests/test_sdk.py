@@ -83,6 +83,43 @@ async def test_configuration_survives_children_and_rollover(runtime_clock, monke
     assert rollover.call_args.args[0]["configuration"] == ref
 
 
+async def test_speech_command_uses_original_root_identity_and_durable_wait(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    ctx = context(now, child_path=["clips", "3"])
+    execute = AsyncMock(return_value={"key": "result"})
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+    result = await ctx.speech(
+        key="voice", payload={"key": "payload", "sha256": "a" * 64, "size": 5},
+        model_profile="voice", capacity_profile_id="voice-v1", characters_bound=30,
+        expected_cost=30, attempt_timeout_seconds=25,
+    )
+    assert result == {"key": "result"}
+    name, command = execute.await_args.args
+    assert name == "runtime.submit_or_attach_speech"
+    assert command["root_id"] == "root" and command["tenant_id"] == "tenant"
+    assert command["operation_id"] == ctx.key("voice") and command["kind"] == "speech"
+    assert "max_output_tokens" not in command
+    assert execute.await_args.kwargs["start_to_close_timeout"] == timedelta(hours=1)
+
+
+@pytest.mark.parametrize("reason,allowed", [
+    ("speech_backend_503", True), ("speech_backend_500", True), ("max_attempts", True),
+    ("root_budget_exhausted", False), ("root_attempt_budget", False),
+    ("capacity_profile_changed", False), ("deadline_exceeded", False),
+])
+async def test_speech_fallback_does_not_swallow_root_or_compatibility_failure(
+    runtime_clock, monkeypatch, reason, allowed
+):
+    ctx = context(runtime_clock[0])
+    failure = failed_activity(ApplicationError(reason, type="OperationFailed", non_retryable=True))
+    monkeypatch.setattr(ctx, "speech", AsyncMock(side_effect=failure))
+    if allowed:
+        assert await ctx.speech_outcome() == {"error": reason}
+    else:
+        with pytest.raises(ActivityError):
+            await ctx.speech_outcome()
+
+
 @pytest.mark.parametrize("window,expected", [(1, 1), (3, 3), (8, 4), (None, 4)])
 async def test_feature_window_bounds_materialization_and_preserves_order(
     runtime_clock, monkeypatch, window, expected

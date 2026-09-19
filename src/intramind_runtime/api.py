@@ -12,6 +12,7 @@ from pydantic import Field
 from .artifacts import ArtifactPort, tenant_prefix
 from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
 from .preparation import PrepareRequest
+from .speech import SpeechPrepareRequest
 from .store import Store, row
 
 
@@ -31,6 +32,7 @@ def create_app(
     preparers=None,
     *,
     manage_lifecycle=False,
+    speech_preparers=None,
 ) -> FastAPI:
     if len(service_token) < 32:
         raise ValueError("service token must contain at least 32 characters")
@@ -71,6 +73,23 @@ def create_app(
     @app.exception_handler(RuntimeConflict)
     async def conflict(request, exc):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.get("/v1/speech/profiles/{model_profile}")
+    async def speech_profile(model_profile: str, tenant_id=Depends(tenant)):
+        preparer = (speech_preparers or {}).get(model_profile)
+        if preparer is None:
+            raise HTTPException(503, "no qualified speech profile")
+        return preparer.profile.model_dump(mode="json")
+
+    @app.post("/v1/speech/prepare")
+    async def prepare_speech(request: SpeechPrepareRequest, tenant_id=Depends(tenant)):
+        preparer = (speech_preparers or {}).get(request.model_profile)
+        if preparer is None:
+            raise HTTPException(503, "no qualified speech profile")
+        try:
+            return await preparer.prepare(request, artifacts, tenant_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @app.exception_handler(AdmissionDenied)
     async def denied(request, exc):
@@ -133,6 +152,7 @@ def create_app(
             tenant_id=tenant_id,
             deadline=deadline,
             budget_limit=definition["budget_limit"],
+            resource_budgets=definition.get("resource_budgets", {}),
             priority=definition.get("priority", "background"),
         )
         # Stable submit intent excludes wall-clock deadline; retries attach to

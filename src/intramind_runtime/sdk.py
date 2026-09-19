@@ -16,7 +16,7 @@ from temporalio.common import RetryPolicy, VersioningBehavior
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from .contracts import Artifact, OperationSpec
+    from .contracts import Artifact, OperationSpec, SpeechOperationSpec
 
 
 @dataclass(frozen=True)
@@ -147,11 +147,39 @@ class TaskContext:
         if attempt_timeout_seconds is None:
             # Existing histories omitted this policy field; keep that command shape.
             payload.pop("attempt_timeout_seconds")
+        return await self._inference("runtime.submit_or_attach_llm", payload)
+
+    async def speech(
+        self, *, key: str, payload: dict, model_profile: str, capacity_profile_id: str,
+        characters_bound: int, expected_cost: int, attempt_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """A speech operation inherits root identity and waits without holding a worker slot."""
+        spec = SpeechOperationSpec(
+            operation_id=self.key(key), root_id=self.root_id, tenant_id=self.tenant_id,
+            payload=Artifact.model_validate(payload), model_profile=model_profile,
+            capacity_profile_id=capacity_profile_id, characters_bound=characters_bound,
+            expected_cost=expected_cost, attempt_timeout_seconds=attempt_timeout_seconds,
+        )
+        return await self._inference("runtime.submit_or_attach_speech", spec.model_dump(mode="json"))
+
+    async def speech_outcome(self, **request: Any) -> dict[str, Any]:
+        """Permit the feature's voice fallback only after a terminal transport failure."""
+        try:
+            return {"result": await self.speech(**request)}
+        except ActivityError as exc:
+            cause = exc.cause
+            if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
+                and cause.message in {"speech_backend_400", "speech_backend_500",
+                                      "speech_backend_503", "max_attempts"}):
+                return {"error": cause.message}
+            raise
+
+    async def _inference(self, name: str, payload: dict) -> dict:
         with self._command():
             return await workflow.execute_activity(
-                "runtime.submit_or_attach_llm",
+                name,
                 payload,
-                activity_id=self.key(key),
+                activity_id=payload["operation_id"],
                 task_queue=self.control_queue,
                 start_to_close_timeout=self.remaining(),
                 schedule_to_close_timeout=self.remaining(),

@@ -16,12 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from .contracts import (
     AdmissionDenied,
     Artifact,
+    InferenceOperation,
+    InferencePool,
     NotFound,
-    OperationSpec,
     PoolSpec,
     Reservation,
     RootSpec,
     RuntimeConflict,
+    parse_operation,
+    parse_pool,
 )
 
 
@@ -87,7 +90,7 @@ class Store:
         existing = await row(c, "SELECT * FROM runtime_roots WHERE root_id=:id", id=spec.root_id)
         data = spec.model_dump(mode="json")
         if existing:
-            if existing["spec"] != data:
+            if RootSpec.model_validate(existing["spec"]) != spec:
                 raise RuntimeConflict("root identity/input conflict")
             return
         limits = await row(c, "SELECT * FROM runtime_authority WHERE id=1")
@@ -101,6 +104,9 @@ class Store:
             VALUES (:id,:tenant,CAST(:spec AS jsonb),:deadline,:budget,:priority)""",
             id=spec.root_id, tenant=spec.tenant_id, spec=encode(data),
             deadline=spec.deadline, budget=spec.budget_limit, priority=spec.priority)
+        for unit, limit in spec.resource_budgets.items():
+            await execute(c, """INSERT INTO runtime_resource_budgets(root_id,unit,budget_limit)
+                VALUES (:root,:unit,:limit)""", root=spec.root_id, unit=unit, limit=limit)
 
     async def create_root(self, spec: RootSpec):
         async with self.transaction() as c:
@@ -124,7 +130,7 @@ class Store:
             await self._event(c, f"start:{root.root_id}", "start_workflow", root.root_id, intent)
             return root.root_id
 
-    async def configure_pool(self, spec: PoolSpec, group_ceiling: int):
+    async def configure_pool(self, spec: InferencePool, group_ceiling: int):
         if group_ceiling <= 0:
             raise ValueError("group ceiling must be positive")
         async with self.transaction() as c:
@@ -148,11 +154,12 @@ class Store:
                             ELSE runtime_pools.health END,
                 group_id=EXCLUDED.group_id, envelope_version=runtime_pools.envelope_version+1""",
                 id=spec.pool_id, g=spec.group_id, spec=spec.model_dump_json(), epoch=spec.engine_epoch,
-                target=spec.target, ceiling=spec.hard_ceiling, context=spec.context_limit,
+                target=spec.target, ceiling=spec.hard_ceiling,
+                context=spec.context_limit if isinstance(spec, PoolSpec) else 0,
                 model=spec.model_profile, until=spec.valid_until)
             await self._wake(c)
 
-    async def submit_operation(self, spec: OperationSpec):
+    async def submit_operation(self, spec: InferenceOperation):
         from .artifacts import tenant_prefix
         if not spec.payload.key.startswith(tenant_prefix(spec.tenant_id)):
             raise NotFound("payload")
@@ -160,7 +167,7 @@ class Store:
             old = await row(c, "SELECT spec FROM runtime_operations WHERE operation_id=:id",
                             id=spec.operation_id)
             if old:
-                if OperationSpec.model_validate(old["spec"]) != spec:
+                if parse_operation(old["spec"]) != spec:
                     raise RuntimeConflict("operation identity/input conflict")
                 return spec.operation_id
             root = await row(c, "SELECT * FROM runtime_roots WHERE root_id=:id AND tenant_id=:tenant",
@@ -169,6 +176,9 @@ class Store:
                 raise NotFound("root")
             if root["cancel_requested"] or root["state"] != "RUNNING" or root["deadline"] <= datetime.now(UTC):
                 raise AdmissionDenied("root is not eligible")
+            if (spec.budget_unit != "tokens"
+                and spec.budget_unit not in root["spec"].get("resource_budgets", {})):
+                raise AdmissionDenied(f"root has no accepted {spec.budget_unit} budget")
             count = await row(c, """SELECT count(*) FILTER(WHERE root_id=:root) AS root_pending,
                 count(*) AS total FROM runtime_operations
                 WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')""", root=spec.root_id)
@@ -209,8 +219,12 @@ class Store:
             cleanup = await row(c, """SELECT count(*) AS n FROM runtime_attempts a
                 JOIN runtime_operations o USING(operation_id) WHERE o.root_id=:id
                 AND (a.compute_held OR a.budget_held)""", id=root_id)
+            budgets = await rows(c, """SELECT unit,budget_limit,reserved,spent
+                FROM runtime_resource_budgets WHERE root_id=:id""", id=root_id)
             return dict(root) | {"operations": {x["state"]: x["n"] for x in counts},
-                                 "cleanup_pending": cleanup["n"] > 0}
+                "cleanup_pending": cleanup["n"] > 0,
+                "resource_budgets": {b["unit"]: {"limit": b["budget_limit"],
+                    "reserved": b["reserved"], "spent": b["spent"]} for b in budgets}}
 
     async def reserve_next(self, pool_id: str, owner_id: str) -> Reservation | None:
         """Called only by an idle executor; no downstream worker queue."""
@@ -218,6 +232,7 @@ class Store:
             pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id", id=pool_id)
             if not pool or pool["health"] != "HEALTHY" or pool["valid_until"] <= datetime.now(UTC):
                 return None
+            profile = parse_pool(pool["spec"])
             group = await row(c, "SELECT * FROM runtime_groups WHERE group_id=:id", id=pool["group_id"])
             used = await row(c, """SELECT count(*) AS group_used,
                 count(*) FILTER(WHERE a.pool_id=:pool) AS pool_used FROM runtime_attempts a
@@ -236,31 +251,41 @@ class Store:
                 WHERE o.state IN ('READY','RETRY_WAIT') AND (o.retry_at IS NULL OR o.retry_at<=now())
                 AND r.state='RUNNING' AND NOT r.cancel_requested AND r.deadline>now()
                 AND o.spec->>'model_profile'=:model
+                AND COALESCE(o.spec->>'kind','llm')=:kind
                 AND (o.spec->>'capacity_profile_id' IS NULL OR o.spec->>'capacity_profile_id'=:profile)
-                AND (o.spec->>'input_tokens_bound')::bigint+(o.spec->>'max_output_tokens')::bigint<=:context
+                AND CASE WHEN :kind='speech' THEN (o.spec->>'characters_bound')::bigint
+                    ELSE (o.spec->>'input_tokens_bound')::bigint+(o.spec->>'max_output_tokens')::bigint
+                    END<=:request_limit
                 AND CAST(:capabilities AS jsonb) @> (o.spec->'required_capabilities')
                 ORDER BY (r.priority=:preferred) DESC,
                 (SELECT COALESCE(max(r2.last_served),0) FROM runtime_roots r2
                  WHERE r2.tenant_id=r.tenant_id),r.last_served,o.created_at,o.operation_id LIMIT 64""",
                 model=pool["model_profile"], preferred=preferred, profile=pool["spec"]["profile_id"],
-                context=pool["context_limit"], capabilities=encode(pool["spec"]["capabilities"]))
+                kind=profile.kind, request_limit=profile.request_limit,
+                capabilities=encode(pool["spec"]["capabilities"]))
             for candidate in candidates:
-                spec = OperationSpec.model_validate(candidate["spec"])
+                spec = parse_operation(candidate["spec"])
                 if spec.capacity_profile_id and spec.capacity_profile_id != pool["spec"]["profile_id"]:
                     continue
                 reason = None
                 if not spec.required_capabilities.issubset(pool["spec"]["capabilities"]):
                     continue
-                if spec.budget_bound > pool["context_limit"]:
+                if spec.budget_bound > profile.request_limit:
                     # Another compatible pool may fit: don't fail on this pool's view.
+                    continue
+                budget = candidate if spec.budget_unit == "tokens" else await row(c,
+                    "SELECT * FROM runtime_resource_budgets WHERE root_id=:root AND unit=:unit",
+                    root=spec.root_id, unit=spec.budget_unit)
+                if budget is None:
+                    await self._terminal(c, spec.operation_id, "FAILED", "resource_budget_missing")
                     continue
                 if candidate["attempts"] >= spec.max_attempts:
                     reason = "max_attempts"
                 elif candidate["root_attempts"] >= candidate["root_spec"]["max_attempts"]:
                     reason = "root_attempt_budget"
-                elif candidate["spent"] + spec.budget_bound > candidate["budget_limit"]:
+                elif budget["spent"] + spec.budget_bound > budget["budget_limit"]:
                     reason = "root_budget_exhausted"
-                elif candidate["spent"] + candidate["reserved"] + spec.budget_bound > candidate["budget_limit"]:
+                elif budget["spent"] + budget["reserved"] + spec.budget_bound > budget["budget_limit"]:
                     await execute(c, "UPDATE runtime_operations SET wait_reason='root_budget' WHERE operation_id=:id",
                                   id=spec.operation_id)
                     continue
@@ -271,12 +296,12 @@ class Store:
                 number = candidate["attempts"] + 1
                 attempt = await row(c, """INSERT INTO runtime_attempts
                     (attempt_id,operation_id,pool_id,engine_epoch,attempt_number,owner_id,
-                     lease_epoch,lease_expires_at,budget_bound,created_at)
-                    VALUES (:id,:op,:pool,:epoch,:number,:owner,:fence,:lease,:bound,clock_timestamp())
+                     lease_epoch,lease_expires_at,budget_bound,budget_unit,created_at)
+                    VALUES (:id,:op,:pool,:epoch,:number,:owner,:fence,:lease,:bound,:unit,clock_timestamp())
                     RETURNING created_at""",
                     id=attempt_id, op=spec.operation_id, pool=pool_id, epoch=pool["engine_epoch"],
                     number=number, fence=number, owner=owner_id, lease=datetime.now(UTC)+timedelta(seconds=self.lease_seconds),
-                    bound=spec.budget_bound)
+                    bound=spec.budget_bound, unit=spec.budget_unit)
                 await execute(c, """UPDATE runtime_operations SET state='EXECUTING',attempts=:n,
                     active_attempt=:attempt,wait_reason=NULL WHERE operation_id=:id""",
                     n=number, attempt=attempt_id, id=spec.operation_id)
@@ -284,7 +309,12 @@ class Store:
                 await execute(c, "UPDATE runtime_authority SET dispatch_clock=:n WHERE id=1", n=clock)
                 await execute(c, """UPDATE runtime_roots SET reserved=reserved+:bound,
                     attempts=attempts+1,last_served=:clock WHERE root_id=:id""",
-                    bound=spec.budget_bound, clock=clock, id=spec.root_id)
+                    bound=spec.budget_bound if spec.budget_unit == "tokens" else 0,
+                    clock=clock, id=spec.root_id)
+                if spec.budget_unit != "tokens":
+                    await execute(c, """UPDATE runtime_resource_budgets SET reserved=reserved+:bound
+                        WHERE root_id=:root AND unit=:unit""",
+                        root=spec.root_id, unit=spec.budget_unit, bound=spec.budget_bound)
                 return Reservation(attempt_id=attempt_id, operation=spec, pool_id=pool_id,
                     engine_epoch=pool["engine_epoch"], model_revision=pool["spec"]["model_revision"],
                     owner_id=owner_id, lease_epoch=number,
@@ -307,7 +337,7 @@ class Store:
     async def mark_send(self, reservation: Reservation):
         async with self.transaction() as c:
             a = await self._owned(c, reservation)
-            spec = OperationSpec.model_validate(a["operation_spec"])
+            spec = parse_operation(a["operation_spec"])
             deadline = min(a["deadline"], a["created_at"] + timedelta(seconds=spec.attempt_timeout_seconds))
             if (a["state"] != "RESERVED" or a["lease_expires_at"] <= datetime.now(UTC)
                 or a["cancel_requested"] or a["root_state"] != "RUNNING" or deadline <= a["observed_at"]):
@@ -344,18 +374,28 @@ class Store:
         await execute(c, """UPDATE runtime_attempts SET budget_held=false,usage=:usage,
             usage_estimated=:estimated WHERE attempt_id=:id""",
             id=a["attempt_id"], usage=charged, estimated=usage is None)
-        await execute(c, """UPDATE runtime_roots SET reserved=reserved-:bound,spent=spent+:usage,
-            state=CASE WHEN spent+:usage>budget_limit AND state='RUNNING' THEN 'FAILED' ELSE state END,
-            terminal_reason=CASE WHEN spent+:usage>budget_limit AND state='RUNNING'
-                THEN 'observed_usage_exceeds_budget' ELSE terminal_reason END,
-            finished_at=CASE WHEN spent+:usage>budget_limit AND state='RUNNING' THEN now() ELSE finished_at END
-            WHERE root_id=:root""", root=a["root_id"], bound=a["budget_bound"], usage=charged)
+        if a["budget_unit"] == "tokens":
+            budget = await row(c, """UPDATE runtime_roots
+                SET reserved=reserved-:bound,spent=spent+:usage WHERE root_id=:root
+                RETURNING spent,budget_limit""", root=a["root_id"], bound=a["budget_bound"], usage=charged)
+        else:
+            budget = await row(c, """UPDATE runtime_resource_budgets
+                SET reserved=reserved-:bound,spent=spent+:usage WHERE root_id=:root AND unit=:unit
+                RETURNING spent,budget_limit""", root=a["root_id"], unit=a["budget_unit"],
+                bound=a["budget_bound"], usage=charged)
+        if budget is None:
+            raise RuntimeConflict("attempt budget ledger missing")
+        if budget["spent"] > budget["budget_limit"]:
+            await execute(c, """UPDATE runtime_roots SET state='FAILED',
+                terminal_reason='observed_usage_exceeds_budget',finished_at=now()
+                WHERE root_id=:root AND state='RUNNING'""", root=a["root_id"])
         if charged > a["budget_bound"]:
             await execute(c, "UPDATE runtime_pools SET target=0,health='DEGRADED' WHERE pool_id=:id",
                           id=a["pool_id"])
         await self._wake(c)
 
-    async def commit_result(self, reservation: Reservation, artifact: Artifact, usage: int | None):
+    async def commit_result(self, reservation: Reservation, artifact: Artifact, usage: int | None,
+                            *, attachments: tuple[Artifact, ...] = ()):
         async with self.transaction() as c:
             a = await self._owned(c, reservation)
             if a["state"] == "RESULT_COMMITTED":
@@ -367,11 +407,15 @@ class Store:
             if a["compute_held"] or a["state"] != "BACKEND_FINISHED":
                 raise RuntimeConflict("backend termination must be recorded first")
             cancelled = a["cancel_requested"] or a["operation_state"] == "CANCELLED" or a["root_state"] != "RUNNING"
-            await execute(c, """INSERT INTO runtime_artifacts
-                (object_key,tenant_id,operation_id,attempt_id,manifest,disposition)
-                VALUES (:key,:tenant,:op,:attempt,CAST(:manifest AS jsonb),:disposition)""",
-                key=artifact.key, tenant=a["tenant_id"], op=a["operation_id"], attempt=a["attempt_id"],
-                manifest=artifact.model_dump_json(), disposition="late_cancelled" if cancelled else "result")
+            from .artifacts import tenant_prefix
+            for ref in (artifact, *attachments):
+                if not ref.key.startswith(tenant_prefix(a["tenant_id"])):
+                    raise NotFound("result")
+                await execute(c, """INSERT INTO runtime_artifacts
+                    (object_key,tenant_id,operation_id,attempt_id,manifest,disposition)
+                    VALUES (:key,:tenant,:op,:attempt,CAST(:manifest AS jsonb),:disposition)""",
+                    key=ref.key, tenant=a["tenant_id"], op=a["operation_id"], attempt=a["attempt_id"],
+                    manifest=ref.model_dump_json(), disposition="late_cancelled" if cancelled else "result")
             await self._settle(c, a, usage)
             await execute(c, """UPDATE runtime_attempts SET state='RESULT_COMMITTED',
                 result_committed_at=now() WHERE attempt_id=:id""", id=a["attempt_id"])
@@ -611,17 +655,19 @@ class Store:
                 WHERE state IN ('READY','RETRY_WAIT') ORDER BY created_at LIMIT 256""")
             pools = await rows(c, "SELECT spec FROM runtime_pools")
             for op in ready:
-                spec = OperationSpec.model_validate(op["spec"])
-                compatible = [p["spec"] for p in pools
+                spec = parse_operation(op["spec"])
+                compatible = [parse_pool(p["spec"]) for p in pools
                               if p["spec"]["model_profile"] == spec.model_profile
+                              and p["spec"].get("kind", "llm") == spec.kind
                               and spec.required_capabilities.issubset(p["spec"]["capabilities"])]
                 if compatible and spec.capacity_profile_id:
-                    if not any(p["profile_id"] == spec.capacity_profile_id for p in compatible):
+                    if not any(p.profile_id == spec.capacity_profile_id for p in compatible):
                         await self._terminal(c, op["operation_id"], "FAILED", "capacity_profile_changed")
                         continue
-                    compatible = [p for p in compatible if p["profile_id"] == spec.capacity_profile_id]
-                if compatible and all(p["context_limit"] < spec.budget_bound for p in compatible):
-                    await self._terminal(c, op["operation_id"], "FAILED", "context_exceeds_all_pools")
+                    compatible = [p for p in compatible if p.profile_id == spec.capacity_profile_id]
+                if compatible and all(p.request_limit < spec.budget_bound for p in compatible):
+                    await self._terminal(c, op["operation_id"], "FAILED",
+                        "context_exceeds_all_pools" if spec.kind == "llm" else "request_exceeds_all_pools")
             await execute(c, """UPDATE runtime_roots SET state='FAILED',terminal_reason='deadline_exceeded',
                 finished_at=now() WHERE state='RUNNING' AND deadline<=now()""")
             terminal = await rows(c, """SELECT o.operation_id FROM runtime_operations o

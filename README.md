@@ -29,6 +29,7 @@ neither replaces storage nor migrates buckets.
 | `temporal_adapter` | Idempotent submit/attach, asynchronous completion and outbox delivery |
 | `store` | Atomic tenant/root admission, attempts, reservations, fencing and budgets |
 | `executor` / `drivers` | One transport attempt and separate result persistence |
+| `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
 | `admin` | Namespace and pinned worker deployment administration |
 | `controller` | Pure feedback policy, requiring installation-specific telemetry/profiles |
@@ -82,6 +83,33 @@ worker builds. Reservation now includes its derived `attempt_deadline`; no new
 database column is needed because attempt creation time, operation policy and
 root deadline are already durable.
 
+Speech uses `TaskContext.speech` / `speech_outcome` with the same operation/attempt
+ledger, root attempt limit and resource-group admission. Its character budget is
+separate from LLM tokens: the trusted task catalog must allocate
+`resource_budgets: {"speech_characters": <positive limit>}`. Missing allocation is
+rejected, and retries/fallback do not receive a new root budget. Migration `0002`
+adds the resource ledger and labels existing attempts as `tokens`; it preserves
+their active reservations. Install it before starting the new runtime processes.
+
+A speech pool declares `admission.kind="speech"` and `character_limit` instead
+of `context_limit`. The pool's `speech` configuration contains
+`validated_profile_id`, `termination_contract="termination-v1"`, `sample_rate`,
+`max_audio_bytes` and the allowed `voices`. The validated profile ID must match
+the admission profile. `base_url` belongs to this deployment configuration;
+`api_key_env` is optional for an isolated, unauthenticated serving deployment.
+Pool/group ceilings and profile limits require measurement; no speech capacity
+is enabled by the example configuration.
+
+The consuming app checkpoints `GET /v1/speech/profiles/{model_profile}`, then uses
+`prepare_speech` with that profile ID and its captured attempt timeout. Changed
+profiles fail explicitly. The driver requires the serving response to echo its
+attempt ID, `X-Intramind-TTS-Contract: termination-v1` and a compute state of
+`not_started` or `terminated`. Unconfirmed responses/timeouts retain UNKNOWN
+accounting. Headers are termination evidence, not idempotency or remote fencing.
+There is no backend status/cancel API; unresolved compute still needs reconciliation.
+WAV bytes and their result manifest are immutable, separately recorded artifacts;
+persistence retry never synthesizes again. Binary data never enters workflow history.
+
 Service commands are `intramind-runtime api|worker|executor|outbox|reconciler|configure`.
 They require explicit `RUNTIME_*` configuration. An application installs matching
 schema migrations and provisions its namespace, storage bucket and pools before
@@ -118,6 +146,10 @@ Tests use a dedicated `runtime_test` database, a test namespace, unique
 workflow queues and temporary buckets. They never reset the development
 `runtime_dev` database. Run `make integration` serially against a given test DB.
 Application feature tests stay opt-in in the consuming application's environment.
+Each pytest session creates a fresh `intramind-runtime-test-*` namespace so retained
+worker deployments do not exhaust a previous session's limit. Set
+`RUNTIME_TEST_TEMPORAL_NAMESPACE` to a name with that prefix when retaining an
+explicit qualification run. Prior histories are not deleted.
 
 The MinIO image is a compatibility test fixture pinned to the existing installation's
 binary, fetched from the official Quay mirror. It is not a production version recommendation:

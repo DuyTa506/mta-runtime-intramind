@@ -1,26 +1,24 @@
 """Disposable Temporal/Postgres feature harness with actual broker accounting."""
 
 import asyncio
-import os
 from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
-import pytest
-from conftest import pool
+from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 
 from intramind_runtime.api import create_app
 from intramind_runtime.client import RuntimeClient
-from intramind_runtime.contracts import EngineResult
+from intramind_runtime.contracts import EngineResult, SpeechPoolSpec
 from intramind_runtime.executor import Executor
 from intramind_runtime.preparation import LlamaCppPromptSizer
+from intramind_runtime.speech import ServingSpeechDriver, SpeechPreparer
 from intramind_runtime.temporal_adapter import BrokerActivities, OutboxPublisher
 
 
@@ -44,17 +42,29 @@ def peak_children(history):
 
 @asynccontextmanager
 async def feature_environment(
-    store, *, name, workflows, build_activities, respond, allow_tool_calls=False
+    store, *, name, workflows, build_activities, respond, allow_tool_calls=False,
+    speech_profile=None, respond_speech=None,
 ):
-    address = os.environ.get("RUNTIME_TEST_TEMPORAL_ADDRESS", "")
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("disposable loopback Temporal required")
-    namespace, uid = "intramind-runtime-test", uuid4().hex
+    temporal = await temporal_test_client()
+    namespace, uid = temporal.namespace, uuid4().hex
     queue, token = name + "-" + uid, "test-runtime-feature-token-1234567890"
-    temporal = await Client.connect(address, namespace=namespace)
     blobs, calls, runs = MemoryArtifacts(), [], []
     spec = pool(target=1).model_copy(update={"context_limit": 16384})
     await store.configure_pool(spec, 1)
+    speech_driver, speech_executor, speech_preparers = None, None, {}
+    if speech_profile is not None:
+        assert respond_speech is not None
+        await store.configure_pool(SpeechPoolSpec(
+            pool_id="voice", group_id="cpu", engine_epoch="voice-e1",
+            profile_id=speech_profile.capacity_profile_id,
+            model_profile=speech_profile.model_profile, model_revision="voice-model-1",
+            hard_ceiling=1, target=1, character_limit=speech_profile.character_limit,
+            valid_until=spec.valid_until,
+        ), 1)
+        speech_driver = ServingSpeechDriver("http://voice/", speech_profile, client=httpx.AsyncClient(
+            base_url="http://voice/", transport=httpx.MockTransport(respond_speech)))
+        speech_executor = Executor(store, blobs, speech_driver, "voice", "voice-executor-" + uid)
+        speech_preparers = {speech_profile.model_profile: SpeechPreparer(speech_profile)}
 
     async def tokenize(request):
         return httpx.Response(200, json={"prompt": "test template", "tokens": [1] * 10})
@@ -75,10 +85,12 @@ async def feature_environment(
         blobs,
         token,
         {
-            name + "/v1": {"deadline_seconds": 120, "budget_limit": 1000000, "task_queue": queue},
+            name + "/v1": {"deadline_seconds": 120, "budget_limit": 1000000, "task_queue": queue,
+                           "resource_budgets": {"speech_characters": 100000} if speech_profile else {}},
         },
         queue,
         {"test": preparer},
+        speech_preparers=speech_preparers,
     )
 
     def runtime_client(tenant):
@@ -107,7 +119,8 @@ async def feature_environment(
         temporal,
         task_queue=queue,
         workflows=workflows,
-        activities=[broker.submit_or_attach, broker.finish, *build_activities(runtime_client)],
+        activities=[broker.submit_or_attach, broker.submit_speech, broker.finish,
+                    *build_activities(runtime_client)],
         deployment_config=WorkerDeploymentConfig(
             version=version,
             use_worker_versioning=True,
@@ -119,6 +132,8 @@ async def feature_environment(
         while True:
             await publisher.tick()
             await executor.tick()
+            if speech_executor:
+                await speech_executor.tick()
             await asyncio.sleep(0.01)
 
     async def submit(source, *, tenant="user:test", configuration=None):
@@ -186,3 +201,5 @@ async def feature_environment(
             with suppress(asyncio.CancelledError):
                 await work
             await sizing.aclose()
+            if speech_driver:
+                await speech_driver.close()

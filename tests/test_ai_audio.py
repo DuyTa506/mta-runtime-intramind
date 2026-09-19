@@ -1,22 +1,39 @@
 """Real Temporal episode recovery with fake inference, voice and publication."""
 
+import asyncio
 import json
 import os
 import wave
+from contextlib import suppress
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
+import httpx
 import pytest
 from feature_harness import feature_environment
+from temporalio.service import RPCError
+
+from intramind_runtime.speech import SpeechProfile
+from intramind_runtime.store import rows
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("compress", [False, True])
+@pytest.mark.parametrize("high_quality", [False, True])
 async def test_audio_retries_encoding_and_publication_without_repeating_completed_work(
-    store, monkeypatch, compress
+    store, monkeypatch, compress, high_quality
 ):
+    await audio_case(store, monkeypatch, compress=compress, high_quality=high_quality)
+
+
+async def test_audio_unknown_voice_does_not_fall_back_or_refund_on_cancel(store, monkeypatch):
+    await audio_case(store, monkeypatch, compress=False, high_quality=True, drop_response=True)
+
+
+async def audio_case(store, monkeypatch, *, compress, high_quality, drop_response=False):
     if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
         pytest.skip("explicit AI dependency environment and opt-in required")
     from api.background.audio.activities import AudioActivities
@@ -34,9 +51,10 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         audio_overview_context_window=4096,
         audio_overview_context_margin=1024,
         audio_overview_max_documents=5,
-        audio_overview_high_quality_voice=False,
+        audio_overview_high_quality_voice=high_quality,
         audio_overview_tts_batch_size=1,
         audio_overview_script_timeout_seconds=27.5,
+        tts_timeout_seconds=23.5,
     )
     monkeypatch.setattr(
         SummaryTool, "_init_tokenizer", lambda self: setattr(self, "tokenizer", None)
@@ -66,13 +84,18 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         wav.setframerate(24000)
         wav.writeframes(b"\x00\x00" * 2400)
 
-    class Voice:
-        async def asynth(self, text, **options):
-            voice_calls.append((text, options))
-            return buffer.getvalue(), 100
-
-        async def aclose(self):
-            pass
+    async def voice_response(request):
+        body = json.loads(request.content)
+        voice_calls.append(body)
+        if drop_response:
+            raise httpx.ReadTimeout("backend termination was not observed")
+        headers = {"X-Intramind-Attempt-ID": request.headers["X-Intramind-Attempt-ID"],
+                   "X-Intramind-TTS-Contract": "termination-v1"}
+        if body["voice"].get("voice_id"):
+            return httpx.Response(503, headers=headers | {"X-Intramind-Compute-State": "not_started"})
+        return httpx.Response(200, content=buffer.getvalue(), headers=headers | {
+            "X-Intramind-Compute-State": "terminated", "Content-Type": "audio/wav",
+        })
 
     class Episodes:
         def open(self, key):
@@ -96,6 +119,7 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         if reservation.operation.max_output_tokens == 12000:
             assert reservation.operation.attempt_timeout_seconds == 27.5
             config.audio_overview_script_timeout_seconds = 1
+            config.tts_timeout_seconds = 1
             reply = json.dumps(turns, ensure_ascii=False)
         else:
             reply = "Nội dung nén giữ đúng căn cứ và ngoại lệ của nguồn. " * 3
@@ -105,9 +129,9 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         audio = AudioActivities(
             factory,
             model_profile="test",
+            speech_profile="test-voice",
             config_factory=lambda: config,
             summary_factory=lambda: summary,
-            voice_factory=Voice,
             storage_factory=Episodes,
             encoder=encode,
         )
@@ -126,23 +150,65 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         workflows=[*AUDIO_WORKFLOWS, *SUMMARY_WORKFLOWS],
         build_activities=activities,
         respond=respond,
+        speech_profile=SpeechProfile(
+            model_profile="test-voice", capacity_profile_id="voice-v1", character_limit=2000,
+            sample_rate=24000, max_audio_bytes=100_000,
+            voices={"vi_female", "vi_male", "vi_female_hq", "vi_male_hq"},
+        ),
+        respond_speech=voice_response,
     ) as env:
         source = (
             {"document_ids": ["0", "1"]}
             if compress
             else {"text": "Nguồn đầy đủ và có căn cứ cần đọc chính xác. " * 30}
         )
-        status, result = await env.submit(
-            {
-                **source,
-                "mode": "podcast",
-                "target_minutes": 1,
-                "conversation_id": "42",
-            }
-        )
+        source |= {"mode": "podcast", "target_minutes": 1, "conversation_id": "42"}
+        if drop_response:
+            api = env.runtime_client("user:test")
+            accepted = await api.submit({"task_type": "audio-overview/v1",
+                "submission_key": uuid4().hex, "input": await api.put_json(source)})
+            handle = env.temporal.get_workflow_handle(accepted["run_id"])
+            try:
+                async with asyncio.timeout(10):
+                    while True:
+                        status = await api.get_run(accepted["run_id"])
+                        if status["operations"].get("RECONCILING"):
+                            break
+                        await asyncio.sleep(0.02)
+                await asyncio.sleep(0.1)
+                assert len(voice_calls) == 1
+                assert status["state"] == "RUNNING" and status["cleanup_pending"]
+                assert status["resource_budgets"]["speech_characters"]["reserved"] > 0
+                assert not encodings and not uploads
+                await api.cancel(accepted["run_id"])
+                cancelled = await api.get_run(accepted["run_id"])
+                assert cancelled["state"] == "CANCELLED" and cancelled["cleanup_pending"]
+                assert cancelled["resource_budgets"] == status["resource_budgets"]
+                await store.confirm_epoch_stopped("voice", "voice-e1", "fake transport joined; no live backend work")
+                reconciled = await api.get_run(accepted["run_id"])
+                assert not reconciled["cleanup_pending"]
+                assert reconciled["resource_budgets"]["speech_characters"]["reserved"] == 0
+                assert len(voice_calls) == 1
+            finally:
+                with suppress(RPCError):
+                    if (await handle.describe()).close_time is None:
+                        await handle.terminate("disposable UNKNOWN speech test cleanup")
+                await api.close()
+            return
+        status, result = await env.submit(source)
         assert status["state"] == "PARTIAL"  # WAV fallback is explicit.
         assert result["transcript"] == turns
-        assert len(voice_calls) == 2
+        assert len(voice_calls) == 2 + int(high_quality)
+        assert voice_calls[-1]["voice"] == {"gender": "female"}
+        assert status["resource_budgets"]["speech_characters"]["spent"] == sum(
+            len(request["text"]) for request in voice_calls if "voice_id" not in request["voice"]
+        )
+        async with store.engine.connect() as connection:
+            voice_operations = await rows(connection,
+                "SELECT spec FROM runtime_operations WHERE spec->>'kind'='speech'")
+        assert len(voice_operations) == len(voice_calls)
+        assert all(operation["spec"]["attempt_timeout_seconds"] == 23.5
+                   for operation in voice_operations)
         assert len(encodings) == 2 and encodings[0] == encodings[1]
         assert uploads == [result["object_key"]]
         assert result["object_key"].startswith("audio-overviews/42/")
@@ -158,5 +224,5 @@ async def test_audio_retries_encoding_and_publication_without_repeating_complete
         assert inference_count == (3 if compress else 1)
         await env.replay(status["root_id"])
         assert len(env.calls) == inference_count
-        assert len(voice_calls) == 2
+        assert len(voice_calls) == 2 + int(high_quality)
         assert len(uploads) == 1

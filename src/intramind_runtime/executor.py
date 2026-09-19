@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from .artifacts import ArtifactPort
-from .contracts import RuntimeConflict
+from .contracts import RuntimeConflict, SpeechResult
 from .drivers import DriverFailure, EngineDriver
 from .store import Store, encode
 
@@ -55,17 +55,27 @@ class Executor:
                     not_sent=not send_marked, retry=not send_marked,
                 ) from exc
             # A completed inference is never retried to repair persistence.
-            data = encode(result.model_dump(mode="json")).encode()
             termination_recorded = False
             while True:
                 try:
                     if not termination_recorded:
                         await self.store.compute_finished(reservation)
                         termination_recorded = True
+                    attachments = ()
+                    document = result.model_dump(mode="json")
+                    if isinstance(result, SpeechResult):
+                        audio = await self.artifacts.put(
+                            reservation.operation.tenant_id, result.audio, "audio/wav")
+                        attachments = (audio,)
+                        document["body"] = result.body | {"audio": audio.model_dump(mode="json")}
+                        usage = result.characters
+                    else:
+                        usage = (result.input_tokens + result.output_tokens
+                            if result.input_tokens is not None and result.output_tokens is not None else None)
+                    data = encode(document).encode()
                     artifact = await self.artifacts.put(reservation.operation.tenant_id, data)
-                    usage = (result.input_tokens + result.output_tokens
-                             if result.input_tokens is not None and result.output_tokens is not None else None)
-                    await self.store.commit_result(reservation, artifact, usage)
+                    await self.store.commit_result(reservation, artifact, usage,
+                        **({"attachments": attachments} if attachments else {}))
                     return True
                 except RuntimeConflict:
                     raise

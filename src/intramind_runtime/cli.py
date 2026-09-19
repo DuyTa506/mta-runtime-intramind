@@ -20,11 +20,12 @@ from temporalio.worker import Worker, WorkerDeploymentConfig
 
 from .api import create_app
 from .artifacts import MinioArtifacts
-from .contracts import PoolSpec
+from .contracts import PoolSpec, SpeechPoolSpec, parse_pool
 from .drivers import OpenAICompletionDriver
 from .executor import Executor
 from .preparation import LlamaCppPromptSizer
 from .settings import Settings
+from .speech import ServingSpeechDriver, SpeechPreparer, SpeechProfile
 from .store import Store
 from .temporal_adapter import BrokerActivities, OutboxPublisher
 from .wakeup import Wakeup
@@ -45,6 +46,8 @@ def artifacts(settings):
 def preparers(config):
     result = {}
     for pool in config["pools"]:
+        if pool["admission"].get("kind") == "speech":
+            continue
         sizing = pool.get("prompt_sizing")
         if not sizing:
             continue
@@ -73,6 +76,34 @@ def preparers(config):
             allow_tool_calls=sizing.get("allow_tool_calls", False),
         )
     return result
+
+
+def speech_profiles(config):
+    result = {}
+    for pool in config["pools"]:
+        spec = parse_pool(pool["admission"])
+        if not isinstance(spec, SpeechPoolSpec):
+            continue
+        qualification = pool["speech"]
+        if (qualification["validated_profile_id"] != spec.profile_id
+            or qualification["termination_contract"] != "termination-v1"):
+            raise ValueError("speech contract must match its qualified capacity profile")
+        if spec.model_profile in result:
+            raise ValueError("ambiguous speech profile")
+        result[spec.model_profile] = SpeechProfile(
+            model_profile=spec.model_profile, capacity_profile_id=spec.profile_id,
+            character_limit=spec.character_limit, sample_rate=qualification["sample_rate"],
+            max_audio_bytes=qualification["max_audio_bytes"], voices=qualification["voices"],
+        )
+    return result
+
+
+def engine_driver(pool, speech):
+    spec = parse_pool(pool["admission"])
+    if isinstance(spec, SpeechPoolSpec):
+        return ServingSpeechDriver(pool["base_url"], speech[spec.model_profile],
+            api_key=os.environ[pool["api_key_env"]] if pool.get("api_key_env") else None)
+    return OpenAICompletionDriver(pool["base_url"], os.environ[pool["api_key_env"]], pool["model"])
 
 
 async def services(command, settings, config):
@@ -106,16 +137,15 @@ async def services(command, settings, config):
         if command == "configure":
             for pool in config["pools"]:
                 await store.configure_pool(
-                    PoolSpec.model_validate(pool["admission"]), pool["group_ceiling"]
+                    parse_pool(pool["admission"]), pool["group_ceiling"]
                 )
             return
         if command == "executor":
             blobs = artifacts(settings)
             await blobs.ready()
+            speech = speech_profiles(config)
             for pool in config["pools"]:
-                driver = OpenAICompletionDriver(
-                    pool["base_url"], os.environ[pool["api_key_env"]], pool["model"]
-                )
+                driver = engine_driver(pool, speech)
                 drivers.append(driver)
                 for _ in range(settings.executor_count):
                     worker = Executor(
@@ -136,7 +166,7 @@ async def services(command, settings, config):
                 worker = Worker(
                     client,
                     task_queue=settings.temporal_queue,
-                    activities=[activities.submit_or_attach, activities.finish],
+                    activities=[activities.submit_or_attach, activities.submit_speech, activities.finish],
                     max_concurrent_activities=32,
                     graceful_shutdown_timeout=timedelta(seconds=30),
                     deployment_config=WorkerDeploymentConfig(
@@ -189,6 +219,8 @@ def main():
             settings.temporal_queue,
             preparers(config),
             manage_lifecycle=True,
+            speech_preparers={key: SpeechPreparer(profile)
+                              for key, profile in speech_profiles(config).items()},
         )
         uvicorn.run(app, host="0.0.0.0", port=8070)
     else:

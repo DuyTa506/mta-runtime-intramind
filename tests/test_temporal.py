@@ -1,22 +1,18 @@
 """Real Temporal/PostgreSQL integration, including history replay."""
 
 import asyncio
-import os
 from contextlib import suppress
 from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from conftest import pool, root
+from conftest import pool, root, temporal_test_client
 from fakes import IndependentEngine, MemoryArtifacts
-from google.protobuf.duration_pb2 import Duration
 from temporalio.api.workflowservice.v1 import (
-    RegisterNamespaceRequest,
     SetWorkerDeploymentCurrentVersionRequest,
 )
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
-from temporalio.service import RPCError, RPCStatusCode
+from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 
 from intramind_runtime.admin import worker_health
@@ -28,19 +24,8 @@ pytestmark = pytest.mark.integration
 
 
 async def test_real_temporal_async_completion_and_replay(store):
-    address = os.environ.get("RUNTIME_TEST_TEMPORAL_ADDRESS")
-    if not address:
-        pytest.skip("explicit disposable RUNTIME_TEST_TEMPORAL_ADDRESS required")
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("test requires a disposable loopback Temporal endpoint")
-    namespace = "intramind-runtime-test"
-    client = await Client.connect(address, namespace=namespace)
-    try:
-        await client.workflow_service.register_namespace(RegisterNamespaceRequest(
-            namespace=namespace, workflow_execution_retention_period=Duration(seconds=86400)))
-    except RPCError as exc:
-        if exc.status != RPCStatusCode.ALREADY_EXISTS:
-            raise
+    client = await temporal_test_client()
+    namespace = client.namespace
     uid = uuid4().hex
     queue = "runtime-test-"+uid
     root_spec = root(root_id=uid)

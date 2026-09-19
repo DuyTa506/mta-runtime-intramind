@@ -1,6 +1,7 @@
 """Trusted-service HTTP client; public identity verification remains at gateway."""
 
 import json
+from urllib.parse import quote
 
 import httpx
 
@@ -74,5 +75,19 @@ class RuntimeClient:
                 ),
             },
         )
+        response.raise_for_status()
+        return response.json()
+
+    async def speech_profile(self, model_profile: str):
+        response = await self.client.get(f"/v1/speech/profiles/{quote(model_profile, safe='')}")
+        response.raise_for_status()
+        return response.json()
+
+    async def prepare_speech(self, *, model_profile: str, capacity_profile_id: str,
+                             payload: dict, attempt_timeout_seconds: float):
+        response = await self.client.post("/v1/speech/prepare", json={
+            "model_profile": model_profile, "capacity_profile_id": capacity_profile_id,
+            "payload": payload, "attempt_timeout_seconds": attempt_timeout_seconds,
+        })
         response.raise_for_status()
         return response.json()
