@@ -1,10 +1,14 @@
 """A separate Temporal worker renders and publishes without reopening inference."""
 
 import asyncio
+import json
 import os
+import re
 import sys
+from collections import Counter
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +24,192 @@ from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 from intramind_runtime.sdk import durable_activity
 
 pytestmark = pytest.mark.integration
+
+
+async def test_pptx_root_keeps_accepted_policy_across_every_phase_and_publication_retry(store, monkeypatch):
+    if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
+        pytest.skip("explicit AI dependency environment required")
+    import llmai
+    from api.background.common.models import ModelActivities
+    from api.background.pptx.activities import PptxActivities
+    from api.background.pptx.leaves import LEAVES
+    from api.background.pptx.manuscript import ManuscriptActivities
+    from api.background.pptx.manuscript_leaves import LEAVES as MANUSCRIPT_LEAVES
+    from api.background.pptx.manuscript_workflows import WORKFLOWS as MANUSCRIPT_WORKFLOWS
+    from api.background.pptx.planning import PlanningActivities
+    from api.background.pptx.planning_leaves import LEAVES as PLAN_LEAVES
+    from api.background.pptx.planning_workflows import WORKFLOWS as PLAN_WORKFLOWS
+    from api.background.pptx.policy import PptxPolicy
+    from api.background.pptx.render import RenderActivities
+    from api.background.pptx.render_workflows import WORKFLOWS as RENDER_WORKFLOWS
+    from api.background.pptx.validation import ValidationActivities
+    from api.background.pptx.validation_workflows import WORKFLOWS as VALIDATION_WORKFLOWS
+    from api.background.pptx.workflows import WORKFLOWS
+    from api.config import PptxLLMConfig, PptxSettings
+    from tests.background.pptx.test_render import deck_bytes
+    from tools.pptx.documents import LoadedCorpus
+    from tools.pptx.engine.utils.llm_calls.validate_slide_manuscript import (
+        AUDIT_SYSTEM_PROMPT,
+        COHERENCE_SYSTEM_PROMPT,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("A PPTX root must use recorded broker inference")
+
+    monkeypatch.setattr(llmai, "get_client", forbidden)
+    queue = "pptx-root-render-" + uuid4().hex
+    policy = PptxPolicy.capture(PptxSettings(llm=PptxLLMConfig(
+        base_url="http://fake/v1", model="test", context_tokens=16000,
+        timeout_seconds=37, concurrency=2)), "test", {
+            "model_profile": "test", "capacity_profile_id": "test-v1", "model": "test",
+            "context_limit": 16384, "response_formats": ["text", "json_schema"],
+            "endpoint_fingerprint": sha256(b"http://fake").hexdigest(),
+        }, environment={"DISABLE_THINKING": "true"}, render_task_queue=queue,
+    ).model_copy(update={"history_window": 1})
+    source = "# Nghiên cứu\n## Chương 1\nKết quả: 42 đơn vị.\n## Chương 2\nBằng chứng bổ sung."
+    fixture = Path(__file__).resolve().parents[2] / "mta-ai-intramind/tests/tools/fixtures/pptx-brief-4848c757.json"
+    schemas, loads, exports, publications, published = Counter(), [], [], [], []
+
+    def load(ids, **kwargs):
+        loads.append(ids)
+        return LoadedCorpus([("Source", source)], [], {"doc": "Source"})
+
+    async def respond(reservation, payload):
+        assert reservation.operation.attempt_timeout_seconds == 37
+        assert payload["model"] == "test"
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        monkeypatch.setenv("CUSTOM_MODEL", "changed-worker-model")
+        monkeypatch.setenv("BACKGROUND_RUNTIME__PPTX_TASK_QUEUE", "wrong-after-acceptance")
+        system, prompt = [message["content"] for message in payload["messages"]]
+        schema = payload.get("response_format", {}).get("json_schema", {}).get("name")
+        if schema == "presentation_brief":
+            answer = fixture.read_text(encoding="utf-8")
+        elif schema == "deck_allocation":
+            answer = json.dumps({"presentation_title": "Kết quả nghiên cứu",
+                "narrative_summary": "Các kết quả và bằng chứng đã được ghi nhận.",
+                "budgets": [{"group_index": 0, "slides": 3}, {"group_index": 1, "slides": 3}]})
+        elif schema == "section_outline":
+            headings = re.search(r"Headings you may cite \(and only these\):\n(.+?)\n\n", prompt, re.S).group(1)
+            group = "Chương 2" if "Chương 2" in headings else "Chương 1"
+            answer = json.dumps({"slides": [{"index": i, "title": f"Nội dung {i}",
+                "purpose": f"Trình bày bằng chứng {i}", "content_type": "text",
+                "source_sections": [group]} for i in range(1, 4)]})
+        elif schema == "slide_details":
+            indexes = [int(i) for i in re.findall(r"--- Slide (\d+) \(", prompt)]
+            answer = json.dumps({"slides": [{"index": i, "key_message": "Kết quả nguồn",
+                "required_points": ["42 đơn vị"], "visual_plan": {"kind": "none"}} for i in indexes]})
+        elif system in (AUDIT_SYSTEM_PROMPT, COHERENCE_SYSTEM_PROMPT):
+            schema = "coherence" if system == COHERENCE_SYSTEM_PROMPT else "audit"
+            marker = "FULL MANUSCRIPT\n" if schema == "coherence" else "DRAFT SLIDES\n"
+            indexes = re.findall(r"(?m)^## Slide (\d+)", prompt.split(marker, 1)[1])
+            assert indexes
+            answer = "\n".join(f"Slide {i}: PASS" for i in indexes)
+        elif "REQUESTED BATCH\n" in prompt:
+            schema = "manuscript"
+            batch = prompt.split("REQUESTED BATCH\n", 1)[1].split("GLOBAL HEADING", 1)[0]
+            indexes = re.findall(r"(?m)^## Slide (\d+)", batch)
+            assert indexes
+            answer = "\n\n---\n\n".join(f"## Slide {i} — Kết quả nguồn\n"
+                "> Core message: Kết quả được xác nhận.\n> Audience move: Hiểu bằng chứng.\n"
+                "> Source anchors: Chương 1\n\n### Narrative\n"
+                "Kết quả có 42 đơn vị, theo tài liệu nguồn.\n\n### Visual intent\nKhông có.\n"
+                for i in indexes)
+        else:
+            assert schema is None
+            schema, answer = "reading", source
+        schemas[schema] += 1
+        return {"choices": [{"message": {"content": answer}}]}
+
+    def activities(factory):
+        return [*PptxActivities(factory, model_profile="test", source_loader=load).registered(),
+                *PlanningActivities(factory, model_profile="test").registered(),
+                *ManuscriptActivities(factory, model_profile="test").registered(),
+                *ValidationActivities(factory, model_profile="test").registered(),
+                ModelActivities(factory, leaves=LEAVES | PLAN_LEAVES | MANUSCRIPT_LEAVES).plan]
+
+    async def export(job, directory):
+        exports.append(deepcopy(job))
+        (directory / "deck.pptx").write_bytes(deck_bytes(len(job["deck"]["slides"])))
+
+    def publication(**kwargs):
+        publications.append(deepcopy(kwargs))
+        return "stable-root-publication"
+
+    class LostPublicationAck(RenderActivities):
+        @durable_activity(name="pptx.publish/v1")
+        async def publish(self, inputs):
+            result = await super().publish(inputs)
+            published.append(result)
+            if len(published) == 1:
+                raise OSError("publication committed but activity acknowledgement lost")
+            assert result == published[0]
+            return result
+
+    workflows = [*WORKFLOWS, *PLAN_WORKFLOWS, *MANUSCRIPT_WORKFLOWS, *VALIDATION_WORKFLOWS]
+    async with feature_environment(store, name="pptx", workflows=workflows,
+                                   build_activities=activities, respond=respond) as env:
+        version = WorkerDeploymentVersion(queue, "render-build-1")
+        async with Worker(env.temporal, task_queue=queue, workflows=RENDER_WORKFLOWS,
+            activities=LostPublicationAck(env.runtime_client, exporter=export,
+                                         publication=publication).registered(),
+            max_concurrent_activities=1,
+            deployment_config=WorkerDeploymentConfig(version=version, use_worker_versioning=True,
+                default_versioning_behavior=VersioningBehavior.PINNED)):
+            for attempt in range(30):
+                try:
+                    await env.temporal.workflow_service.set_worker_deployment_current_version(
+                        SetWorkerDeploymentCurrentVersionRequest(namespace=env.temporal.namespace,
+                            deployment_name=version.deployment_name, build_id=version.build_id,
+                            identity="pptx-root-qualification"))
+                    break
+                except RPCError:
+                    if attempt == 29:
+                        raise
+                    await asyncio.sleep(0.5)
+            status, result = await env.submit({"document_ids": ["doc"], "unit_id": "verified-unit",
+                "format": "detailed", "n_slides": 6, "style": "academic",
+                "avoid_layout_repetition": False}, configuration=policy.model_dump(mode="json"))
+            assert loads == [["doc"]] and len(exports) == 1
+            assert len(publications) == len(published) == 2 and publications[0] == publications[1]
+            assert publications[0]["task_id"] == "rtw_" + status["root_id"]
+            assert publications[0]["owner_user_id"] == "test"
+            assert publications[0]["owner_unit_id"] == "verified-unit"
+            assert publications[0]["source_request"]["avoid_layout_repetition"] is False
+            assert result["slide_count"] == 6 and result["artifact_id"] == "stable-root-publication"
+            assert result["style"] == "academic" and result["tool_info"]["model_name"] == "test"
+            count = sum(schemas.values())
+            assert count == len(env.calls) == result["llm_call_count"]
+            assert schemas["coherence"] == 1 and schemas["manuscript"] >= 1
+            assert status["operations"] == {"SUCCEEDED": count}
+            assert status["reserved"] == 0 and status["spent"] == count * 30
+
+            phases, starts = [], []
+            replayer = Replayer(workflows=[*workflows, *RENDER_WORKFLOWS])
+
+            async def replay_chain(workflow_id, run_id=None):
+                history = await env.temporal.get_workflow_handle(workflow_id, run_id=run_id).fetch_history()
+                await replayer.replay_workflow(history)
+                start = history.events[0].workflow_execution_started_event_attributes
+                envelope = (await env.temporal.data_converter.decode(start.input.payloads))[0]
+                starts.append(envelope)
+                assert envelope["root_id"] == status["root_id"] and envelope["tenant_id"] == "user:test"
+                assert envelope["configuration"] == starts[0]["configuration"]
+                assert envelope["deadline"] == starts[0]["deadline"]
+                for event in history.events:
+                    if event.HasField("start_child_workflow_execution_initiated_event_attributes"):
+                        child = event.start_child_workflow_execution_initiated_event_attributes
+                        if workflow_id == status["root_id"]:
+                            phases.append(child.workflow_type.name)
+                            assert (child.task_queue.name == queue) == (child.workflow_type.name == "pptx.render/v1")
+                    if event.HasField("child_workflow_execution_started_event_attributes"):
+                        child = event.child_workflow_execution_started_event_attributes.workflow_execution
+                        await replay_chain(child.workflow_id, child.run_id)
+                    if event.HasField("workflow_execution_continued_as_new_event_attributes"):
+                        await replay_chain(workflow_id, event.workflow_execution_continued_as_new_event_attributes.new_execution_run_id)
+
+            await replay_chain(status["root_id"])
+            assert phases == [f"pptx.{phase}/v1" for phase in ("context", "planning", "manuscript", "validation", "render")]
+            assert len(env.calls) == count and len(exports) == 1 and len(publications) == 2
 
 
 async def test_separate_render_worker_recovers_lost_artifact_and_publication_ack(store, tmp_path):

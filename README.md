@@ -93,6 +93,9 @@ deterministic repairs continue, and only dispatched repairs spend root budget.
 `tests/test_ai_pptx_render.py` runs a separate render queue, losing render and
 publication acknowledgements before replay. It verifies Temporal cancellation
 reaches the export subprocess through heartbeats and prevents publication.
+It also runs the application's complete `pptx/v1` root through all five phases,
+retains accepted queue/model/flags and tenant/root accounting, and replays every
+child and rollover without repeating inference or rendering on publication retry.
 Model/tokenizer responses, rendered file contents and feature artifacts are
 fixtures; Chromium image verification and public PPTX cutover remain application work.
 
