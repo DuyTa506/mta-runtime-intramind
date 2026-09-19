@@ -3,6 +3,11 @@
 [Repository](https://github.com/DuyTa506/mta-runtime-intramind) · development branch: `dev`.
 The package and Intramind migration are in active development; no production release has been declared.
 
+Rollout uses direct Temporal cutover after functional/recovery and deploy checks.
+The release gate no longer requires overload observation, 72-hour soak, canary
+percentages or seven days at full routing. Existing-work reconciliation, static
+capacity qualification, security, MinIO and restore evidence still apply.
+
 A Python package for durable agent workflows and shared inference admission.
 Application code declares the next step; the runtime accounts for inference
 attempts; Temporal persists workflow decisions; the serving engine executes them.

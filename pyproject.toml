@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "intramind-runtime"
-version = "0.2.0rc2"
+version = "0.2.0rc3"
 description = "Durable workflow and shared inference admission for Intramind"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
