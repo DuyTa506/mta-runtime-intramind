@@ -1,0 +1,79 @@
+# Local development and disposable tests; no production volumes or networks.
+services:
+  postgres:
+    image: postgres:17.11-alpine@sha256:f02121de6f74d30d8a94cd1d9584125e2178d7e6c377d8130112d4e52d867995
+    environment:
+      POSTGRES_USER: runtime_dev
+      POSTGRES_PASSWORD: runtime_dev_only
+      POSTGRES_DB: runtime_dev
+    ports: ['127.0.0.1:55440:5432']
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/10-runtime.sql:ro
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U runtime_dev -d runtime_dev']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  temporal-schema:
+    image: temporalio/admin-tools:1.32.0@sha256:a9f84fb9a374b2374fe2e67c8efc0468ff3f1c66c8a0b14597ec86e349e62bca
+    entrypoint: [/bin/sh, /opt/schema.sh]
+    volumes: ['./schema.sh:/opt/schema.sh:ro']
+    mem_limit: 256m
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  temporal:
+    image: temporalio/server:1.32.0@sha256:c3e752127759616bb1615e0f9ba0e21635aeb5fdeb922de4f371c350955f46ae
+    environment:
+      TEMPORAL_SERVER_CONFIG_FILE_PATH: /opt/temporal.yaml
+      TEMPORAL_ALLOW_NO_AUTH: 'true'
+    volumes: ['./temporal.yaml:/opt/temporal.yaml:ro']
+    ports: ['127.0.0.1:17234:7233']
+    mem_limit: 1g
+    stop_grace_period: 30s
+    depends_on:
+      temporal-schema: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD-SHELL, 'nc -z 127.0.0.1 7233']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  temporal-ui:
+    image: temporalio/ui:2.54.1@sha256:ff0943fe532b8e33c46cd28b29e81e0ce0b6f55b9ee50a38ef1b437cc4de3fa5
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_DEFAULT_NAMESPACE: intramind-runtime-test
+      TEMPORAL_CORS_ORIGINS: http://127.0.0.1:18088,http://localhost:18088
+      TEMPORAL_DISABLE_NEWS_FETCH: 'true'
+    ports: ['127.0.0.1:18088:8080']
+    mem_limit: 256m
+    depends_on:
+      temporal: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, 'wget -q -O /dev/null http://127.0.0.1:8080/']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: [server, /data, --console-address, ':9001']
+    environment:
+      MINIO_ROOT_USER: runtime_test
+      MINIO_ROOT_PASSWORD: runtime_test_only
+    ports: ['127.0.0.1:19010:9000', '127.0.0.1:19011:9001']
+    volumes: ['minio:/data']
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:9000/minio/health/live]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres:
+  minio:

@@ -1,0 +1,199 @@
+"""Separate API, broker activity worker, executors and outbox processes."""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import signal
+from contextlib import suppress
+from datetime import timedelta
+from pathlib import Path
+from uuid import uuid4
+
+import httpx
+import uvicorn
+from minio import Minio
+from temporalio.client import Client
+from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
+from temporalio.worker import Worker, WorkerDeploymentConfig
+
+from .api import create_app
+from .artifacts import MinioArtifacts
+from .contracts import PoolSpec
+from .drivers import OpenAICompletionDriver
+from .executor import Executor
+from .preparation import LlamaCppPromptSizer
+from .settings import Settings
+from .store import Store
+from .temporal_adapter import BrokerActivities, OutboxPublisher
+from .wakeup import Wakeup
+
+
+def artifacts(settings):
+    return MinioArtifacts(
+        Minio(
+            settings.minio_endpoint,
+            access_key=settings.minio_access_key.get_secret_value(),
+            secret_key=settings.minio_secret_key.get_secret_value(),
+            secure=settings.minio_secure,
+        ),
+        settings.minio_bucket,
+    )
+
+
+def preparers(config):
+    result = {}
+    for pool in config["pools"]:
+        sizing = pool.get("prompt_sizing")
+        if not sizing:
+            continue
+        spec = PoolSpec.model_validate(pool["admission"])
+        if sizing.get("validated_profile_id") != spec.profile_id:
+            raise ValueError("tokenizer/template contract must match the capacity profile")
+        if spec.model_profile in result:
+            raise ValueError(
+                "ambiguous model profile: define one pinned sizing contract per model profile"
+            )
+        client = httpx.AsyncClient(
+            base_url=sizing["base_url"].rstrip("/") + "/",
+            headers={"Authorization": f"Bearer {os.environ[pool['api_key_env']]}"},
+            timeout=30,
+            follow_redirects=False,
+            transport=httpx.AsyncHTTPTransport(retries=0),
+        )
+        result[spec.model_profile] = LlamaCppPromptSizer(
+            client,
+            model=pool["model"],
+            capacity_profile_id=spec.profile_id,
+            context_limit=spec.context_limit,
+            token_margin=sizing["token_margin"],
+            expected_output_tokens=sizing["expected_output_tokens"],
+            response_formats=frozenset(sizing.get("response_formats", ["text"])),
+            allow_tool_calls=sizing.get("allow_tool_calls", False),
+        )
+    return result
+
+
+async def services(command, settings, config):
+    store = Store(settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds)
+    tasks = []
+    drivers = []
+    wakeup = Wakeup(settings.database_url.get_secret_value())
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+
+    async def repeat(fn, delay, *, on_events=False):
+        while not stop.is_set():
+            generation = wakeup.generation
+            try:
+                if await fn() and on_events:
+                    continue
+            except Exception:
+                logging.exception("runtime %s tick failed", command)
+            try:
+                if on_events:
+                    await wakeup.wait(generation, timeout=delay)
+                else:
+                    await asyncio.wait_for(stop.wait(), timeout=delay)
+            except TimeoutError:
+                pass
+
+    try:
+        if command in ("executor", "outbox"):
+            await wakeup.start()
+        if command == "configure":
+            for pool in config["pools"]:
+                await store.configure_pool(
+                    PoolSpec.model_validate(pool["admission"]), pool["group_ceiling"]
+                )
+            return
+        if command == "executor":
+            blobs = artifacts(settings)
+            await blobs.ready()
+            for pool in config["pools"]:
+                driver = OpenAICompletionDriver(
+                    pool["base_url"], os.environ[pool["api_key_env"]], pool["model"]
+                )
+                drivers.append(driver)
+                for _ in range(settings.executor_count):
+                    worker = Executor(
+                        store, blobs, driver, pool["admission"]["pool_id"], str(uuid4())
+                    )
+                    tasks.append(asyncio.create_task(repeat(worker.tick, 5, on_events=True)))
+        elif command == "reconciler":
+            tasks.append(asyncio.create_task(repeat(store.reconcile_expired, 5)))
+        else:
+            client = await Client.connect(
+                settings.temporal_address, namespace=settings.temporal_namespace
+            )
+            if command == "outbox":
+                publisher = OutboxPublisher(store, client, str(uuid4()))
+                tasks.append(asyncio.create_task(repeat(publisher.tick, 5, on_events=True)))
+            elif command == "worker":
+                activities = BrokerActivities(store, artifacts(settings))
+                worker = Worker(
+                    client,
+                    task_queue=settings.temporal_queue,
+                    activities=[activities.submit_or_attach, activities.finish],
+                    max_concurrent_activities=32,
+                    graceful_shutdown_timeout=timedelta(seconds=30),
+                    deployment_config=WorkerDeploymentConfig(
+                        version=WorkerDeploymentVersion(
+                            "intramind-runtime", os.environ["RUNTIME_BUILD_ID"]
+                        ),
+                        use_worker_versioning=True,
+                        default_versioning_behavior=VersioningBehavior.PINNED,
+                    ),
+                )
+                async with worker:
+                    await stop.wait()
+                return
+        await stop.wait()
+        if command == "executor":
+            # Stop fetching work, but retain live transports and any output bytes
+            # until their current tick has persisted/settled or recorded UNKNOWN.
+            logging.info("Executor stopping; waiting for active attempts to settle")
+            await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        for driver in drivers:
+            await driver.close()
+        await wakeup.close()
+        await store.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "command", choices=["api", "configure", "worker", "executor", "outbox", "reconciler"]
+    )
+    args = parser.parse_args()
+    settings = Settings()
+    logging.basicConfig(
+        level=settings.log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    config = json.loads(Path(settings.pool_config).read_text())
+    if args.command == "api":
+        store = Store(settings.database_url.get_secret_value())
+        app = create_app(
+            store,
+            artifacts(settings),
+            settings.service_token.get_secret_value(),
+            config["tasks"],
+            settings.temporal_queue,
+            preparers(config),
+            manage_lifecycle=True,
+        )
+        uvicorn.run(app, host="0.0.0.0", port=8070)
+    else:
+        asyncio.run(services(args.command, settings, config))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "intramind-runtime"
+version = "0.1.0"
+description = "Durable workflow and shared inference admission for Intramind"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "Framework :: AsyncIO",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+  "temporalio==1.33.0",
+  "sqlalchemy[asyncio]>=2.0.36,<2.1",
+  "asyncpg>=0.30,<1",
+  "alembic>=1.14,<2",
+  "fastapi>=0.140,<0.142",
+  "uvicorn>=0.35,<1",
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.10,<3",
+  "httpx>=0.28.1,<0.29",
+  "minio>=7.2,<8",
+  "prometheus-client>=0.22,<1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "hypothesis>=6,<7", "ruff==0.16.1"]
+
+[project.scripts]
+intramind-runtime = "intramind_runtime.cli:main"
+
+[project.urls]
+Repository = "https://github.com/DuyTa506/mta-runtime-intramind"
+Issues = "https://github.com/DuyTa506/mta-runtime-intramind/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/intramind_runtime"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: requires explicitly configured disposable PostgreSQL/MinIO/Temporal"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

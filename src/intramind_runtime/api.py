@@ -1,0 +1,161 @@
+"""Internal authenticated API. Gateway remains the public identity authority."""
+
+import hmac
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+from pydantic import Field
+
+from .artifacts import ArtifactPort, tenant_prefix
+from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
+from .preparation import PrepareRequest
+from .store import Store, row
+
+
+class Submission(Contract):
+    task_type: str = Field(min_length=1, max_length=120)
+    submission_key: str = Field(min_length=1, max_length=200)
+    input: Artifact
+
+
+def create_app(
+    store: Store,
+    artifacts: ArtifactPort,
+    service_token: str,
+    definitions: dict[str, dict],
+    control_queue="intramind-control",
+    preparers=None,
+    *,
+    manage_lifecycle=False,
+) -> FastAPI:
+    if len(service_token) < 32:
+        raise ValueError("service token must contain at least 32 characters")
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            if manage_lifecycle:
+                await artifacts.ready()
+            yield
+        finally:
+            if manage_lifecycle:
+                for preparer in (preparers or {}).values():
+                    await preparer.client.aclose()
+                await store.close()
+
+    app = FastAPI(title="Intramind Runtime", version="0.1.0", lifespan=lifespan)
+
+    async def tenant(request: Request):
+        provided = request.headers.get("authorization", "")
+        if not hmac.compare_digest(provided.encode(), f"Bearer {service_token}".encode()):
+            raise HTTPException(401, "trusted service authentication required")
+        identity = request.headers.get("x-tenant-id", "")
+        if not identity or len(identity) > 200:
+            raise HTTPException(400, "verified tenant identity required")
+        return identity
+
+    @app.post("/v1/requests/prepare")
+    async def prepare(request: PrepareRequest, tenant_id=Depends(tenant)):
+        preparer = (preparers or {}).get(request.model_profile)
+        if preparer is None:
+            raise HTTPException(503, "no qualified tokenizer/template profile for this model")
+        try:
+            return await preparer.prepare(request, artifacts, tenant_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.exception_handler(RuntimeConflict)
+    async def conflict(request, exc):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(AdmissionDenied)
+    async def denied(request, exc):
+        return JSONResponse(
+            status_code=429 if exc.retryable else 422,
+            content={"detail": str(exc)},
+            headers={"Retry-After": "5"} if exc.retryable else {},
+        )
+
+    @app.exception_handler(NotFound)
+    async def missing(request, exc):
+        return JSONResponse(status_code=404, content={"detail": "not found"})
+
+    @app.get("/health")
+    async def health():
+        async with store.engine.connect() as c:
+            await row(c, "SELECT id FROM runtime_authority WHERE id=1")
+        return {"status": "ledger_ready"}
+
+    @app.get("/metrics")
+    async def metrics():
+        from .metrics import snapshot
+
+        return Response(await snapshot(store), media_type="text/plain; version=0.0.4")
+
+    @app.post("/v1/artifacts", response_model=Artifact)
+    async def upload(request: Request, tenant_id=Depends(tenant)):
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 16 * 1024 * 1024:
+                raise HTTPException(413, "input payload exceeds 16 MiB")
+            chunks.append(chunk)
+        return await artifacts.put(
+            tenant_id, b"".join(chunks), request.headers.get("content-type", "application/json")
+        )
+
+    @app.post("/v1/artifacts/read")
+    async def download(ref: Artifact, tenant_id=Depends(tenant)):
+        if not ref.key.startswith(tenant_prefix(tenant_id)):
+            raise NotFound("artifact")
+        return Response(await artifacts.get(ref), media_type=ref.content_type)
+
+    @app.post("/v1/runs", status_code=202)
+    async def submit(request: Submission, tenant_id=Depends(tenant)):
+        definition = definitions.get(request.task_type)
+        if definition is None:
+            raise HTTPException(422, "task type/version is not registered")
+        if not request.input.key.startswith(tenant_prefix(tenant_id)):
+            raise NotFound("input")
+        await artifacts.get(request.input)
+        root_id = sha256(f"{tenant_id}\x00{request.submission_key}".encode()).hexdigest()
+        deadline = datetime.now(UTC) + timedelta(seconds=definition["deadline_seconds"])
+        root = RootSpec(
+            root_id=root_id,
+            tenant_id=tenant_id,
+            deadline=deadline,
+            budget_limit=definition["budget_limit"],
+            priority=definition.get("priority", "background"),
+        )
+        # Stable submit intent excludes wall-clock deadline; retries attach to
+        # the original root and cannot extend its lifetime.
+        spec = {
+            "workflow_type": request.task_type,
+            "task_queue": definition["task_queue"],
+            "input": {
+                "root_id": root_id,
+                "tenant_id": tenant_id,
+                "control_queue": control_queue,
+                "input": request.input.model_dump(mode="json"),
+            },
+        }
+        run_id = await store.submit_run(root, request.submission_key, request.input.sha256, spec)
+        return {"task_id": run_id, "run_id": run_id, "status": "submitted", "owner": "temporal"}
+
+    @app.get("/v1/runs/{run_id}")
+    async def status(run_id: str, tenant_id=Depends(tenant)):
+        return await store.run(run_id, tenant_id)
+
+    @app.post("/v1/runs/{run_id}/cancel", status_code=202)
+    async def cancel(run_id: str, tenant_id=Depends(tenant)):
+        await store.cancel(run_id, tenant_id)
+        return {"run_id": run_id, "cancellation": "requested"}
+
+    @app.get("/v1/operations/{operation_id}")
+    async def operation(operation_id: str, tenant_id=Depends(tenant)):
+        return await store.operation(operation_id, tenant_id)
+
+    return app

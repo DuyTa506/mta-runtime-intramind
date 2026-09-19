@@ -1,0 +1,265 @@
+{
+  "artifact_backend": "minio",
+  "production_capacity_profile": null,
+  "inventory": [
+    {
+      "id": "A01",
+      "name": "tasks.generate_summary_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A02",
+      "name": "tasks.generate_mindmap_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A03",
+      "name": "tasks.generate_draft_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A04",
+      "name": "tasks.enrich_draft_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A05",
+      "name": "tasks.generate_directive_review_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A06",
+      "name": "tasks.translate_document_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A07",
+      "name": "tasks.generate_pptx_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A08",
+      "name": "tasks.consolidate_memory_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A09",
+      "name": "tasks.generate_audio_overview_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A10",
+      "name": "tasks.rewrite_document_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A11",
+      "name": "tasks.generate_teaching_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "A12",
+      "name": "tasks.generate_exam_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B01",
+      "name": "tasks.process_document_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B02",
+      "name": "tasks.build_kg_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B03",
+      "name": "warehouse.dispatch",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B04",
+      "name": "warehouse.extract",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B05",
+      "name": "warehouse.projection",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B06",
+      "name": "warehouse.execute",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B07",
+      "name": "warehouse.graph",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "B08",
+      "name": "warehouse.retention",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "X01",
+      "name": "mta-ai-intramind/debug_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "X02",
+      "name": "mta-be-intramind/debug_task",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D01",
+      "name": "compact_conversation",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D02",
+      "name": "auto_title_conversation",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D03",
+      "name": "sync_documents_background",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D04",
+      "name": "cleanup_remote_documents",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D05",
+      "name": "gateway_audit_log",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D06",
+      "name": "query_write_audit",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D07",
+      "name": "query_log",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D08",
+      "name": "native_generate_presentation_async",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D09",
+      "name": "native_create_template",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "D10",
+      "name": "pptx_webhook_delivery",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "O01",
+      "name": "mta-backup",
+      "disposition": "retained_native",
+      "evidence": null
+    },
+    {
+      "id": "O02",
+      "name": "mta-integrity-check",
+      "disposition": "retained_native",
+      "evidence": null
+    },
+    {
+      "id": "O03",
+      "name": "mta-maintenance-check",
+      "disposition": "retained_native",
+      "evidence": null
+    },
+    {
+      "id": "H01",
+      "name": "streaming_summary",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "H02",
+      "name": "retrieval_and_routing",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "H03",
+      "name": "pptx_assets_export_helpers",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "H04",
+      "name": "request_scoped_inference",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "H05",
+      "name": "warehouse_activity_pulse",
+      "disposition": "retained_native",
+      "evidence": null
+    },
+    {
+      "id": "H06",
+      "name": "worker_beacon_and_lease_keeper",
+      "disposition": "pending",
+      "evidence": null
+    },
+    {
+      "id": "H07",
+      "name": "cache_metrics_tracing_helpers",
+      "disposition": "retained_native",
+      "evidence": null
+    },
+    {
+      "id": "H08",
+      "name": "vieneu_idle_reaper",
+      "disposition": "retained_native",
+      "evidence": null
+    }
+  ],
+  "evidence": {}
+}

@@ -1,0 +1,55 @@
+# enable-template
+log:
+  stdout: true
+  level: warn
+persistence:
+  numHistoryShards: 4
+  defaultStore: history
+  visibilityStore: visibility
+  datastores:
+    history:
+      sql:
+        pluginName: postgres12
+        databaseName: temporal
+        connectAddr: 'postgres:5432'
+        connectProtocol: tcp
+        user: runtime_dev
+        password: runtime_dev_only
+        maxConns: 8
+        maxIdleConns: 4
+    visibility:
+      sql:
+        pluginName: postgres12
+        databaseName: temporal_visibility
+        connectAddr: 'postgres:5432'
+        connectProtocol: tcp
+        user: runtime_dev
+        password: runtime_dev_only
+        maxConns: 4
+        maxIdleConns: 2
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: '{{ env "BIND_ON_IP" }}'
+services:
+  frontend:
+    rpc: {grpcPort: 7233, membershipPort: 6933, bindOnIP: '0.0.0.0'}
+  history:
+    rpc: {grpcPort: 7234, membershipPort: 6934, bindOnIP: '{{ env "BIND_ON_IP" }}'}
+  matching:
+    rpc: {grpcPort: 7235, membershipPort: 6935, bindOnIP: '{{ env "BIND_ON_IP" }}'}
+  worker:
+    rpc: {grpcPort: 7239, membershipPort: 6939, bindOnIP: '{{ env "BIND_ON_IP" }}'}
+clusterMetadata:
+  enableGlobalNamespace: false
+  failoverVersionIncrement: 10
+  masterClusterName: development
+  currentClusterName: development
+  clusterInformation:
+    development:
+      enabled: true
+      initialFailoverVersion: 1
+      rpcName: frontend
+      rpcAddress: '127.0.0.1:7233'
+dcRedirectionPolicy:
+  policy: noop
