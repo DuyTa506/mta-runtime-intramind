@@ -78,6 +78,12 @@ class RuntimeClient:
         response.raise_for_status()
         return response.json()
 
+    async def llm_profile(self, model_profile: str):
+        """Read the configured context/tool contract; actual admission remains atomic at dispatch."""
+        response = await self.client.get(f"/v1/llm/profiles/{quote(model_profile, safe='')}")
+        response.raise_for_status()
+        return response.json()
+
     async def speech_profile(self, model_profile: str):
         response = await self.client.get(f"/v1/speech/profiles/{quote(model_profile, safe='')}")
         response.raise_for_status()

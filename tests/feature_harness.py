@@ -1,6 +1,7 @@
 """Disposable Temporal/Postgres feature harness with actual broker accounting."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
 from uuid import uuid4
@@ -15,7 +16,8 @@ from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 
 from intramind_runtime.api import create_app
 from intramind_runtime.client import RuntimeClient
-from intramind_runtime.contracts import EngineResult, SpeechPoolSpec
+from intramind_runtime.contracts import SpeechPoolSpec
+from intramind_runtime.drivers import OpenAICompletionDriver
 from intramind_runtime.executor import Executor
 from intramind_runtime.preparation import LlamaCppPromptSizer
 from intramind_runtime.speech import ServingSpeechDriver, SpeechPreparer
@@ -105,13 +107,27 @@ async def feature_environment(
             ),
         )
 
-    class Engine:
-        async def execute(self, reservation, payload):
-            calls.append(reservation.attempt_id)
-            body = await respond(reservation, payload)
-            return EngineResult(body=body, input_tokens=10, output_tokens=20)
+    reservations = {}
 
-    executor = Executor(store, blobs, Engine(), "p", "feature-executor-" + uid)
+    async def completion_http(request):
+        attempt_id = request.headers["X-Intramind-Attempt-ID"]
+        payload = json.loads(request.content)
+        calls.append(attempt_id)
+        body = await respond(reservations[attempt_id], payload)
+        body.setdefault("usage", {"prompt_tokens": 10, "completion_tokens": 20})
+        return httpx.Response(200, json=body)
+
+    class Engine(OpenAICompletionDriver):
+        async def execute(self, reservation, payload):
+            reservations[reservation.attempt_id] = reservation
+            try:
+                return await super().execute(reservation, payload)
+            finally:
+                reservations.pop(reservation.attempt_id)
+
+    completion_driver = Engine("http://fake/v1/", "test-only", "test", client=httpx.AsyncClient(
+        base_url="http://fake/v1/", transport=httpx.MockTransport(completion_http)))
+    executor = Executor(store, blobs, completion_driver, "p", "feature-executor-" + uid)
     publisher = OutboxPublisher(store, temporal, "feature-publisher-" + uid)
     broker = BrokerActivities(store, blobs)
     version = WorkerDeploymentVersion("feature-" + uid, "build-1")
@@ -201,5 +217,6 @@ async def feature_environment(
             with suppress(asyncio.CancelledError):
                 await work
             await sizing.aclose()
+            await completion_driver.close()
             if speech_driver:
                 await speech_driver.close()

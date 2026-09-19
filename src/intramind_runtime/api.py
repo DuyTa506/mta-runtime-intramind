@@ -65,6 +65,20 @@ def create_app(
             raise HTTPException(400, "verified tenant identity required")
         return identity
 
+    @app.get("/v1/llm/profiles/{model_profile}")
+    async def llm_profile(model_profile: str, tenant_id=Depends(tenant)):
+        """Expose configured prompt limits for planning; this grants no capacity reservation."""
+        preparer = (preparers or {}).get(model_profile)
+        if preparer is None:
+            raise HTTPException(503, "no qualified tokenizer/template profile for this model")
+        return {
+            "model_profile": model_profile,
+            "capacity_profile_id": preparer.profile_id,
+            "context_limit": preparer.context_limit,
+            "response_formats": sorted(preparer.response_formats),
+            "allow_tool_calls": preparer.allow_tool_calls,
+        }
+
     @app.post("/v1/requests/prepare")
     async def prepare(request: PrepareRequest, tenant_id=Depends(tenant)):
         preparer = (preparers or {}).get(request.model_profile)

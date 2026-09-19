@@ -57,10 +57,19 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
-Version `0.2.0rc1` is a test release candidate for the accepted-policy, speech,
-artifact and deadline contracts. It must not replace the published `0.1.0` wheel
+Version `0.2.0rc2` adds HTTP tool-policy parity and prompt-profile discovery to
+the accepted-policy, speech, artifact and deadline contracts. It is a test release
+candidate and must not replace an earlier wheel
 under the same filename. Commit each passing phase, build immutable images from
 that commit, then deploy and smoke-test those images before the next phase.
+
+`RuntimeClient.llm_profile()` reads the authenticated
+`GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
+validated response formats and tool support. Persist it with agent planning state
+and reject a changed profile before reusing its journal; it is configuration, not
+live capacity or an admission permit. The HTTP driver preserves explicit boolean
+`parallel_tool_calls` alongside the tool transcript, while still issuing exactly
+one completion per admitted attempt and rejecting caller-controlled routing.
 
 Submission may include a separate immutable `configuration` artifact selected by
 the trusted application. Request identity remains the input digest and submission
