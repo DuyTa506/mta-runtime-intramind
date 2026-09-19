@@ -74,6 +74,12 @@ repair, publication retry and Continue-As-New through real Temporal/PostgreSQL.
 It uses fake inference and the application's real Markdown parser/renderer;
 these tests do not declare a production migration or measured serving capacity.
 
+The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
+condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.
+It verifies publication retry and history replay without new inference. Model
+responses and artifact storage are fixtures; the full PPTX workflow and render
+pipeline remain application migration work.
+
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
 validated response formats and tool support. Persist it with agent planning state
