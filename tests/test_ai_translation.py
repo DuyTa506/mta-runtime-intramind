@@ -38,6 +38,8 @@ async def test_translation_checkpoints_partial_batches_and_retries_publication(
         raw = user.split("```json\n")[-1].split("\n```")[0]
         items = json.loads(raw)
         requests.append(items)
+        if len(requests) == 1:
+            assert "Thuật ngữ cố định" in user
         settings.engine.thread_count = 64
         settings.engine.max_retries = 0
         settings.enabled = False
@@ -65,6 +67,8 @@ async def test_translation_checkpoints_partial_batches_and_retries_publication(
                                     build_activities=activities, respond=respond) as env:
         client = env.runtime_client("user:test")
         try:
+            policy["glossary_file"] = await client.put_bytes(
+                "en,vi\nHello,Thuật ngữ cố định\n".encode(), content_type="text/csv")
             uploaded = await client.put_bytes(b"# Hello world\n\nA second sentence.\n\n```python\nx = 1\n```\n",
                                               content_type="text/markdown")
             status, result = await env.submit({"file": uploaded, "filename": "source.md",
