@@ -52,7 +52,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-python -m pip install /release/intramind_runtime-0.2.0rc1-py3-none-any.whl
+python -m pip install /release/intramind_runtime-0.2.0rc4-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
