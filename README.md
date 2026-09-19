@@ -90,8 +90,11 @@ new inference. `tests/test_ai_pptx_validation.py` adds whole-deck coherence,
 ordered repair windows, layout persistence, lost acknowledgements and replay.
 An oversized audit is rejected by request preparation before admission; native
 deterministic repairs continue, and only dispatched repairs spend root budget.
-Model responses, tokenizer output and feature artifacts are fixtures; render and
-public PPTX cutover remain application migration work.
+`tests/test_ai_pptx_render.py` runs a separate render queue, losing render and
+publication acknowledgements before replay. It verifies Temporal cancellation
+reaches the export subprocess through heartbeats and prevents publication.
+Model/tokenizer responses, rendered file contents and feature artifacts are
+fixtures; Chromium image verification and public PPTX cutover remain application work.
 
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,

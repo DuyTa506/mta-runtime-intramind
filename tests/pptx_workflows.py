@@ -59,3 +59,12 @@ async def checkpoint_validation(ctx: TaskContext, inputs: dict) -> dict:
                                 task_queue=ctx.task_queue, inputs=manuscript)
     return await ctx.activity("test.pptx.validation-publish/v1",
                               common | {"input": result}, key="publish")
+
+
+@durable_task(name="pptx-render-checkpoint", version=1, policy=TaskPolicy(max_iterations=1))
+async def checkpoint_render(ctx: TaskContext, inputs: dict) -> dict:
+    prepared = await ctx.activity("test.pptx.render-seed/v1", {
+        "tenant_id": ctx.tenant_id, "root_id": ctx.root_id,
+        "started_at": ctx.started_at.isoformat()}, key="prepare")
+    return await ctx.run_child(key="render", task_type="pptx.render/v1",
+                              task_queue=prepared["queue"], inputs=prepared["validation"])
