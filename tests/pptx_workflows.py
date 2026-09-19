@@ -48,3 +48,14 @@ async def checkpoint_manuscript(ctx: TaskContext, inputs: dict) -> dict:
                                     task_queue=ctx.task_queue, inputs=plan)
     return await ctx.activity("test.pptx.manuscript-publish/v1",
                               common | {"input": manuscript}, key="publish")
+
+
+@durable_task(name="pptx-validation-checkpoint", version=1, policy=TaskPolicy(max_iterations=1))
+async def checkpoint_validation(ctx: TaskContext, inputs: dict) -> dict:
+    common = {"tenant_id": ctx.tenant_id}
+    manuscript = await ctx.activity("test.pptx.validation-seed/v1", common | {
+        "configuration": ctx.configuration}, key="prepare")
+    result = await ctx.run_child(key="validation", task_type="pptx.validation/v1",
+                                task_queue=ctx.task_queue, inputs=manuscript)
+    return await ctx.activity("test.pptx.validation-publish/v1",
+                              common | {"input": result}, key="publish")

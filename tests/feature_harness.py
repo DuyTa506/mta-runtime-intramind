@@ -45,7 +45,7 @@ def peak_children(history):
 @asynccontextmanager
 async def feature_environment(
     store, *, name, workflows, build_activities, respond, allow_tool_calls=False,
-    speech_profile=None, respond_speech=None,
+    speech_profile=None, respond_speech=None, tokenize_prompt=None,
 ):
     temporal = await temporal_test_client()
     namespace, uid = temporal.namespace, uuid4().hex
@@ -71,7 +71,7 @@ async def feature_environment(
     async def tokenize(request):
         return httpx.Response(200, json={"prompt": "test template", "tokens": [1] * 10})
 
-    sizing = httpx.AsyncClient(base_url="http://fake/", transport=httpx.MockTransport(tokenize))
+    sizing = httpx.AsyncClient(base_url="http://fake/", transport=httpx.MockTransport(tokenize_prompt or tokenize))
     preparer = LlamaCppPromptSizer(
         sizing,
         model="test",

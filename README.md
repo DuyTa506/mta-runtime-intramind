@@ -86,8 +86,12 @@ planning rollover, verifies retained policy/output limits and settled root usage
 `tests/test_ai_pptx_manuscript.py` qualifies manuscript waves, bounded native
 parse/audit repairs and a failed batch retaining the other slides. Lost join and
 publication acknowledgements, rollover and replay keep root usage settled without
-new inference. Model responses and artifact storage are fixtures; whole-deck
-audit, render and public PPTX cutover remain application migration work.
+new inference. `tests/test_ai_pptx_validation.py` adds whole-deck coherence,
+ordered repair windows, layout persistence, lost acknowledgements and replay.
+An oversized audit is rejected by request preparation before admission; native
+deterministic repairs continue, and only dispatched repairs spend root budget.
+Model responses, tokenizer output and feature artifacts are fixtures; render and
+public PPTX cutover remain application migration work.
 
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
