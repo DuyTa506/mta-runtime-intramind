@@ -46,7 +46,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-python -m pip install /release/intramind_runtime-0.1.0-py3-none-any.whl
+python -m pip install /release/intramind_runtime-0.2.0rc1-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -56,6 +56,11 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc1` is a test release candidate for the accepted-policy, speech,
+artifact and deadline contracts. It must not replace the published `0.1.0` wheel
+under the same filename. Commit each passing phase, build immutable images from
+that commit, then deploy and smoke-test those images before the next phase.
 
 Submission may include a separate immutable `configuration` artifact selected by
 the trusted application. Request identity remains the input digest and submission
