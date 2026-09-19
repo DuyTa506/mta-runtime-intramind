@@ -13,3 +13,14 @@ async def checkpoint_models(ctx: TaskContext, inputs: dict) -> dict:
     brief = await ctx.model_step(key="brief", planner="ai.model_step/v1",
                                 inputs=prepared, max_model_calls=1)
     return await ctx.activity("test.pptx.publish/v1", common | {"input": brief}, key="publish")
+
+
+@durable_task(name="pptx-context-checkpoint", version=1, policy=TaskPolicy(max_iterations=1))
+async def checkpoint_context(ctx: TaskContext, inputs: dict) -> dict:
+    common = {"tenant_id": ctx.tenant_id}
+    prepared = await ctx.activity("pptx.prepare/v1", common | {
+        "input": inputs, "root_id": ctx.root_id, "configuration": ctx.configuration,
+        "started_at": ctx.started_at.isoformat()}, key="prepare")
+    context = await ctx.run_child(key="context", task_type="pptx.context/v1",
+                                  task_queue=ctx.task_queue, inputs=prepared)
+    return await ctx.activity("test.pptx.context-publish/v1", common | {"input": context}, key="publish")

@@ -76,9 +76,12 @@ these tests do not declare a production migration or measured serving capacity.
 
 The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
 condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.
-It verifies publication retry and history replay without new inference. Model
-responses and artifact storage are fixtures; the full PPTX workflow and render
-pipeline remain application migration work.
+It verifies publication retry and history replay without new inference.
+`tests/test_ai_pptx_context.py` also exercises native document/corpus reading,
+bounded child windows, source and accepted-policy retention, mid-phase rollover,
+designated-primary selection and root accounting across all replayed histories.
+Model responses and artifact storage are fixtures; the complete deck planning,
+manuscript, audit and render pipeline remain application migration work.
 
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
