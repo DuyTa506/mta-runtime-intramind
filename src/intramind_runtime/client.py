@@ -24,6 +24,16 @@ class RuntimeClient:
         response.raise_for_status()
         return response.json()
 
+    async def buffer(self, submission: dict):
+        response = await self.client.post("/v1/buffers", json=submission)
+        response.raise_for_status()
+        return response.json()
+
+    async def get_buffered(self, item_id: str):
+        response = await self.client.get(f"/v1/buffers/{item_id}")
+        response.raise_for_status()
+        return response.json()
+
     async def cancel(self, run_id: str):
         response = await self.client.post(f"/v1/runs/{run_id}/cancel")
         response.raise_for_status()

@@ -45,7 +45,8 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
     assert state["state"] == "RUNNING" and state["reserved"] == 30
     assert state["resource_budgets"] == {} and state["cleanup_pending"]
     async with store.engine.connect() as connection:
-        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0002"
+        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0003"
+        assert (await connection.execute(text("SELECT count(*) FROM runtime_buffer_items"))).scalar_one() == 0
         assert (await connection.execute(text("SELECT budget_unit FROM runtime_attempts"))).scalar_one() == "tokens"
     await store.confirm_epoch_stopped("p", "e1", "test legacy engine stopped")
     state = await store.run("migration-preserved", "t")

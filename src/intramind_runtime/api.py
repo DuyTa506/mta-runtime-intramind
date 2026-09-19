@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import Field
 
 from .artifacts import MAX_ARTIFACT_BYTES, ArtifactPort, tenant_prefix
+from .buffering import BufferedSubmission, BufferedSubmissions
 from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
 from .preparation import PrepareRequest
 from .speech import SpeechPrepareRequest
@@ -55,6 +56,7 @@ def create_app(
     app = FastAPI(title="Intramind Runtime", version="0.1.0", lifespan=lifespan)
     uploads = ArtifactUploads(artifacts, max_bytes=artifact_max_bytes,
                               concurrency=artifact_upload_concurrency)
+    buffers = BufferedSubmissions(store, artifacts, control_queue=control_queue)
 
     async def tenant(request: Request):
         provided = request.headers.get("authorization", "")
@@ -73,6 +75,10 @@ def create_app(
             raise HTTPException(503, "no qualified tokenizer/template profile for this model")
         return {
             "model_profile": model_profile,
+            "model": preparer.model,
+            "endpoint_fingerprint": sha256(
+                str(preparer.client.base_url).rstrip("/").removesuffix("/v1").encode()
+            ).hexdigest(),
             "capacity_profile_id": preparer.profile_id,
             "context_limit": preparer.context_limit,
             "response_formats": sorted(preparer.response_formats),
@@ -182,6 +188,22 @@ def create_app(
             spec["input"]["configuration"] = request.configuration.model_dump(mode="json")
         run_id = await store.submit_run(root, request.submission_key, request.input.sha256, spec)
         return {"task_id": run_id, "run_id": run_id, "status": "submitted", "owner": "temporal"}
+
+    @app.post("/v1/buffers", status_code=202)
+    async def buffer(request: BufferedSubmission, tenant_id=Depends(tenant)):
+        definition = definitions.get(request.task_type)
+        if definition is None:
+            raise HTTPException(422, "task type/version is not registered")
+        for ref in (request.input, request.configuration):
+            if not ref.key.startswith(tenant_prefix(tenant_id)):
+                raise NotFound("artifact")
+            await artifacts.get(ref)
+        item_id = await buffers.append(tenant_id, request, definition)
+        return {"item_id": item_id, "status": "buffered", "owner": "temporal"}
+
+    @app.get("/v1/buffers/{item_id}")
+    async def buffer_status(item_id: str, tenant_id=Depends(tenant)):
+        return await buffers.status(tenant_id, item_id)
 
     @app.get("/v1/runs/{run_id}")
     async def status(run_id: str, tenant_id=Depends(tenant)):

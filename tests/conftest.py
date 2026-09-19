@@ -53,7 +53,7 @@ async def store():
     async with store.engine.begin() as c:
         await c.execute(text("DROP SCHEMA public CASCADE"))
         await c.execute(text("CREATE SCHEMA public"))
-        for name in ("schema.sql", "speech_budget.sql"):
+        for name in ("schema.sql", "speech_budget.sql", "buffering.sql"):
             for statement in files("intramind_runtime").joinpath(name).read_text().split(";"):
                 if statement.strip():
                     await c.execute(text(statement))

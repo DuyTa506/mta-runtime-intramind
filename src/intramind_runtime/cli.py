@@ -160,8 +160,13 @@ async def services(command, settings, config):
                 settings.temporal_address, namespace=settings.temporal_namespace
             )
             if command == "outbox":
+                from .buffering import BufferedSubmissions
+
                 publisher = OutboxPublisher(store, client, str(uuid4()))
                 tasks.append(asyncio.create_task(repeat(publisher.tick, 5, on_events=True)))
+                buffers = BufferedSubmissions(store, artifacts(settings),
+                                              control_queue=settings.temporal_queue)
+                tasks.append(asyncio.create_task(repeat(buffers.tick, 5, on_events=True)))
             elif command == "worker":
                 activities = BrokerActivities(store, artifacts(settings))
                 worker = Worker(

@@ -33,6 +33,7 @@ neither replaces storage nor migrates buckets.
 | `client` / `api` | Authenticated submission, status, cancellation and artifact access |
 | `temporal_adapter` | Idempotent submit/attach, asynchronous completion and outbox delivery |
 | `store` | Atomic tenant/root admission, attempts, reservations, fencing and budgets |
+| `buffering` | Bounded durable inputs, accepted policy, delayed batches and partition serialization |
 | `executor` / `drivers` | One transport attempt and separate result persistence |
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
@@ -62,7 +63,7 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
-Version `0.2.0rc2` adds HTTP tool-policy parity and prompt-profile discovery to
+Version `0.2.0rc4` adds deferred batch submission and migration `0003` to
 the accepted-policy, speech, artifact and deadline contracts. It is a test release
 candidate and must not replace an earlier wheel
 under the same filename. Commit each passing phase, build immutable images from
@@ -89,6 +90,15 @@ Continue-As-New. Keep enable flags and credentials outside this snapshot.
 `map_children(window=...)` bounds each feature phase within `TaskPolicy.child_window`;
 it does not reserve inference capacity. These additions require matching API/SDK
 builds and are not present in the previously published wheel.
+
+`RuntimeClient.buffer()` accepts tenant-scoped immutable input/configuration
+artifacts, a partition key, a stable submission key, delay and batch size. Enable
+`buffering` bounds in the task catalog explicitly. The outbox process seals due
+inputs and starts a regular durable workflow; only one batch per tenant/task/partition
+is active. Lost artifact/submit ACKs reuse the frozen batch and root. Policy changes
+start a subsequent batch. Pending records do not expire or get trimmed; backpressure
+rejects new inputs. `get_buffered(item_id)` reports pending, root state or an explicit
+dispatch deadline failure. This facility does not require Celery Beat or Redis.
 
 `prepare(..., attempt_timeout_seconds=...)` carries a trusted total attempt limit
 outside the model payload. Values must be finite, positive numbers up to 86,400

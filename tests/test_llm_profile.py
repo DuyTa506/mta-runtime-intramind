@@ -1,3 +1,5 @@
+from hashlib import sha256
+
 import httpx
 from fakes import MemoryArtifacts
 
@@ -12,7 +14,7 @@ async def test_planner_reads_pinned_context_capability_without_touching_inferenc
     def forbidden(request):
         raise AssertionError("profile discovery must not invoke the engine")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(forbidden)) as backend:
+    async with httpx.AsyncClient(base_url="http://fixture/v1/", transport=httpx.MockTransport(forbidden)) as backend:
         sizer = LlamaCppPromptSizer(
             backend, model="tool", capacity_profile_id="gpu-profile-v7", context_limit=16384,
             token_margin=8, expected_output_tokens=1024,
@@ -28,6 +30,7 @@ async def test_planner_reads_pinned_context_capability_without_touching_inferenc
                 "model_profile": "review", "capacity_profile_id": "gpu-profile-v7",
                 "context_limit": 16384, "response_formats": ["json_schema", "text"],
                 "allow_tool_calls": True,
+                "model": "tool", "endpoint_fingerprint": sha256(b"http://fixture").hexdigest(),
             }
             assert (await http.get("/v1/llm/profiles/missing")).status_code == 503
 
