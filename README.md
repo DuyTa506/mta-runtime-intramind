@@ -74,6 +74,13 @@ repair, publication retry and Continue-As-New through real Temporal/PostgreSQL.
 It uses fake inference and the application's real Markdown parser/renderer;
 these tests do not declare a production migration or measured serving capacity.
 
+The opt-in `tests/test_be_ingestion_parse.py` suite runs native BE text parsing
+through real Temporal/PostgreSQL. A downstream lost acknowledgement, root rollover
+and replay reuse the immutable parsed checkpoint without repeating source reads or
+parsing. It preserves accepted flags, source bytes and document ownership. Enable
+`RUNTIME_TEST_BE_FEATURES=yes` in the BE dependency environment; this case does not
+qualify external OCR, embedding, index publication or public ingestion routing.
+
 The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
 condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.
 It verifies publication retry and history replay without new inference.
