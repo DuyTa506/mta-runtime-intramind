@@ -89,6 +89,14 @@ rollovers and history replay repeat no committed embedding. Model vectors and
 parsed source are fixtures; the native CPU splitter/process, Temporal and budget
 ledger are real. These checks do not publish to application indexes.
 
+`tests/test_be_ingestion_publication.py` exercises the native BE publication worker
+with 65 generation-addressed batches, lost batch/receipt ACKs and root/child
+rollover/replay. Besides the BE opt-in, it requires explicit
+`INGESTION_TEST_MONGO_URI`, `INGESTION_TEST_ELASTIC_URL` and `INGESTION_TEST_QDRANT_URL`.
+It creates and removes only its UUID-named test database/indexes/collection. Real
+Temporal/PostgreSQL and index stores are used; parsed text/vectors are fixtures,
+and page-image publication/public ingestion routing are outside this case.
+
 The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
 condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.
 It verifies publication retry and history replay without new inference.
