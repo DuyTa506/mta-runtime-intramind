@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0rc5 — unreleased
+
+- Embedding operations share admission, root identities and attempt limits while
+  keeping a separate character budget. Migration `0004` retains existing reservations.
+- Pinned embedding profiles bound batches and validate model revision, dimension,
+  finite vectors and response bytes. Timeout/unconfirmed compute remains UNKNOWN.
+- `TaskContext.embedding`, service preparation and broker completion keep vectors
+  through persistence retries, downstream failure, Continue-As-New and history replay.
+
 ## 0.1.0 — unreleased
 
 - Bounded file-based artifact uploads support 128 MiB binary results while retaining

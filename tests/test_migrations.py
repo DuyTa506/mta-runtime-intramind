@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from conftest import operation, pool, root
 from sqlalchemy import text
+from test_speech_ledger import speech, speech_pool
 
 pytestmark = pytest.mark.integration
 
@@ -39,15 +40,28 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
                     'SEND_INTENT',30)"""))
         await connection.execute(text("""UPDATE runtime_operations SET state='EXECUTING',
             active_attempt='old-attempt',attempts=1 WHERE operation_id='legacy'"""))
+    await migrate("0003")
+    await store.create_root(root("speech-preserved", resource_budgets={"speech_characters": 12}))
+    await store.configure_pool(speech_pool(), 4)
+    await store.submit_operation(speech().model_copy(update={"root_id": "speech-preserved"}))
+    speech_attempt = await store.reserve_next("voice", "speech-before-upgrade")
+    await store.mark_send(speech_attempt)
     await migrate()
     await migrate()
     state = await store.run("migration-preserved", "t")
     assert state["state"] == "RUNNING" and state["reserved"] == 30
     assert state["resource_budgets"] == {} and state["cleanup_pending"]
+    assert (await store.run("speech-preserved", "t"))["resource_budgets"]["speech_characters"] == {
+        "limit": 12, "reserved": 12, "spent": 0,
+    }
     async with store.engine.connect() as connection:
-        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0003"
+        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0004"
         assert (await connection.execute(text("SELECT count(*) FROM runtime_buffer_items"))).scalar_one() == 0
-        assert (await connection.execute(text("SELECT budget_unit FROM runtime_attempts"))).scalar_one() == "tokens"
+        assert (await connection.execute(text("SELECT budget_unit FROM runtime_attempts WHERE attempt_id='old-attempt'"))).scalar_one() == "tokens"
     await store.confirm_epoch_stopped("p", "e1", "test legacy engine stopped")
     state = await store.run("migration-preserved", "t")
     assert state["spent"] == 30 and state["reserved"] == 0 and not state["cleanup_pending"]
+    await store.confirm_epoch_stopped("voice", "e1", "test speech engine stopped")
+    assert (await store.run("speech-preserved", "t"))["resource_budgets"]["speech_characters"] == {
+        "limit": 12, "reserved": 0, "spent": 12,
+    }

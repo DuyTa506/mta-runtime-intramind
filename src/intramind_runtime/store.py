@@ -257,15 +257,19 @@ class Store:
                 AND o.spec->>'model_profile'=:model
                 AND COALESCE(o.spec->>'kind','llm')=:kind
                 AND (o.spec->>'capacity_profile_id' IS NULL OR o.spec->>'capacity_profile_id'=:profile)
-                AND CASE WHEN :kind='speech' THEN (o.spec->>'characters_bound')::bigint
+                AND CASE WHEN :kind IN ('speech','embedding') THEN GREATEST(1,(o.spec->>'characters_bound')::bigint)
                     ELSE (o.spec->>'input_tokens_bound')::bigint+(o.spec->>'max_output_tokens')::bigint
                     END<=:request_limit
+                AND (:kind<>'embedding' OR (o.spec->>'texts_count')::bigint<=:batch_limit)
+                AND (:kind<>'embedding' OR o.spec->>'model_revision'=:model_revision)
                 AND CAST(:capabilities AS jsonb) @> (o.spec->'required_capabilities')
                 ORDER BY (r.priority=:preferred) DESC,
                 (SELECT COALESCE(max(r2.last_served),0) FROM runtime_roots r2
                  WHERE r2.tenant_id=r.tenant_id),r.last_served,o.created_at,o.operation_id LIMIT 64""",
                 model=pool["model_profile"], preferred=preferred, profile=pool["spec"]["profile_id"],
                 kind=profile.kind, request_limit=profile.request_limit,
+                batch_limit=getattr(profile, "max_batch_size", 0),
+                model_revision=profile.model_revision,
                 capabilities=encode(pool["spec"]["capabilities"]))
             for candidate in candidates:
                 spec = parse_operation(candidate["spec"])
@@ -697,7 +701,16 @@ class Store:
                         await self._terminal(c, op["operation_id"], "FAILED", "capacity_profile_changed")
                         continue
                     compatible = [p for p in compatible if p.profile_id == spec.capacity_profile_id]
-                if compatible and all(p.request_limit < spec.budget_bound for p in compatible):
+                if compatible and spec.kind == "embedding":
+                    compatible = [p for p in compatible if p.model_revision == spec.model_revision]
+                    if not compatible:
+                        await self._terminal(c, op["operation_id"], "FAILED", "model_revision_changed")
+                        continue
+                if compatible and all(
+                    p.request_limit < spec.budget_bound
+                    or (spec.kind == "embedding" and p.max_batch_size < spec.texts_count)
+                    for p in compatible
+                ):
                     await self._terminal(c, op["operation_id"], "FAILED",
                         "context_exceeds_all_pools" if spec.kind == "llm" else "request_exceeds_all_pools")
             await execute(c, """UPDATE runtime_roots SET state='FAILED',terminal_reason='deadline_exceeded',

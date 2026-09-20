@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from .artifacts import ArtifactPort
-from .contracts import RuntimeConflict, SpeechResult
+from .contracts import EmbeddingResult, RuntimeConflict, SpeechResult
 from .drivers import DriverFailure, EngineDriver
 from .store import Store, encode
 
@@ -69,6 +69,8 @@ class Executor:
                         attachments = (audio,)
                         document["body"] = result.body | {"audio": audio.model_dump(mode="json")}
                         usage = result.characters
+                    elif isinstance(result, EmbeddingResult):
+                        usage = max(1, result.characters)
                     else:
                         usage = (result.input_tokens + result.output_tokens
                             if result.input_tokens is not None and result.output_tokens is not None else None)

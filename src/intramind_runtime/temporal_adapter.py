@@ -16,6 +16,7 @@ from .artifacts import ArtifactPort
 from .contracts import (
     AdmissionDenied,
     Artifact,
+    EmbeddingOperationSpec,
     InferenceOperation,
     NotFound,
     OperationSpec,
@@ -39,6 +40,10 @@ class BrokerActivities:
     @activity.defn(name="runtime.submit_or_attach_speech")
     async def submit_speech(self, payload: dict) -> dict:
         return await self._submit(SpeechOperationSpec.model_validate(payload))
+
+    @activity.defn(name="runtime.submit_or_attach_embedding")
+    async def submit_embedding(self, payload: dict) -> dict:
+        return await self._submit(EmbeddingOperationSpec.model_validate(payload))
 
     async def _submit(self, spec: InferenceOperation) -> dict:
         try:

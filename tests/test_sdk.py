@@ -168,21 +168,22 @@ async def test_configuration_survives_children_and_rollover(runtime_clock, monke
     assert rollover.call_args.args[0]["configuration"] == ref
 
 
-async def test_speech_command_uses_original_root_identity_and_durable_wait(runtime_clock, monkeypatch):
+@pytest.mark.parametrize("kind,extra", [("speech", {}), ("embedding", {"texts_count": 2, "model_revision": "model-v1"})])
+async def test_resource_command_uses_original_root_identity_and_durable_wait(runtime_clock, monkeypatch, kind, extra):
     now, _ = runtime_clock
     ctx = context(now, child_path=["clips", "3"])
     execute = AsyncMock(return_value={"key": "result"})
     monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
-    result = await ctx.speech(
+    result = await getattr(ctx, kind)(
         key="voice", payload={"key": "payload", "sha256": "a" * 64, "size": 5},
         model_profile="voice", capacity_profile_id="voice-v1", characters_bound=30,
-        expected_cost=30, attempt_timeout_seconds=25,
+        expected_cost=30, attempt_timeout_seconds=25, **extra,
     )
     assert result == {"key": "result"}
     name, command = execute.await_args.args
-    assert name == "runtime.submit_or_attach_speech"
+    assert name == f"runtime.submit_or_attach_{kind}"
     assert command["root_id"] == "root" and command["tenant_id"] == "tenant"
-    assert command["operation_id"] == ctx.key("voice") and command["kind"] == "speech"
+    assert command["operation_id"] == ctx.key("voice") and command["kind"] == kind
     assert "max_output_tokens" not in command
     assert execute.await_args.kwargs["start_to_close_timeout"] == timedelta(hours=1)
 

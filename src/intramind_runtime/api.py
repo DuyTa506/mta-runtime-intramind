@@ -12,6 +12,7 @@ from pydantic import Field
 from .artifacts import MAX_ARTIFACT_BYTES, ArtifactPort, tenant_prefix
 from .buffering import BufferedSubmission, BufferedSubmissions
 from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
+from .embedding import EmbeddingPrepareRequest
 from .preparation import PrepareRequest
 from .speech import SpeechPrepareRequest
 from .store import Store, row
@@ -35,6 +36,7 @@ def create_app(
     *,
     manage_lifecycle=False,
     speech_preparers=None,
+    embedding_preparers=None,
     artifact_max_bytes=MAX_ARTIFACT_BYTES,
     artifact_upload_concurrency=2,
 ) -> FastAPI:
@@ -111,6 +113,23 @@ def create_app(
         preparer = (speech_preparers or {}).get(request.model_profile)
         if preparer is None:
             raise HTTPException(503, "no qualified speech profile")
+        try:
+            return await preparer.prepare(request, artifacts, tenant_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/v1/embedding/profiles/{model_profile}")
+    async def embedding_profile(model_profile: str, tenant_id=Depends(tenant)):
+        preparer = (embedding_preparers or {}).get(model_profile)
+        if preparer is None:
+            raise HTTPException(503, "no qualified embedding profile")
+        return preparer.profile.model_dump(mode="json")
+
+    @app.post("/v1/embedding/prepare")
+    async def prepare_embedding(request: EmbeddingPrepareRequest, tenant_id=Depends(tenant)):
+        preparer = (embedding_preparers or {}).get(request.model_profile)
+        if preparer is None:
+            raise HTTPException(503, "no qualified embedding profile")
         try:
             return await preparer.prepare(request, artifacts, tenant_id)
         except ValueError as exc:

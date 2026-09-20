@@ -4,7 +4,7 @@ from typing import Protocol
 
 import httpx
 
-from .contracts import CancelOutcome, EngineResult, Reservation, SpeechResult
+from .contracts import CancelOutcome, EmbeddingResult, EngineResult, Reservation, SpeechResult
 
 
 class DriverFailure(Exception):
@@ -14,7 +14,9 @@ class DriverFailure(Exception):
 
 
 class EngineDriver(Protocol):
-    async def execute(self, reservation: Reservation, payload: dict) -> EngineResult | SpeechResult: ...
+    async def execute(
+        self, reservation: Reservation, payload: dict
+    ) -> EngineResult | SpeechResult | EmbeddingResult: ...
     async def cancel(self, reservation: Reservation) -> CancelOutcome: ...
 
 

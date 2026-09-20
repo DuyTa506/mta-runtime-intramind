@@ -20,8 +20,9 @@ from temporalio.worker import Worker, WorkerDeploymentConfig
 
 from .api import create_app
 from .artifacts import MinioArtifacts
-from .contracts import PoolSpec, SpeechPoolSpec, parse_pool
+from .contracts import EmbeddingPoolSpec, PoolSpec, SpeechPoolSpec, parse_pool
 from .drivers import OpenAICompletionDriver
+from .embedding import EmbeddingPreparer, EmbeddingProfile, ServingEmbeddingDriver
 from .executor import Executor
 from .preparation import LlamaCppPromptSizer
 from .settings import Settings
@@ -47,7 +48,7 @@ def artifacts(settings):
 def preparers(config):
     result = {}
     for pool in config["pools"]:
-        if pool["admission"].get("kind") == "speech":
+        if pool["admission"].get("kind", "llm") != "llm":
             continue
         sizing = pool.get("prompt_sizing")
         if not sizing:
@@ -99,8 +100,34 @@ def speech_profiles(config):
     return result
 
 
-def engine_driver(pool, speech):
+def embedding_profiles(config):
+    result = {}
+    for pool in config["pools"]:
+        spec = parse_pool(pool["admission"])
+        if not isinstance(spec, EmbeddingPoolSpec):
+            continue
+        qualification = pool["embedding"]
+        if (qualification["validated_profile_id"] != spec.profile_id
+            or qualification["termination_contract"] != "termination-v1"):
+            raise ValueError("embedding contract must match its qualified capacity profile")
+        if spec.model_profile in result:
+            raise ValueError("ambiguous embedding profile")
+        result[spec.model_profile] = EmbeddingProfile(
+            model_profile=spec.model_profile, capacity_profile_id=spec.profile_id,
+            model=qualification["model"], model_revision=spec.model_revision,
+            dimension=qualification["dimension"], max_batch_size=spec.max_batch_size,
+            character_limit=spec.character_limit,
+            max_text_characters=qualification["max_text_characters"],
+            max_response_bytes=qualification["max_response_bytes"],
+        )
+    return result
+
+
+def engine_driver(pool, speech, embeddings=None):
     spec = parse_pool(pool["admission"])
+    if isinstance(spec, EmbeddingPoolSpec):
+        return ServingEmbeddingDriver(pool["base_url"], embeddings[spec.model_profile],
+            api_key=os.environ[pool["api_key_env"]] if pool.get("api_key_env") else None)
     if isinstance(spec, SpeechPoolSpec):
         return ServingSpeechDriver(pool["base_url"], speech[spec.model_profile],
             api_key=os.environ[pool["api_key_env"]] if pool.get("api_key_env") else None)
@@ -145,8 +172,9 @@ async def services(command, settings, config):
             blobs = artifacts(settings)
             await blobs.ready()
             speech = speech_profiles(config)
+            embeddings = embedding_profiles(config)
             for pool in config["pools"]:
-                driver = engine_driver(pool, speech)
+                driver = engine_driver(pool, speech, embeddings)
                 drivers.append(driver)
                 for _ in range(settings.executor_count):
                     worker = Executor(
@@ -172,7 +200,8 @@ async def services(command, settings, config):
                 worker = Worker(
                     client,
                     task_queue=settings.temporal_queue,
-                    activities=[activities.submit_or_attach, activities.submit_speech, activities.finish],
+                    activities=[activities.submit_or_attach, activities.submit_speech,
+                                activities.submit_embedding, activities.finish],
                     max_concurrent_activities=32,
                     graceful_shutdown_timeout=timedelta(seconds=30),
                     deployment_config=WorkerDeploymentConfig(
@@ -227,6 +256,8 @@ def main():
             manage_lifecycle=True,
             speech_preparers={key: SpeechPreparer(profile)
                               for key, profile in speech_profiles(config).items()},
+            embedding_preparers={key: EmbeddingPreparer(profile)
+                                 for key, profile in embedding_profiles(config).items()},
             artifact_max_bytes=settings.artifact_max_bytes,
             artifact_upload_concurrency=settings.artifact_upload_concurrency,
         )

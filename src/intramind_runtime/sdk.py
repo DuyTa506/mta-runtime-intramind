@@ -17,7 +17,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 with workflow.unsafe.imports_passed_through():
-    from .contracts import Artifact, OperationSpec, SpeechOperationSpec
+    from .contracts import Artifact, EmbeddingOperationSpec, OperationSpec, SpeechOperationSpec
 
 
 class OperationDeadlineExceeded(TimeoutError):
@@ -191,6 +191,24 @@ class TaskContext:
         if deadline is None:
             payload.pop("deadline")
         return await self._inference("runtime.submit_or_attach_speech", payload)
+
+    async def embedding(
+        self, *, key: str, payload: dict, model_profile: str, capacity_profile_id: str, model_revision: str,
+        characters_bound: int, texts_count: int, expected_cost: int, attempt_timeout_seconds: float,
+        deadline: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Wait durably for one embedding batch under the same root and shared admission."""
+        spec = EmbeddingOperationSpec(
+            operation_id=self.key(key), root_id=self.root_id, tenant_id=self.tenant_id,
+            payload=Artifact.model_validate(payload), model_profile=model_profile,
+            capacity_profile_id=capacity_profile_id, characters_bound=characters_bound,
+            texts_count=texts_count, expected_cost=expected_cost, model_revision=model_revision,
+            attempt_timeout_seconds=attempt_timeout_seconds, deadline=deadline,
+        )
+        command = spec.model_dump(mode="json")
+        if deadline is None:
+            command.pop("deadline")
+        return await self._inference("runtime.submit_or_attach_embedding", command)
 
     async def speech_outcome(self, **request: Any) -> dict[str, Any]:
         """Permit the feature's voice fallback only after a terminal transport failure."""

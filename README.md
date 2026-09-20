@@ -36,6 +36,7 @@ neither replaces storage nor migrates buckets.
 | `buffering` | Bounded durable inputs, accepted policy, delayed batches and partition serialization |
 | `executor` / `drivers` | One transport attempt and separate result persistence |
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
+| `embedding` | Pinned document/query batches, vector validation and independent input accounting |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
 | `uploads` | Bounded temporary files and concurrency for artifact ingestion |
 | `admin` | Namespace and pinned worker deployment administration |
@@ -52,7 +53,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-python -m pip install /release/intramind_runtime-0.2.0rc4-py3-none-any.whl
+python -m pip install /release/intramind_runtime-0.2.0rc5-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -63,10 +64,9 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
-Version `0.2.0rc4` adds deferred batch submission and migration `0003` to
-the accepted-policy, speech, artifact and deadline contracts. It is a test release
-candidate and must not replace an earlier wheel
-under the same filename. Commit each passing phase, build immutable images from
+Version `0.2.0rc5` adds embedding admission and migration `0004` to the accepted-policy,
+speech, buffering, artifact and deadline contracts. It is a release candidate;
+never replace an earlier wheel under the same filename. Commit each passing phase, build immutable images from
 that commit, then deploy and smoke-test those images before the next phase.
 
 The AI translation integration suite exercises partial batch acceptance, finite
@@ -150,7 +150,7 @@ worker builds. Reservation now includes its derived `attempt_deadline`; no new
 database column is needed because attempt creation time, operation policy and
 root deadline are already durable.
 
-An optional absolute `deadline` on `ctx.llm`, `ctx.speech` and `ctx.activity`
+An optional absolute `deadline` on `ctx.llm`, `ctx.speech`, `ctx.embedding` and `ctx.activity`
 bounds a feature phase across queueing, retries and worker recovery. Derive it
 once from the workflow clock and reuse it for every effect in that phase.
 `OperationDeadlineExceeded` lets the feature apply its explicit timeout policy;
@@ -164,6 +164,32 @@ and neither lease recovery nor a late result can resurrect the operation. Only
 confirmed not-sent work can refund its reservation. Calls without a phase deadline
 keep their prior activity command shape. This is a source contract addition;
 upgrade the API, broker and SDK together and retain pinned workers for old histories.
+
+Embedding uses `TaskContext.embedding` and the same operation/attempt ledger,
+root attempt limit and resource-group admission. The trusted task catalog allocates
+`resource_budgets: {"embedding_characters": <positive limit>}` independently of LLM
+tokens and speech. Usage is the sum of input character counts, with a one-unit
+minimum per batch, including an all-empty batch. This is accounting, not a token
+or GPU-memory estimate. Migration `0004` extends the existing budget constraints;
+apply it before starting rc5 runtime services, keeping pinned workers for prior runs.
+
+An embedding pool declares `admission.kind="embedding"`, `character_limit` and
+`max_batch_size`. Its `embedding` configuration supplies `validated_profile_id`,
+`termination_contract="termination-v1"`, `model`, `dimension`, `max_text_characters`
+and `max_response_bytes`. Model revision, profile, per-text/batch bounds and vector
+dimensions must be qualified together. No embedding capacity is enabled by default.
+The app snapshots `embedding_profile`, calls `prepare_embedding`, and checkpoints
+each returned batch through `ctx.embedding`. The runtime preserves input order,
+empty texts and document/query semantics; it neither truncates input nor normalizes
+vectors. Chunking and model-native truncation policies belong to the accepted
+application/deployment profile.
+
+The embedding driver requires matching attempt/termination headers and the pinned
+model/config revision. A timeout or unconfirmed compute failure keeps UNKNOWN
+resource accounting. A completed response with invalid dimensions, nonfinite values
+or excessive bytes cannot be published; artifact persistence retries reuse the
+completed vectors. A real Temporal/PostgreSQL test covers batch accounting,
+downstream lost acknowledgement, rollover and history replay with fixture inference.
 
 Speech uses `TaskContext.speech` / `speech_outcome` with the same operation/attempt
 ledger, root attempt limit and resource-group admission. Its character budget is

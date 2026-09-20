@@ -49,7 +49,7 @@ class RootSpec(Contract):
     deadline: datetime
     budget_limit: int = Field(gt=0)
     resource_budgets: dict[
-        Literal["speech_characters"], Annotated[int, Field(gt=0, strict=True)]
+        Literal["speech_characters", "embedding_characters"], Annotated[int, Field(gt=0, strict=True)]
     ] = Field(default_factory=dict)
     max_operations: int = Field(default=10_000, gt=0, le=100_000)
     max_pending: int = Field(default=64, gt=0, le=1024)
@@ -119,12 +119,29 @@ class SpeechOperationSpec(_OperationSpec):
         return self.characters_bound
 
 
-InferenceOperation = OperationSpec | SpeechOperationSpec
+class EmbeddingOperationSpec(_OperationSpec):
+    kind: Literal["embedding"] = "embedding"
+    model_revision: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$")
+    characters_bound: int = Field(ge=0, strict=True)
+    texts_count: int = Field(gt=0, strict=True)
+
+    @property
+    def budget_unit(self) -> str:
+        return "embedding_characters"
+
+    @property
+    def budget_bound(self) -> int:
+        # An empty text still performs inference; each batch reserves at least one unit.
+        return max(1, self.characters_bound)
+
+
+InferenceOperation = OperationSpec | SpeechOperationSpec | EmbeddingOperationSpec
 
 
 def parse_operation(value: dict) -> InferenceOperation:
     """Keep legacy completion records valid without inventing token fields for speech."""
-    model = SpeechOperationSpec if value.get("kind") == "speech" else OperationSpec
+    model = {"speech": SpeechOperationSpec, "embedding": EmbeddingOperationSpec}.get(
+        value.get("kind"), OperationSpec)
     return model.model_validate(value)
 
 
@@ -174,12 +191,23 @@ class SpeechPoolSpec(_PoolSpec):
         return self.character_limit
 
 
-InferencePool = PoolSpec | SpeechPoolSpec
+class EmbeddingPoolSpec(_PoolSpec):
+    kind: Literal["embedding"] = "embedding"
+    character_limit: int = Field(gt=0, strict=True)
+    max_batch_size: int = Field(gt=0, le=256, strict=True)
+
+    @property
+    def request_limit(self) -> int:
+        return self.character_limit
+
+
+InferencePool = PoolSpec | SpeechPoolSpec | EmbeddingPoolSpec
 
 
 def parse_pool(value: dict) -> InferencePool:
     """Read the resource class explicitly; old pool records remain completion pools."""
-    model = SpeechPoolSpec if value.get("kind") == "speech" else PoolSpec
+    model = {"speech": SpeechPoolSpec, "embedding": EmbeddingPoolSpec}.get(
+        value.get("kind"), PoolSpec)
     return model.model_validate(value)
 
 
@@ -211,6 +239,11 @@ class SpeechResult(Contract):
     body: dict[str, Any]
     audio: bytes = Field(exclude=True)
     characters: int = Field(gt=0, strict=True)
+
+
+class EmbeddingResult(Contract):
+    body: dict[str, Any]
+    characters: int = Field(ge=0, strict=True)
 
 
 class CancelOutcome(StrEnum):
