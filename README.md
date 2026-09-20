@@ -97,6 +97,14 @@ It creates and removes only its UUID-named test database/indexes/collection. Rea
 Temporal/PostgreSQL and index stores are used; parsed text/vectors are fixtures,
 and page-image publication/public ingestion routing are outside this case.
 
+`tests/test_be_ingestion_root.py` runs the application's `ingestion.document/v1`
+with native parsing and splitting, shared root embedding accounting, real publication
+stores and dedup. Lost dedup/embedding-record/publication ACKs and replay of every
+child/rollover retain one decision and the accepted configuration. A scoped alias
+does no embedding or index publication. Inference and page storage are fixtures;
+packaged PDF/DOCX/MinIO checks belong to infrastructure phase deployment. Public
+submission, cancellation and promotion-on-delete remain separate integration work.
+
 The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
 condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.
 It verifies publication retry and history replay without new inference.
