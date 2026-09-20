@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0rc6 — unreleased
+
+- `TaskContext.embedding_outcome` exposes only confirmed terminal backend failures
+  to an application's accepted fallback. Budget, revision/vector corruption,
+  deadline, cancellation and uncertain compute still propagate through recovery.
+
 ## 0.2.0rc5 — unreleased
 
 - Embedding operations share admission, root identities and attempt limits while

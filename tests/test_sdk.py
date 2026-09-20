@@ -192,18 +192,23 @@ async def test_resource_command_uses_original_root_identity_and_durable_wait(run
     ("speech_backend_503", True), ("speech_backend_500", True), ("max_attempts", True),
     ("root_budget_exhausted", False), ("root_attempt_budget", False),
     ("capacity_profile_changed", False), ("deadline_exceeded", False),
+    ("embedding_invalid_vectors", False), ("embedding_model_revision_changed", False),
+    ("backend_epoch_stopped", False),
 ])
-async def test_speech_fallback_does_not_swallow_root_or_compatibility_failure(
-    runtime_clock, monkeypatch, reason, allowed
+@pytest.mark.parametrize("kind", ["speech", "embedding"])
+async def test_native_fallback_does_not_swallow_root_or_compatibility_failure(
+    runtime_clock, monkeypatch, reason, allowed, kind
 ):
+    reason = reason.replace("speech_backend_", kind + "_backend_")
     ctx = context(runtime_clock[0])
     failure = failed_activity(ApplicationError(reason, type="OperationFailed", non_retryable=True))
-    monkeypatch.setattr(ctx, "speech", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(ctx, kind, AsyncMock(side_effect=failure))
+    outcome = getattr(ctx, kind + "_outcome")
     if allowed:
-        assert await ctx.speech_outcome() == {"error": reason}
+        assert await outcome() == {"error": reason}
     else:
         with pytest.raises(ActivityError):
-            await ctx.speech_outcome()
+            await outcome()
 
 
 @pytest.mark.parametrize("window,expected", [(1, 1), (3, 3), (8, 4), (None, 4)])

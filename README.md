@@ -53,7 +53,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-python -m pip install /release/intramind_runtime-0.2.0rc5-py3-none-any.whl
+python -m pip install /release/intramind_runtime-0.2.0rc6-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -64,8 +64,10 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
-Version `0.2.0rc5` adds embedding admission and migration `0004` to the accepted-policy,
-speech, buffering, artifact and deadline contracts. It is a release candidate;
+Version `0.2.0rc6` retains embedding admission and migration `0004` from rc5 and adds
+`embedding_outcome` for an application's accepted terminal-failure fallback. It
+preserves the accepted-policy, speech, buffering, artifact and deadline contracts.
+It is a release candidate;
 never replace an earlier wheel under the same filename. Commit each passing phase, build immutable images from
 that commit, then deploy and smoke-test those images before the next phase.
 
@@ -80,6 +82,12 @@ and replay reuse the immutable parsed checkpoint without repeating source reads 
 parsing. It preserves accepted flags, source bytes and document ownership. Enable
 `RUNTIME_TEST_BE_FEATURES=yes` in the BE dependency environment; this case does not
 qualify external OCR, embedding, index publication or public ingestion routing.
+
+`tests/test_be_ingestion_chunk.py` adds native semantic/hybrid chunking and final
+embedding checkpoints. Lost record/publication acknowledgements, root and child
+rollovers and history replay repeat no committed embedding. Model vectors and
+parsed source are fixtures; the native CPU splitter/process, Temporal and budget
+ledger are real. These checks do not publish to application indexes.
 
 The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
 condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.

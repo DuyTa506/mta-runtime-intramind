@@ -210,6 +210,19 @@ class TaskContext:
             command.pop("deadline")
         return await self._inference("runtime.submit_or_attach_embedding", command)
 
+    async def embedding_outcome(self, **request: Any) -> dict[str, Any]:
+        """Allow an accepted native fallback only after a terminal backend failure."""
+        try:
+            return {"result": await self.embedding(**request)}
+        except ActivityError as exc:
+            cause = exc.cause
+            if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
+                and cause.message in {"embedding_backend_400", "embedding_backend_500",
+                                      "embedding_backend_502", "embedding_backend_503",
+                                      "embedding_backend_504", "max_attempts"}):
+                return {"error": cause.message}
+            raise
+
     async def speech_outcome(self, **request: Any) -> dict[str, Any]:
         """Permit the feature's voice fallback only after a terminal transport failure."""
         try:
