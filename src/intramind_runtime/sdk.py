@@ -297,7 +297,9 @@ class TaskContext:
             return {"result": await self.llm(**request)}
         except ActivityError as exc:
             cause = exc.cause
-            if isinstance(cause, ApplicationError) and cause.type == "OperationFailed":
+            if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
+                and cause.message in {"backend_rejected_400", "backend_rejected_422",
+                                      "invalid_response", "max_attempts"}):
                 return {"error": "OperationFailed"}
             raise
 

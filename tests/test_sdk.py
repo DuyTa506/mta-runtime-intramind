@@ -453,15 +453,32 @@ async def test_early_signal_overrides_carried_signal_without_losing_other_events
     assert instance.pending_events == {}
 
 
-@pytest.mark.parametrize("failure_type", ["OperationFailed", "AdmissionRejected", "Timeout"])
+@pytest.mark.parametrize("failure_type,reason,allows_fallback", [
+    ("OperationFailed", "backend_rejected_400", True),
+    ("OperationFailed", "backend_rejected_422", True),
+    ("OperationFailed", "invalid_response", True),
+    ("OperationFailed", "max_attempts", True),
+    ("OperationFailed", "root_budget_exhausted", False),
+    ("OperationFailed", "root_attempt_budget", False),
+    ("OperationFailed", "resource_budget_missing", False),
+    ("OperationFailed", "context_exceeds_all_pools", False),
+    ("OperationFailed", "invalid_completion_payload", False),
+    ("OperationFailed", "backend_rejected_401", False),
+    ("OperationFailed", "backend_rejected_403", False),
+    ("OperationFailed", "backend_rejected_404", False),
+    ("OperationFailed", "backend_status_503_unconfirmed", False),
+    ("OperationFailed", "unknown_future_error", False),
+    ("AdmissionRejected", "invalid_response", False),
+    ("Timeout", "invalid_response", False),
+])
 async def test_only_confirmed_terminal_inference_failure_allows_fallback(
-    runtime_clock, failure_type
+    runtime_clock, failure_type, reason, allows_fallback
 ):
     now, _ = runtime_clock
     ctx = context(now)
-    error = failed_activity(ApplicationError("failure", type=failure_type, non_retryable=True))
+    error = failed_activity(ApplicationError(reason, type=failure_type, non_retryable=True))
     ctx.llm = AsyncMock(side_effect=error)
-    if failure_type == "OperationFailed":
+    if allows_fallback:
         assert await ctx.llm_outcome(key="call") == {"error": "OperationFailed"}
     else:
         with pytest.raises(ActivityError):

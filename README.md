@@ -53,7 +53,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-python -m pip install /release/intramind_runtime-0.2.0rc6-py3-none-any.whl
+python -m pip install /release/intramind_runtime-0.2.0rc7-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -64,9 +64,13 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
-Version `0.2.0rc6` retains embedding admission and migration `0004` from rc5 and adds
-`embedding_outcome` for an application's accepted terminal-failure fallback. It
-preserves the accepted-policy, speech, buffering, artifact and deadline contracts.
+Version `0.2.0rc7` restricts `llm_outcome` to known terminal inference errors.
+Exhausted root budgets, admission/policy failures, invalid configuration and
+unconfirmed transport failures propagate; they cannot become a successful content
+fallback. It retains `embedding_outcome` from rc6 and schema migration `0004`.
+Sampling, accepted-policy, speech, buffering, artifact and deadline contracts remain.
+Keep earlier worker images for executions pinned to their build; this changes the
+workflow branch taken after policy failures and requires a new deployment version.
 It is a release candidate;
 never replace an earlier wheel under the same filename. Commit each passing phase, build immutable images from
 that commit, then deploy and smoke-test those images before the next phase.
