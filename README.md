@@ -54,7 +54,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-uv pip install /release/intramind_runtime-0.2.0rc9-py3-none-any.whl
+uv pip install /release/intramind_runtime-0.2.0rc10-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -64,6 +64,17 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc10` adds `DirectBinding`, `DirectRouting` and `inference_scope` for
+application callers. The binding supplies a scoped HTTP auth adapter and a direct
+profile URL; it never submits a workflow, changes payloads or retries inference.
+Bind verified request identity around the full response, including streaming, and
+propagate context into worker threads. Trusted startup probes use an explicit service
+identity. Missing identity or an unqualified endpoint/model fails before dispatch.
+Clients must disable their own SDK/stream retry loops and preserve native model
+configuration for compatibility checks. A binding alone does not cover every caller;
+complete the application inventory before enabling shared-pool production traffic.
+Schema remains `0005`; upgrade runtime API/executor/reconciler together first.
 
 Version `0.2.0rc9` extends direct HTTP admission to embedding and native reranking;
 schema remains `0005`. With `direct_enabled: true`, embedding uses its existing
