@@ -3,6 +3,7 @@
 import json
 
 from fastapi import Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .contracts import AdmissionDenied
 from .preparation import PrepareRequest
@@ -57,3 +58,25 @@ def register(app, tenant, proxies, preparers):
         # An omitted output limit retains engine semantics and reserves a full context slot.
         bound = sized["input_tokens_bound"] + limit if limit else preparer.context_limit
         return await proxy.open(tenant_id, payload, request_bound=bound)
+
+    @app.post("/v1/direct/{model_profile}/api/v1/embed")
+    @app.post("/v1/direct/{model_profile}/api/v1/rerank")
+    async def native(model_profile: str, request: Request, tenant_id=Depends(tenant)):
+        path = request.url.path.rsplit("/", 1)[1]
+        kind = {"embed": "embedding", "rerank": "rerank"}[path]
+        proxy = proxies.get(model_profile)
+        if proxy is None or proxy.pool.kind != kind or proxy.profile is None:
+            raise HTTPException(503, "qualified direct inference profile unavailable")
+        payload = await _payload(request)
+        try:
+            validated = proxy.profile.validate_payload(payload)
+        except ValueError:
+            raise HTTPException(422, "request is outside the qualified native contract") from None
+        if kind == "embedding":
+            bound, batch = validated.characters, len(validated.texts)
+        else:
+            bound, batch = proxy.profile.requirement(validated)
+            if not batch:
+                return JSONResponse({"results": []})
+        return await proxy.open(tenant_id, payload, request_bound=max(1, bound),
+                                path=f"api/v1/{path}", batch_size=batch)

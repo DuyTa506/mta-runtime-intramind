@@ -47,6 +47,15 @@ class EmbeddingProfile(Contract):
             raise ValueError("embedding batch exceeds the qualified profile")
         return request
 
+    def validate_response(self, body: dict, payload: dict):
+        request = self.validate_payload(payload)
+        result = _EmbeddingResponse.model_validate(body)
+        if (result.model != self.model or result.dimension != self.dimension
+            or len(result.embeddings) != len(request.texts)
+            or any(len(vector) != result.dimension for vector in result.embeddings)):
+            raise ValueError("embedding output differs from qualified model/batch/dimension")
+        return result
+
 
 class EmbeddingPrepareRequest(Contract):
     model_profile: str = Field(min_length=1)
@@ -139,13 +148,9 @@ class ServingEmbeddingDriver:
                         raise DriverFailure("embedding_response_exceeds_profile", finished=True)
                     pieces.append(piece)
                 try:
-                    result = _EmbeddingResponse.model_validate_json(b"".join(pieces))
-                    if (response.headers.get("Content-Type", "").split(";")[0] != "application/json"
-                        or result.model != self.profile.model
-                        or result.dimension != self.profile.dimension
-                        or len(result.embeddings) != len(request.texts)
-                        or any(len(vector) != result.dimension for vector in result.embeddings)):
-                        raise ValueError("embedding output differs from qualified model/batch/dimension")
+                    if response.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                        raise ValueError("embedding response must be JSON")
+                    result = self.profile.validate_response(json.loads(b"".join(pieces)), payload)
                 except ValueError as exc:
                     raise DriverFailure("embedding_invalid_vectors", finished=True) from exc
                 return EmbeddingResult(body=result.model_dump(mode="json"), characters=request.characters)

@@ -201,12 +201,22 @@ class EmbeddingPoolSpec(_PoolSpec):
         return self.character_limit
 
 
-InferencePool = PoolSpec | SpeechPoolSpec | EmbeddingPoolSpec
+class RerankPoolSpec(_PoolSpec):
+    kind: Literal["rerank"] = "rerank"
+    character_limit: int = Field(gt=0, strict=True)
+    max_batch_size: int = Field(gt=0, le=256, strict=True)
+
+    @property
+    def request_limit(self) -> int:
+        return self.character_limit
+
+
+InferencePool = PoolSpec | SpeechPoolSpec | EmbeddingPoolSpec | RerankPoolSpec
 
 
 def parse_pool(value: dict) -> InferencePool:
     """Read the resource class explicitly; old pool records remain completion pools."""
-    model = {"speech": SpeechPoolSpec, "embedding": EmbeddingPoolSpec}.get(
+    model = {"speech": SpeechPoolSpec, "embedding": EmbeddingPoolSpec, "rerank": RerankPoolSpec}.get(
         value.get("kind"), PoolSpec)
     return model.model_validate(value)
 

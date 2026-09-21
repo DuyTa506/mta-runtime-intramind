@@ -54,7 +54,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-uv pip install /release/intramind_runtime-0.2.0rc8-py3-none-any.whl
+uv pip install /release/intramind_runtime-0.2.0rc9-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -64,6 +64,24 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc9` extends direct HTTP admission to embedding and native reranking;
+schema remains `0005`. With `direct_enabled: true`, embedding uses its existing
+qualified profile at `/v1/direct/{model_profile}/api/v1/embed`. A rerank pool declares
+`kind="rerank"`, `character_limit` and `max_batch_size`; its `rerank` configuration
+contains `validated_profile_id`, `termination_contract="termination-v1"` and
+`max_response_bytes`. The native model/config revision must pin its candidate cap
+to this same batch size. `/v1/direct/{model_profile}/api/v1/rerank` preserves payload,
+top_k and score scale, accounting for the prefix that native serving processes.
+Empty candidate lists return locally without inference. Rerank has no background
+executor or new Temporal workflow type. Qualified bounds are required; no pool is
+enabled by default.
+
+Embedding/rerank require matching attempt, termination and model-revision evidence.
+Successful bodies are bounded and validated before publication: vector dimensions,
+batch count and model for embedding; finite scores and unique, valid original indices
+for rerank. Unknown termination remains accounted for even if HTTP has returned.
+Caller routing and coordinated deployment are still required for global coverage.
 
 Version `0.2.0rc8` adds migration `0005` and opt-in direct LLM admission. Apply the
 migration before upgrading runtime API/executors/reconciler together. Old executors
@@ -87,7 +105,7 @@ process shutdown retains UNKNOWN rather than returning capacity. Epoch shutdown
 must be confirmed through the existing operator procedure. Runtime configuration
 and caller routing must both be deployed before claiming shared admission across
 the application; this release alone does not change AI/BE caller destinations.
-Embedding/rerank HTTP routes are not exposed by this release.
+Embedding/rerank HTTP routes were added in rc9 as described above.
 
 Version `0.2.0rc7` restricts `llm_outcome` to known terminal inference errors.
 Exhausted root budgets, admission/policy failures, invalid configuration and

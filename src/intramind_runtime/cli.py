@@ -20,11 +20,12 @@ from temporalio.worker import Worker, WorkerDeploymentConfig
 
 from .api import create_app
 from .artifacts import MinioArtifacts
-from .contracts import EmbeddingPoolSpec, PoolSpec, SpeechPoolSpec, parse_pool
+from .contracts import EmbeddingPoolSpec, PoolSpec, RerankPoolSpec, SpeechPoolSpec, parse_pool
 from .drivers import OpenAICompletionDriver
 from .embedding import EmbeddingPreparer, EmbeddingProfile, ServingEmbeddingDriver
 from .executor import Executor
 from .preparation import LlamaCppPromptSizer
+from .rerank import RerankProfile
 from .settings import Settings
 from .speech import ServingSpeechDriver, SpeechPreparer, SpeechProfile
 from .store import Store
@@ -123,8 +124,29 @@ def embedding_profiles(config):
     return result
 
 
+def rerank_profiles(config):
+    result = {}
+    for pool in config["pools"]:
+        spec = parse_pool(pool["admission"])
+        if not isinstance(spec, RerankPoolSpec):
+            continue
+        qualification = pool["rerank"]
+        if (qualification["validated_profile_id"] != spec.profile_id
+            or qualification["termination_contract"] != "termination-v1"):
+            raise ValueError("rerank contract must match its qualified capacity profile")
+        if spec.model_profile in result:
+            raise ValueError("ambiguous rerank profile")
+        result[spec.model_profile] = RerankProfile(
+            model_profile=spec.model_profile, capacity_profile_id=spec.profile_id,
+            model_revision=spec.model_revision, character_limit=spec.character_limit,
+            max_batch_size=spec.max_batch_size, max_response_bytes=qualification["max_response_bytes"])
+    return result
+
+
 def engine_driver(pool, speech, embeddings=None):
     spec = parse_pool(pool["admission"])
+    if isinstance(spec, RerankPoolSpec):
+        raise ValueError("rerank pools serve direct requests only")
     if isinstance(spec, EmbeddingPoolSpec):
         return ServingEmbeddingDriver(pool["base_url"], embeddings[spec.model_profile],
             api_key=os.environ[pool["api_key_env"]] if pool.get("api_key_env") else None)
@@ -139,6 +161,7 @@ def direct_proxies(config, store, sizing):
     from .direct_proxy import DirectProxy
 
     selected = {}
+    embeddings, rerankers = embedding_profiles(config), rerank_profiles(config)
     for pool in config["pools"]:
         enabled = pool.get("direct_enabled", False)
         if type(enabled) is not bool:
@@ -148,18 +171,27 @@ def direct_proxies(config, store, sizing):
         spec = parse_pool(pool["admission"])
         if spec.model_profile in selected:
             raise ValueError("ambiguous direct model profile")
-        preparer = sizing.get(spec.model_profile)
-        if (spec.kind != "llm" or preparer is None
-            or preparer.profile_id != spec.profile_id or preparer.model != pool["model"]):
-            raise ValueError("direct inference requires matching qualified prompt sizing")
-        selected[spec.model_profile] = (pool, spec, os.environ[pool["api_key_env"]])
+        profile = None
+        if spec.kind == "llm":
+            preparer = sizing.get(spec.model_profile)
+            if (preparer is None or preparer.profile_id != spec.profile_id
+                or preparer.model != pool["model"]):
+                raise ValueError("direct inference requires matching qualified prompt sizing")
+        elif spec.kind in {"embedding", "rerank"}:
+            profile = (embeddings if spec.kind == "embedding" else rerankers)[spec.model_profile]
+        else:
+            raise ValueError("no qualified direct contract for this pool kind")
+        api_key = os.environ[pool["api_key_env"]] if pool.get("api_key_env") else None
+        selected[spec.model_profile] = (pool, spec, profile, api_key)
     return {
-        key: DirectProxy(store, pool=spec, model=pool["model"], client=httpx.AsyncClient(
+        key: DirectProxy(store, pool=spec, model=pool.get("model"), profile=profile,
+            max_response_bytes=profile.max_response_bytes if profile else 16*1024*1024,
+            client=httpx.AsyncClient(
             base_url=pool["base_url"].rstrip("/") + "/",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
             timeout=httpx.Timeout(None, connect=10), follow_redirects=False,
             transport=httpx.AsyncHTTPTransport(retries=0)))
-        for key, (pool, spec, api_key) in selected.items()
+        for key, (pool, spec, profile, api_key) in selected.items()
     }
 
 
@@ -203,6 +235,8 @@ async def services(command, settings, config):
             speech = speech_profiles(config)
             embeddings = embedding_profiles(config)
             for pool in config["pools"]:
+                if pool["admission"].get("kind") == "rerank":
+                    continue
                 driver = engine_driver(pool, speech, embeddings)
                 drivers.append(driver)
                 for _ in range(settings.executor_count):

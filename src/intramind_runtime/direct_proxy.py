@@ -1,6 +1,7 @@
 """Stream foreground HTTP while an owned producer drains admitted inference."""
 
 import asyncio
+import json
 import logging
 from collections import deque
 from contextlib import suppress
@@ -16,6 +17,14 @@ from .direct import DirectAdmissions, DirectRequest
 from .store import encode
 
 logger = logging.getLogger(__name__)
+
+
+async def _chunks(response, buffered):
+    if buffered is not None:
+        yield buffered
+    else:
+        async for chunk in response.aiter_bytes():
+            yield chunk
 
 
 class _Channel:
@@ -74,9 +83,11 @@ class _DirectResponse(StreamingResponse):
 class DirectProxy:
     """No Temporal client, inference retry, or request/response artifact persistence."""
 
-    def __init__(self, store, *, client, pool, model=None, timeout_seconds=1800, max_response_bytes=16*1024*1024):
+    def __init__(self, store, *, client, pool, model=None, profile=None,
+                 timeout_seconds=1800, max_response_bytes=16*1024*1024):
         self.store, self.client, self.pool = store, client, pool
         self.model = model or pool.model_revision
+        self.profile = profile
         self.timeout_seconds, self.max_response_bytes = timeout_seconds, max_response_bytes
         self.admission = DirectAdmissions(store)
         self.owner_id = "direct-api-" + uuid4().hex
@@ -153,6 +164,17 @@ class DirectProxy:
                         if status == 200 and (state != "terminated" or response.headers.get(
                             "X-Intramind-Model-Revision") != self.pool.model_revision):
                             raise RuntimeError("direct backend model revision or termination changed")
+                    buffered = None
+                    if self.profile is not None and status == 200:
+                        raw = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            raw.extend(chunk)
+                            if len(raw) > self.max_response_bytes:
+                                raise ValueError("direct response exceeds qualified bound")
+                        if content_type.split(";")[0] != "application/json":
+                            raise ValueError("direct native response must be JSON")
+                        self.profile.validate_response(json.loads(raw), payload)
+                        buffered = bytes(raw)
                     forwarded = {name: value for name in (
                         "Retry-After", "X-Intramind-Model-Revision", "X-Intramind-Compute-State",
                         f"X-Intramind-{self.pool.kind.title()}-Contract")
@@ -161,7 +183,7 @@ class DirectProxy:
                     if not headers.done():
                         headers.set_result((status, forwarded))
                     size, pending = 0, b""
-                    async for chunk in response.aiter_bytes():
+                    async for chunk in _chunks(response, buffered):
                         size += len(chunk)
                         if size > self.max_response_bytes:
                             raise ValueError("direct response exceeds bound")
