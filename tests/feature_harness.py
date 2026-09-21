@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -151,18 +151,19 @@ async def feature_environment(
     publisher = OutboxPublisher(store, temporal, "feature-publisher-" + uid)
     broker = BrokerActivities(store, blobs)
     version = WorkerDeploymentVersion("feature-" + uid, "build-1")
-    worker = Worker(
-        temporal,
-        task_queue=queue,
-        workflows=workflows,
-        activities=[broker.submit_or_attach, broker.submit_speech, broker.submit_embedding, broker.finish,
-                    *build_activities(runtime_client)],
-        deployment_config=WorkerDeploymentConfig(
-            version=version,
-            use_worker_versioning=True,
-            default_versioning_behavior=VersioningBehavior.PINNED,
-        ),
-    )
+    def make_worker():
+        return Worker(
+            temporal,
+            task_queue=queue,
+            workflows=workflows,
+            activities=[broker.submit_or_attach, broker.submit_speech, broker.submit_embedding, broker.finish,
+                        *build_activities(runtime_client)],
+            deployment_config=WorkerDeploymentConfig(
+                version=version,
+                use_worker_versioning=True,
+                default_versioning_behavior=VersioningBehavior.PINNED,
+            ),
+        )
 
     async def pump():
         while True:
@@ -203,7 +204,14 @@ async def feature_environment(
                 child = event.child_workflow_execution_started_event_attributes.workflow_execution.workflow_id
                 await replay(child)
 
-    async with worker:
+    async with AsyncExitStack() as workers:
+        worker = await workers.enter_async_context(make_worker())
+
+        async def restart_worker():
+            nonlocal worker
+            await workers.aclose()
+            worker = await workers.enter_async_context(make_worker())
+
         for attempt in range(30):
             try:
                 await temporal.workflow_service.set_worker_deployment_current_version(
@@ -228,6 +236,7 @@ async def feature_environment(
                 blobs=blobs,
                 runtime_client=runtime_client,
                 temporal=temporal,
+                restart_worker=restart_worker,
             )
         finally:
             for run_id in runs:
