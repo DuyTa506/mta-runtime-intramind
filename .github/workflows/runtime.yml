@@ -28,7 +28,9 @@ jobs:
           .test-data/wheel-env/bin/intramind-runtime --help
       - name: Collect service diagnostics
         if: failure()
-        run: docker compose -p intramind-runtime-dev -f dev/compose.yaml logs --no-color > .test-data/services.log
+        run: |
+          mkdir -p .test-data
+          docker compose -p intramind-runtime-dev -f dev/compose.yaml logs --no-color > .test-data/services.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -8,10 +8,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from aiohttp import web
 from feature_harness import feature_environment
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlmodel import SQLModel, select
 
 pytestmark = pytest.mark.integration
 
@@ -19,8 +16,11 @@ pytestmark = pytest.mark.integration
 async def test_webhook_restart_preserves_delivery_identity_without_inference(store, monkeypatch, tmp_path):
     if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
         pytest.skip("explicit AI dependency environment required")
+    from aiohttp import web
     from api.background.pptx import webhooks
     from api.background.pptx.webhook_workflows import webhook
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlmodel import SQLModel, select
     from tools.pptx.engine.enums.webhook_event import WebhookEvent
     from tools.pptx.engine.models.sql.user import User
     from tools.pptx.engine.models.sql.webhook_outbox import WebhookOutbox
