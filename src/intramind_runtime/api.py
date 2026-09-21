@@ -39,6 +39,7 @@ def create_app(
     embedding_preparers=None,
     artifact_max_bytes=MAX_ARTIFACT_BYTES,
     artifact_upload_concurrency=2,
+    direct_proxies=None,
 ) -> FastAPI:
     if len(service_token) < 32:
         raise ValueError("service token must contain at least 32 characters")
@@ -50,6 +51,8 @@ def create_app(
                 await artifacts.ready()
             yield
         finally:
+            for proxy in (direct_proxies or {}).values():
+                await proxy.close()
             if manage_lifecycle:
                 for preparer in (preparers or {}).values():
                     await preparer.client.aclose()
@@ -68,6 +71,10 @@ def create_app(
         if not identity or len(identity) > 200:
             raise HTTPException(400, "verified tenant identity required")
         return identity
+
+    from .direct_routes import register
+
+    register(app, tenant, direct_proxies or {}, preparers or {})
 
     @app.get("/v1/llm/profiles/{model_profile}")
     async def llm_profile(model_profile: str, tenant_id=Depends(tenant)):

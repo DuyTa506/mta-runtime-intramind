@@ -37,6 +37,7 @@ neither replaces storage nor migrates buckets.
 | `executor` / `drivers` | One transport attempt and separate result persistence |
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `embedding` | Pinned document/query batches, vector validation and independent input accounting |
+| `direct` / `direct_proxy` | Shared compute reservations and direct HTTP streaming without Temporal |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
 | `uploads` | Bounded temporary files and concurrency for artifact ingestion |
 | `admin` | Namespace and pinned worker deployment administration |
@@ -53,7 +54,7 @@ Use Python 3.12. Applications install the release wheel from the maintainer's
 release artifacts or internal package index and pin its version and hash.
 
 ```bash
-python -m pip install /release/intramind_runtime-0.2.0rc7-py3-none-any.whl
+uv pip install /release/intramind_runtime-0.2.0rc8-py3-none-any.whl
 ```
 
 Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
@@ -63,6 +64,30 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc8` adds migration `0005` and opt-in direct LLM admission. Apply the
+migration before upgrading runtime API/executors/reconciler together. Old executors
+do not count direct reservations: keep direct callers disabled until every runtime
+process uses this version. Existing worker-pinned workflows retain their images.
+The new endpoint does not submit Temporal workflows or persist conversation bytes.
+
+Set `direct_enabled: true` on one pool per model profile with its qualified
+`prompt_sizing` contract. Trusted services call
+`POST /v1/direct/{model_profile}/chat/completions` with the runtime service bearer
+token and verified `X-Tenant-ID`. The original OpenAI body is forwarded after
+validation. Omitting the output limit reserves the pool's full context bound;
+the proxy does not silently add or reduce an output limit. Capacity exhaustion
+returns 429 with `Retry-After`; clients must not retry uncertain inference silently.
+
+Foreground and background share pool/group counters, including drain, metrics,
+epoch confirmation and UNKNOWN reconciliation. Every fifth grant leaves a turn
+for a compatible READY background operation. Disconnect detaches the consumer;
+the proxy drains upstream until termination. A truncated stream, read timeout or
+process shutdown retains UNKNOWN rather than returning capacity. Epoch shutdown
+must be confirmed through the existing operator procedure. Runtime configuration
+and caller routing must both be deployed before claiming shared admission across
+the application; this release alone does not change AI/BE caller destinations.
+Embedding/rerank HTTP routes are not exposed by this release.
 
 Version `0.2.0rc7` restricts `llm_outcome` to known terminal inference errors.
 Exhausted root budgets, admission/policy failures, invalid configuration and

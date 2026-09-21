@@ -134,6 +134,35 @@ def engine_driver(pool, speech, embeddings=None):
     return OpenAICompletionDriver(pool["base_url"], os.environ[pool["api_key_env"]], pool["model"])
 
 
+def direct_proxies(config, store, sizing):
+    """Enable direct HTTP only for one qualified, pinned pool per model profile."""
+    from .direct_proxy import DirectProxy
+
+    selected = {}
+    for pool in config["pools"]:
+        enabled = pool.get("direct_enabled", False)
+        if type(enabled) is not bool:
+            raise ValueError("direct_enabled must be boolean")
+        if not enabled:
+            continue
+        spec = parse_pool(pool["admission"])
+        if spec.model_profile in selected:
+            raise ValueError("ambiguous direct model profile")
+        preparer = sizing.get(spec.model_profile)
+        if (spec.kind != "llm" or preparer is None
+            or preparer.profile_id != spec.profile_id or preparer.model != pool["model"]):
+            raise ValueError("direct inference requires matching qualified prompt sizing")
+        selected[spec.model_profile] = (pool, spec, os.environ[pool["api_key_env"]])
+    return {
+        key: DirectProxy(store, pool=spec, model=pool["model"], client=httpx.AsyncClient(
+            base_url=pool["base_url"].rstrip("/") + "/",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(None, connect=10), follow_redirects=False,
+            transport=httpx.AsyncHTTPTransport(retries=0)))
+        for key, (pool, spec, api_key) in selected.items()
+    }
+
+
 async def services(command, settings, config):
     store = Store(settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds)
     tasks = []
@@ -245,14 +274,15 @@ def main():
     )
     config = json.loads(Path(settings.pool_config).read_text())
     if args.command == "api":
-        store = Store(settings.database_url.get_secret_value())
+        store = Store(settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds)
+        sizing = preparers(config)
         app = create_app(
             store,
             artifacts(settings),
             settings.service_token.get_secret_value(),
             config["tasks"],
             settings.temporal_queue,
-            preparers(config),
+            sizing,
             manage_lifecycle=True,
             speech_preparers={key: SpeechPreparer(profile)
                               for key, profile in speech_profiles(config).items()},
@@ -260,6 +290,7 @@ def main():
                                  for key, profile in embedding_profiles(config).items()},
             artifact_max_bytes=settings.artifact_max_bytes,
             artifact_upload_concurrency=settings.artifact_upload_concurrency,
+            direct_proxies=direct_proxies(config, store, sizing),
         )
         uvicorn.run(app, host="0.0.0.0", port=8070)
     else:

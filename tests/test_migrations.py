@@ -8,6 +8,8 @@ from conftest import operation, pool, root
 from sqlalchemy import text
 from test_speech_ledger import speech, speech_pool
 
+from intramind_runtime.direct import DirectAdmissions, DirectRequest
+
 pytestmark = pytest.mark.integration
 
 
@@ -44,9 +46,28 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
     await store.create_root(root("speech-preserved", resource_budgets={"speech_characters": 12}))
     await store.configure_pool(speech_pool(), 4)
     await store.submit_operation(speech().model_copy(update={"root_id": "speech-preserved"}))
-    speech_attempt = await store.reserve_next("voice", "speech-before-upgrade")
-    await store.mark_send(speech_attempt)
+    async with store.engine.begin() as connection:
+        await connection.execute(text("""UPDATE runtime_roots SET attempts=1
+            WHERE root_id='speech-preserved'"""))
+        await connection.execute(text("""UPDATE runtime_resource_budgets SET reserved=12
+            WHERE root_id='speech-preserved' AND unit='speech_characters'"""))
+        await connection.execute(text("""INSERT INTO runtime_attempts
+            (attempt_id,operation_id,pool_id,engine_epoch,attempt_number,owner_id,lease_epoch,
+             lease_expires_at,state,budget_bound,budget_unit)
+            VALUES ('old-speech-attempt','speech','voice','e1',1,'old-speech-worker',1,
+                    now()+interval '1 hour','SEND_INTENT',12,'speech_characters')"""))
+        await connection.execute(text("""UPDATE runtime_operations SET state='EXECUTING',
+            active_attempt='old-speech-attempt',attempts=1 WHERE operation_id='speech'"""))
     await migrate()
+    await store.configure_pool(pool("direct-after-upgrade", target=1), 4)
+    direct = DirectAdmissions(store)
+    reservation = await direct.reserve(DirectRequest(
+        request_id="upgrade-preserved", tenant_id="t", payload_digest="a" * 64,
+        model_profile="test", capacity_profile_id="test-v1", request_bound=30,
+        deadline=root().deadline,
+    ), "direct-after-upgrade", "direct-owner")
+    await direct.mark_send(reservation)
+    await direct.unknown(reservation, "fixture_response_lost")
     await migrate()
     state = await store.run("migration-preserved", "t")
     assert state["state"] == "RUNNING" and state["reserved"] == 30
@@ -55,9 +76,13 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
         "limit": 12, "reserved": 12, "spent": 0,
     }
     async with store.engine.connect() as connection:
-        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0004"
+        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0005"
         assert (await connection.execute(text("SELECT count(*) FROM runtime_buffer_items"))).scalar_one() == 0
         assert (await connection.execute(text("SELECT budget_unit FROM runtime_attempts WHERE attempt_id='old-attempt'"))).scalar_one() == "tokens"
+        assert (await connection.execute(text("""SELECT count(*) FROM runtime_inflight_attempts
+            WHERE compute_held"""))).scalar_one() == 3
+    status = await store.drain_status()
+    assert status["compute_held"] == 3 and status["unknown_attempts"] == 1
     await store.confirm_epoch_stopped("p", "e1", "test legacy engine stopped")
     state = await store.run("migration-preserved", "t")
     assert state["spent"] == 30 and state["reserved"] == 0 and not state["cleanup_pending"]
@@ -65,3 +90,6 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
     assert (await store.run("speech-preserved", "t"))["resource_budgets"]["speech_characters"] == {
         "limit": 12, "reserved": 0, "spent": 12,
     }
+    assert (await store.drain_status())["compute_held"] == 1
+    await store.confirm_epoch_stopped("direct-after-upgrade", "e1", "test direct engine stopped")
+    assert (await store.drain_status())["unsettled_attempts"] == 0

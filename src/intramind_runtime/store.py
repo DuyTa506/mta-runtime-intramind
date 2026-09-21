@@ -72,7 +72,7 @@ class Store:
                 count(*) FILTER (WHERE state='UNKNOWN') AS unknown_attempts,
                 count(*) FILTER (WHERE compute_held OR budget_held
                     OR state IN ('UNKNOWN','BACKEND_FINISHED')) AS unsettled_attempts
-                FROM runtime_attempts""")
+                FROM runtime_inflight_attempts""")
             return dict(status)
 
     async def _wake(self, c):
@@ -136,7 +136,7 @@ class Store:
         async with self.transaction() as c:
             old = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id", id=spec.pool_id)
             if old and (old["engine_epoch"] != spec.engine_epoch or old["spec"] != spec.model_dump(mode="json")):
-                active = await row(c, """SELECT count(*) AS n FROM runtime_attempts
+                active = await row(c, """SELECT count(*) AS n FROM runtime_inflight_attempts
                     WHERE pool_id=:id AND (compute_held OR budget_held)""", id=spec.pool_id)
                 if active["n"]:
                     raise RuntimeConflict("drain/reconcile existing attempts before reconfiguration")
@@ -238,7 +238,7 @@ class Store:
             profile = parse_pool(pool["spec"])
             group = await row(c, "SELECT * FROM runtime_groups WHERE group_id=:id", id=pool["group_id"])
             used = await row(c, """SELECT count(*) AS group_used,
-                count(*) FILTER(WHERE a.pool_id=:pool) AS pool_used FROM runtime_attempts a
+                count(*) FILTER(WHERE a.pool_id=:pool) AS pool_used FROM runtime_inflight_attempts a
                 JOIN runtime_pools p USING(pool_id) WHERE a.compute_held AND p.group_id=:g""",
                 pool=pool_id, g=pool["group_id"])
             if (group["health"] != "HEALTHY" or used["group_used"] >= group["hard_ceiling"]
@@ -660,6 +660,13 @@ class Store:
 
     async def reconcile_expired(self):
         async with self.transaction() as c:
+            direct = await execute(c, """UPDATE runtime_direct_attempts SET
+                state=CASE WHEN state='RESERVED' THEN 'FAILED_NOT_SENT' ELSE 'UNKNOWN' END,
+                compute_held=state<>'RESERVED',
+                unknown_at=CASE WHEN state='RESERVED' THEN NULL ELSE COALESCE(unknown_at,now()) END,
+                error_class=CASE WHEN state='RESERVED' THEN 'lease_expired_before_send' ELSE 'lease_expired_after_send' END
+                WHERE state IN ('RESERVED','SEND_INTENT')
+                    AND LEAST(lease_expires_at,deadline)<=clock_timestamp()""")
             expired_operations = await rows(c, """SELECT operation_id FROM runtime_operations
                 WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')
                 AND (spec->>'deadline')::timestamptz<=clock_timestamp()""")
@@ -720,7 +727,9 @@ class Store:
                 AND o.state NOT IN ('SUCCEEDED','FAILED','CANCELLED')""")
             for op in terminal:
                 await self._terminal(c, op["operation_id"], "CANCELLED", "root_terminal")
-            return len(attempts)
+            if direct.rowcount:
+                await self._wake(c)
+            return len(attempts) + direct.rowcount
 
     async def confirm_epoch_stopped(self, pool_id: str, engine_epoch: str, evidence: str):
         """Operator action after independent confirmation of instance termination.
@@ -736,6 +745,9 @@ class Store:
                 raise RuntimeConflict("engine epoch does not match")
             await execute(c, "UPDATE runtime_pools SET target=0,health='UNAVAILABLE' WHERE pool_id=:id",
                           id=pool_id)
+            direct = await execute(c, """UPDATE runtime_direct_attempts SET state='FAILED',compute_held=false,
+                backend_finished_at=COALESCE(backend_finished_at,now()),error_class='engine_epoch_stopped'
+                WHERE pool_id=:pool AND engine_epoch=:epoch AND compute_held""", pool=pool_id, epoch=engine_epoch)
             attempts = await rows(c, """SELECT a.*,o.root_id,o.state AS operation_state
                 FROM runtime_attempts a JOIN runtime_operations o USING(operation_id)
                 WHERE a.pool_id=:pool AND a.engine_epoch=:epoch AND (a.compute_held OR a.budget_held)""",
@@ -750,7 +762,8 @@ class Store:
             await execute(c, """INSERT INTO runtime_controller_updates(pool_id,envelope_version,target,reason)
                 VALUES (:id,:version,0,:reason)""", id=pool_id, version=pool["envelope_version"],
                 reason=f"epoch_stopped:{engine_epoch}:{evidence}")
-            return len(attempts)
+            await self._wake(c)
+            return len(attempts) + direct.rowcount
 
     async def update_target(self, pool_id: str, target: int, version: int, reason: str):
         async with self.transaction() as c:
