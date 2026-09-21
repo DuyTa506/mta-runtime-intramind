@@ -48,6 +48,7 @@ async def feature_environment(
     store, *, name, workflows, build_activities, respond, allow_tool_calls=False,
     speech_profile=None, respond_speech=None, tokenize_prompt=None,
     embedding_profile=None, respond_embedding=None,
+    buffering=None,
 ):
     temporal = await temporal_test_client()
     namespace, uid = temporal.namespace, uuid4().hex
@@ -107,7 +108,8 @@ async def feature_environment(
         {
             name + "/v1": {"deadline_seconds": 120, "budget_limit": 1000000, "task_queue": queue,
                            "resource_budgets": ({"speech_characters": 100000} if speech_profile else {})
-                           | ({"embedding_characters": 100000} if embedding_profile else {})},
+                           | ({"embedding_characters": 100000} if embedding_profile else {}),
+                           **({"buffering": buffering} if buffering is not None else {})},
         },
         queue,
         {"test": preparer},
@@ -149,6 +151,9 @@ async def feature_environment(
         base_url="http://fake/v1/", transport=httpx.MockTransport(completion_http)))
     executor = Executor(store, blobs, completion_driver, "p", "feature-executor-" + uid)
     publisher = OutboxPublisher(store, temporal, "feature-publisher-" + uid)
+    from intramind_runtime.buffering import BufferedSubmissions
+
+    buffers = BufferedSubmissions(store, blobs, control_queue=queue) if buffering is not None else None
     broker = BrokerActivities(store, blobs)
     version = WorkerDeploymentVersion("feature-" + uid, "build-1")
     def make_worker():
@@ -167,6 +172,8 @@ async def feature_environment(
 
     async def pump():
         while True:
+            if buffers is not None:
+                await buffers.tick()
             await publisher.tick()
             await executor.tick()
             if speech_executor:
