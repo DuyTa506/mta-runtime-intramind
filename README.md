@@ -188,6 +188,14 @@ child and rollover without repeating inference or rendering on publication retry
 Model/tokenizer responses, rendered file contents and feature artifacts are
 fixtures; Chromium image verification and public PPTX cutover remain application work.
 
+`tests/test_ai_pptx_webhook.py` hands a committed SQLite webhook outbox to
+`pptx.webhook/v1`, loses one receiver acknowledgement and restarts the worker: each
+delivery keeps one identity, secrets stay out of history and no inference is used.
+`tests/test_ai_pptx_native.py` does the same for `pptx.native/v1`: the native task
+row and its handoff are committed together, the worker dies mid-generation, and the
+retry replays the recorded model completion instead of calling the model again.
+A late retry of a completed task returns its status without generating twice.
+
 `RuntimeClient.llm_profile()` reads the authenticated
 `GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
 validated response formats and tool support. Persist it with agent planning state
