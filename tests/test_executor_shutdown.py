@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from conftest import operation
+from conftest import operation, pool, root
 from fakes import IndependentEngine, MemoryArtifacts
 from pydantic import SecretStr
 
@@ -20,6 +20,7 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
     reservation = Reservation(
         attempt_id="a", operation=spec, pool_id="p", engine_epoch="e1",
         model_revision="model-1", owner_id="executor", lease_epoch=1,
+        attempt_deadline=root().deadline,
     )
     store = SimpleNamespace(
         lease_seconds=60,
@@ -69,7 +70,7 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
     )
     config = {"pools": [{
         "base_url": "http://unused.invalid", "api_key_env": "SHUTDOWN_TEST_KEY",
-        "model": "test", "admission": {"pool_id": "p"},
+        "model": "test", "admission": pool().model_dump(mode="json"),
     }]}
     service = asyncio.create_task(cli.services("executor", settings, config))
     try:

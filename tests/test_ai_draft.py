@@ -5,13 +5,13 @@ import os
 import re
 
 import pytest
-from feature_harness import feature_environment
+from feature_harness import feature_environment, peak_children
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("kind", ["standard", "agentic", "custom"])
-async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, kind):
+async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, monkeypatch, kind):
     if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
         pytest.skip("explicit AI dependency environment and opt-in required")
     import yaml
@@ -24,6 +24,7 @@ async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, 
     from api.background.draft.activities import DraftActivities
     from api.background.draft.agent import DraftAgentActivities
     from api.background.draft.workflows import WORKFLOWS
+    from api.config import settings
     from docx import Document
     from tests.test_context_synthesis.test_linch_synthesis import (
         FakeDocStore,
@@ -33,24 +34,39 @@ async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, 
     )
 
     template = make_template()
+    if kind == "standard":
+        template.sections[0].slots.append(
+            template.sections[0].slots[0].model_copy(update={"slot_id": "extra"})
+        )
     (tmp_path / "unit_test_template.yaml").write_text(yaml.safe_dump(template.model_dump()))
+    monkeypatch.setattr(settings, "synthesis_extractor_concurrency", 1 if kind == "standard" else 16)
+    monkeypatch.setattr(settings, "synthesis_fill_worker_concurrency", 1 if kind == "standard" else 16)
     document = Document()
-    document.add_paragraph("Doanh thu: {{amount}}")
+    for index in range(12):
+        document.add_paragraph(f"Doanh thu {index}: {{{{amount{index}}}}}")
     blueprint = Blueprint(
         title="Báo cáo",
         fields=[
             FieldSpan(
-                block_id="b0",
-                match="{{amount}}",
+                block_id=f"b{index}",
+                match=f"{{{{amount{index}}}}}",
                 label="Doanh thu",
                 instruction="Doanh thu kỳ báo cáo",
             )
+            for index in range(12)
         ],
     )
     source_docx = docx_bytes(document)
     llm, agent_turns, publications = FakeLLM(), [], []
 
+    class Documents(FakeDocStore):
+        def get_chunks_by_document(self, doc_id):
+            chunk = super().get_chunks_by_document(doc_id)[0]
+            return [chunk | {"id": f"{doc_id}-{i}", "chunk_index": i} for i in range(3)]
+
     async def respond(reservation, payload):
+        monkeypatch.setattr(settings, "synthesis_extractor_concurrency", 16)
+        monkeypatch.setattr(settings, "synthesis_fill_worker_concurrency", 16)
         messages = payload["messages"]
         if payload.get("tools"):
             agent_turns.append(reservation.attempt_id)
@@ -114,7 +130,7 @@ async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, 
         draft = DraftActivities(
             factory,
             model_profile="test",
-            store_factory=FakeDocStore,
+            store_factory=Documents,
             embedder_factory=FakeEmbedder,
             template_directory=lambda: str(tmp_path),
         )
@@ -149,6 +165,7 @@ async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, 
                     "template_fit_guard": False,
                     "fill_agentic": kind == "agentic",
                     "dedup_threshold": 0.99,
+                    **({"concurrency": 1, "fill_worker_concurrency": 1} if kind == "agentic" else {}),
                 },
             }
         )
@@ -161,5 +178,7 @@ async def test_draft_recovers_every_model_boundary_and_replays(store, tmp_path, 
             assert publications[0][-1].startswith(b"PK")
         if kind == "agentic":
             assert len(agent_turns) == 2
+        history = await env.temporal.get_workflow_handle(status["root_id"]).fetch_history()
+        assert peak_children(history) == 1
         await env.replay(status["root_id"])
         assert len(env.calls) == result["telemetry"]["llm_calls"]

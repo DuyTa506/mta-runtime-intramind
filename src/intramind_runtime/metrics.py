@@ -14,12 +14,12 @@ async def snapshot(store: Store) -> bytes:
         for r in await rows(c, "SELECT state,count(*) AS n FROM runtime_operations GROUP BY state"):
             states.labels(r["state"]).set(r["n"])
         for r in await rows(c, """SELECT p.pool_id,p.target,count(a.attempt_id) AS n
-            FROM runtime_pools p LEFT JOIN runtime_attempts a ON a.pool_id=p.pool_id AND a.compute_held
+            FROM runtime_pools p LEFT JOIN runtime_inflight_attempts a ON a.pool_id=p.pool_id AND a.compute_held
             GROUP BY p.pool_id,p.target"""):
             held.labels(r["pool_id"]).set(r["n"])
             target.labels(r["pool_id"]).set(r["target"])
         value = await row(c, """SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(unknown_at)),0) AS age
-            FROM runtime_attempts WHERE state='UNKNOWN'""")
+            FROM runtime_inflight_attempts WHERE state='UNKNOWN'""")
         unknown_age.set(value["age"])
         value = await row(c, """SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(created_at)),0) AS age
             FROM runtime_outbox WHERE delivered_at IS NULL""")

@@ -1,6 +1,8 @@
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
@@ -9,6 +11,33 @@ from sqlalchemy.engine import make_url
 from intramind_runtime.artifacts import tenant_prefix
 from intramind_runtime.contracts import Artifact, OperationSpec, PoolSpec, RootSpec, digest
 from intramind_runtime.store import Store
+
+_TEMPORAL_NAMESPACE = "intramind-runtime-test-" + uuid4().hex
+
+
+async def temporal_test_client():
+    """Isolate qualification runs without deleting the histories of earlier test sessions."""
+    from google.protobuf.duration_pb2 import Duration
+    from temporalio.api.workflowservice.v1 import RegisterNamespaceRequest
+    from temporalio.client import Client
+    from temporalio.service import RPCError, RPCStatusCode
+
+    address = os.environ.get("RUNTIME_TEST_TEMPORAL_ADDRESS")
+    if not address:
+        pytest.skip("explicit disposable RUNTIME_TEST_TEMPORAL_ADDRESS required")
+    if address not in {"127.0.0.1:17233", "127.0.0.1:17234"}:
+        pytest.fail("disposable loopback Temporal test port required")
+    namespace = os.environ.get("RUNTIME_TEST_TEMPORAL_NAMESPACE", _TEMPORAL_NAMESPACE)
+    if not re.fullmatch(r"intramind-runtime-test(?:-[a-z0-9-]+)?", namespace):
+        pytest.fail("refusing to use a namespace outside intramind-runtime-test")
+    client = await Client.connect(address, namespace=namespace)
+    try:
+        await client.workflow_service.register_namespace(RegisterNamespaceRequest(
+            namespace=namespace, workflow_execution_retention_period=Duration(seconds=86400)))
+    except RPCError as exc:
+        if exc.status != RPCStatusCode.ALREADY_EXISTS:
+            raise
+    return client
 
 
 @pytest.fixture
@@ -24,9 +53,10 @@ async def store():
     async with store.engine.begin() as c:
         await c.execute(text("DROP SCHEMA public CASCADE"))
         await c.execute(text("CREATE SCHEMA public"))
-        for statement in files("intramind_runtime").joinpath("schema.sql").read_text().split(";"):
-            if statement.strip():
-                await c.execute(text(statement))
+        for name in ("schema.sql", "speech_budget.sql", "buffering.sql", "embedding_budget.sql", "direct.sql"):
+            for statement in files("intramind_runtime").joinpath(name).read_text().split(";"):
+                if statement.strip():
+                    await c.execute(text(statement))
     yield store
     await store.close()
 

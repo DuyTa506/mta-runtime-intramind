@@ -8,10 +8,10 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from conftest import pool
+from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
+from feature_harness import peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
@@ -36,12 +36,9 @@ async def test_summary_children_retry_publication_without_repeating_inference(
     from api.background.summary.workflows import WORKFLOWS
     from tools.summary import SummaryTool
 
-    address = os.environ["RUNTIME_TEST_TEMPORAL_ADDRESS"]
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("disposable loopback Temporal required")
-    namespace, uid = "intramind-runtime-test", uuid4().hex
+    client = await temporal_test_client()
+    namespace, uid = client.namespace, uuid4().hex
     queue, token = "summary-test-" + uid, "summary-test-service-token-1234567890"
-    client = await Client.connect(address, namespace=namespace)
     blobs = MemoryArtifacts()
     spec = pool(target=1).model_copy(update={"context_limit": 16384})
     await store.configure_pool(spec, 1)
@@ -52,7 +49,7 @@ async def test_summary_children_retry_publication_without_repeating_inference(
     llm = MagicMock()
     llm.get_model_info.return_value = {"model_name": "test", "provider": "fake"}
     llm.agenerate = AsyncMock(side_effect=AssertionError("activities must not infer"))
-    tool = SummaryTool(llm, {"context_window": 16384})
+    tool = SummaryTool(llm, {"context_window": 16384, "map_concurrency": 1})
     tool._count_tokens = lambda text: len(text.split())
     tool._get_document_text = AsyncMock(return_value="Nguồn có thời hạn và ngoại lệ. " * 20)
     tool.chunker.mindmap_chunk = MagicMock(
@@ -120,6 +117,7 @@ async def test_summary_children_retry_publication_without_repeating_inference(
 
         async def execute(self, reservation, payload):
             self.calls.append(reservation.attempt_id)
+            tool.config["map_concurrency"] = 16
             return EngineResult(
                 body={
                     "choices": [
@@ -194,6 +192,7 @@ async def test_summary_children_retry_publication_without_repeating_inference(
             tool._get_document_text.assert_awaited_once_with("fake-document")
             llm.agenerate.assert_not_awaited()
             history = await handle.fetch_history()
+            assert peak_children(history) == 1
             await Replayer(workflows=WORKFLOWS).replay_workflow(history)
             for event in history.events:
                 if event.HasField("child_workflow_execution_started_event_attributes"):

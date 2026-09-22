@@ -4,7 +4,7 @@ from typing import Protocol
 
 import httpx
 
-from .contracts import CancelOutcome, EngineResult, Reservation
+from .contracts import CancelOutcome, EmbeddingResult, EngineResult, Reservation, SpeechResult
 
 
 class DriverFailure(Exception):
@@ -14,7 +14,9 @@ class DriverFailure(Exception):
 
 
 class EngineDriver(Protocol):
-    async def execute(self, reservation: Reservation, payload: dict) -> EngineResult: ...
+    async def execute(
+        self, reservation: Reservation, payload: dict
+    ) -> EngineResult | SpeechResult | EmbeddingResult: ...
     async def cancel(self, reservation: Reservation) -> CancelOutcome: ...
 
 
@@ -29,8 +31,10 @@ class OpenAICompletionDriver:
 
     async def execute(self, reservation: Reservation, payload: dict) -> EngineResult:
         allowed = {"messages", "temperature", "top_p", "seed", "stop", "response_format",
-                   "presence_penalty", "frequency_penalty", "tools", "tool_choice", "chat_template_kwargs"}
-        if payload.keys() - allowed or not isinstance(payload.get("messages"), list):
+                   "presence_penalty", "frequency_penalty", "tools", "tool_choice", "chat_template_kwargs",
+                   "parallel_tool_calls"}
+        if (payload.keys() - allowed or not isinstance(payload.get("messages"), list)
+            or ("parallel_tool_calls" in payload and type(payload["parallel_tool_calls"]) is not bool)):
             raise DriverFailure("invalid_completion_payload", not_sent=True)
         request = payload | {"model": self.model, "max_tokens": reservation.operation.max_output_tokens,
                              "n": 1, "stream": False}

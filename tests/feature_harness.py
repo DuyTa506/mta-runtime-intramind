@@ -1,47 +1,96 @@
 """Disposable Temporal/Postgres feature harness with actual broker accounting."""
 
 import asyncio
-import os
-from contextlib import asynccontextmanager, suppress
+import json
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
-import pytest
-from conftest import pool
+from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 
 from intramind_runtime.api import create_app
 from intramind_runtime.client import RuntimeClient
-from intramind_runtime.contracts import EngineResult
+from intramind_runtime.contracts import EmbeddingPoolSpec, SpeechPoolSpec
+from intramind_runtime.drivers import OpenAICompletionDriver
+from intramind_runtime.embedding import EmbeddingPreparer, ServingEmbeddingDriver
 from intramind_runtime.executor import Executor
 from intramind_runtime.preparation import LlamaCppPromptSizer
+from intramind_runtime.speech import ServingSpeechDriver, SpeechPreparer
 from intramind_runtime.temporal_adapter import BrokerActivities, OutboxPublisher
+
+
+def peak_children(history):
+    active, peak = 0, 0
+    for event in history.events:
+        if event.HasField("start_child_workflow_execution_initiated_event_attributes"):
+            active += 1
+            peak = max(active, peak)
+        elif any(
+            event.HasField(f"child_workflow_execution_{state}_event_attributes")
+            for state in ("completed", "failed", "canceled", "timed_out", "terminated")
+        ):
+            active -= 1
+        elif event.HasField("start_child_workflow_execution_failed_event_attributes"):
+            active -= 1
+        assert active >= 0
+    assert active == 0
+    return peak
 
 
 @asynccontextmanager
 async def feature_environment(
-    store, *, name, workflows, build_activities, respond, allow_tool_calls=False
+    store, *, name, workflows, build_activities, respond, allow_tool_calls=False,
+    speech_profile=None, respond_speech=None, tokenize_prompt=None,
+    embedding_profile=None, respond_embedding=None,
+    buffering=None,
 ):
-    address = os.environ.get("RUNTIME_TEST_TEMPORAL_ADDRESS", "")
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("disposable loopback Temporal required")
-    namespace, uid = "intramind-runtime-test", uuid4().hex
+    temporal = await temporal_test_client()
+    namespace, uid = temporal.namespace, uuid4().hex
     queue, token = name + "-" + uid, "test-runtime-feature-token-1234567890"
-    temporal = await Client.connect(address, namespace=namespace)
     blobs, calls, runs = MemoryArtifacts(), [], []
     spec = pool(target=1).model_copy(update={"context_limit": 16384})
     await store.configure_pool(spec, 1)
+    speech_driver, speech_executor, speech_preparers = None, None, {}
+    if speech_profile is not None:
+        assert respond_speech is not None
+        await store.configure_pool(SpeechPoolSpec(
+            pool_id="voice", group_id="cpu", engine_epoch="voice-e1",
+            profile_id=speech_profile.capacity_profile_id,
+            model_profile=speech_profile.model_profile, model_revision="voice-model-1",
+            hard_ceiling=1, target=1, character_limit=speech_profile.character_limit,
+            valid_until=spec.valid_until,
+        ), 1)
+        speech_driver = ServingSpeechDriver("http://voice/", speech_profile, client=httpx.AsyncClient(
+            base_url="http://voice/", transport=httpx.MockTransport(respond_speech)))
+        speech_executor = Executor(store, blobs, speech_driver, "voice", "voice-executor-" + uid)
+        speech_preparers = {speech_profile.model_profile: SpeechPreparer(speech_profile)}
+
+    embedding_driver, embedding_executor, embedding_preparers = None, None, {}
+    if embedding_profile is not None:
+        assert respond_embedding is not None
+        await store.configure_pool(EmbeddingPoolSpec(
+            pool_id="embedding", group_id=spec.group_id, engine_epoch="embedding-e1",
+            profile_id=embedding_profile.capacity_profile_id,
+            model_profile=embedding_profile.model_profile, model_revision=embedding_profile.model_revision,
+            hard_ceiling=1, target=1, character_limit=embedding_profile.character_limit,
+            max_batch_size=embedding_profile.max_batch_size, valid_until=spec.valid_until,
+        ), 1)
+        embedding_driver = ServingEmbeddingDriver("http://embedding/", embedding_profile,
+            client=httpx.AsyncClient(base_url="http://embedding/",
+                                    transport=httpx.MockTransport(respond_embedding)))
+        embedding_executor = Executor(store, blobs, embedding_driver, "embedding", "embedding-" + uid)
+        embedding_preparers = {embedding_profile.model_profile: EmbeddingPreparer(embedding_profile)}
 
     async def tokenize(request):
         return httpx.Response(200, json={"prompt": "test template", "tokens": [1] * 10})
 
-    sizing = httpx.AsyncClient(base_url="http://fake/", transport=httpx.MockTransport(tokenize))
+    sizing = httpx.AsyncClient(base_url="http://fake/", transport=httpx.MockTransport(tokenize_prompt or tokenize))
     preparer = LlamaCppPromptSizer(
         sizing,
         model="test",
@@ -57,10 +106,15 @@ async def feature_environment(
         blobs,
         token,
         {
-            name + "/v1": {"deadline_seconds": 120, "budget_limit": 1000000, "task_queue": queue},
+            name + "/v1": {"deadline_seconds": 120, "budget_limit": 1000000, "task_queue": queue,
+                           "resource_budgets": ({"speech_characters": 100000} if speech_profile else {})
+                           | ({"embedding_characters": 100000} if embedding_profile else {}),
+                           **({"buffering": buffering} if buffering is not None else {})},
         },
         queue,
         {"test": preparer},
+        speech_preparers=speech_preparers,
+        embedding_preparers=embedding_preparers,
     )
 
     def runtime_client(tenant):
@@ -75,41 +129,67 @@ async def feature_environment(
             ),
         )
 
-    class Engine:
-        async def execute(self, reservation, payload):
-            calls.append(reservation.attempt_id)
-            body = await respond(reservation, payload)
-            return EngineResult(body=body, input_tokens=10, output_tokens=20)
+    reservations = {}
 
-    executor = Executor(store, blobs, Engine(), "p", "feature-executor-" + uid)
+    async def completion_http(request):
+        attempt_id = request.headers["X-Intramind-Attempt-ID"]
+        payload = json.loads(request.content)
+        calls.append(attempt_id)
+        body = await respond(reservations[attempt_id], payload)
+        body.setdefault("usage", {"prompt_tokens": 10, "completion_tokens": 20})
+        return httpx.Response(200, json=body)
+
+    class Engine(OpenAICompletionDriver):
+        async def execute(self, reservation, payload):
+            reservations[reservation.attempt_id] = reservation
+            try:
+                return await super().execute(reservation, payload)
+            finally:
+                reservations.pop(reservation.attempt_id)
+
+    completion_driver = Engine("http://fake/v1/", "test-only", "test", client=httpx.AsyncClient(
+        base_url="http://fake/v1/", transport=httpx.MockTransport(completion_http)))
+    executor = Executor(store, blobs, completion_driver, "p", "feature-executor-" + uid)
     publisher = OutboxPublisher(store, temporal, "feature-publisher-" + uid)
+    from intramind_runtime.buffering import BufferedSubmissions
+
+    buffers = BufferedSubmissions(store, blobs, control_queue=queue) if buffering is not None else None
     broker = BrokerActivities(store, blobs)
     version = WorkerDeploymentVersion("feature-" + uid, "build-1")
-    worker = Worker(
-        temporal,
-        task_queue=queue,
-        workflows=workflows,
-        activities=[broker.submit_or_attach, broker.finish, *build_activities(runtime_client)],
-        deployment_config=WorkerDeploymentConfig(
-            version=version,
-            use_worker_versioning=True,
-            default_versioning_behavior=VersioningBehavior.PINNED,
-        ),
-    )
+    def make_worker():
+        return Worker(
+            temporal,
+            task_queue=queue,
+            workflows=workflows,
+            activities=[broker.submit_or_attach, broker.submit_speech, broker.submit_embedding, broker.finish,
+                        *build_activities(runtime_client)],
+            deployment_config=WorkerDeploymentConfig(
+                version=version,
+                use_worker_versioning=True,
+                default_versioning_behavior=VersioningBehavior.PINNED,
+            ),
+        )
 
     async def pump():
         while True:
+            if buffers is not None:
+                await buffers.tick()
             await publisher.tick()
             await executor.tick()
+            if speech_executor:
+                await speech_executor.tick()
+            if embedding_executor:
+                await embedding_executor.tick()
             await asyncio.sleep(0.01)
 
-    async def submit(source, *, tenant="user:test"):
+    async def submit(source, *, tenant="user:test", configuration=None):
         api = runtime_client(tenant)
         try:
             ref = await api.put_json(source)
-            result = await api.submit(
-                {"task_type": name + "/v1", "submission_key": uid, "input": ref}
-            )
+            submission = {"task_type": name + "/v1", "submission_key": uid, "input": ref}
+            if configuration is not None:
+                submission["configuration"] = await api.put_json(configuration)
+            result = await api.submit(submission)
             runs.append(result["run_id"])
             for _ in range(2000):
                 status = await api.get_run(result["run_id"])
@@ -131,7 +211,14 @@ async def feature_environment(
                 child = event.child_workflow_execution_started_event_attributes.workflow_execution.workflow_id
                 await replay(child)
 
-    async with worker:
+    async with AsyncExitStack() as workers:
+        worker = await workers.enter_async_context(make_worker())
+
+        async def restart_worker():
+            nonlocal worker
+            await workers.aclose()
+            worker = await workers.enter_async_context(make_worker())
+
         for attempt in range(30):
             try:
                 await temporal.workflow_service.set_worker_deployment_current_version(
@@ -156,6 +243,7 @@ async def feature_environment(
                 blobs=blobs,
                 runtime_client=runtime_client,
                 temporal=temporal,
+                restart_worker=restart_worker,
             )
         finally:
             for run_id in runs:
@@ -167,3 +255,8 @@ async def feature_environment(
             with suppress(asyncio.CancelledError):
                 await work
             await sizing.aclose()
+            await completion_driver.close()
+            if speech_driver:
+                await speech_driver.close()
+            if embedding_driver:
+                await embedding_driver.close()

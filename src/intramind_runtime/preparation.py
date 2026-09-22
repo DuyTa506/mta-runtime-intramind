@@ -10,13 +10,14 @@ import json
 import httpx
 from pydantic import Field
 
-from .contracts import AdmissionDenied, Contract
+from .contracts import AdmissionDenied, AttemptTimeout, Contract
 
 
 class PrepareRequest(Contract):
     model_profile: str = Field(min_length=1, max_length=120)
     payload: dict
     max_output_tokens: int = Field(gt=0, le=1_000_000)
+    attempt_timeout_seconds: AttemptTimeout | None = None
 
 
 class LlamaCppPromptSizer:
@@ -49,7 +50,8 @@ class LlamaCppPromptSizer:
         self.allow_tool_calls = allow_tool_calls
         self._io_window = asyncio.Semaphore(4)
 
-    async def prepare(self, request: PrepareRequest, artifacts, tenant_id: str):
+    async def size(self, request: PrepareRequest):
+        """Validate and size without persisting foreground conversation content."""
         payload = request.payload
         allowed = {
             "messages",
@@ -130,15 +132,23 @@ class LlamaCppPromptSizer:
         bound = len(tokens) + self.token_margin
         if bound + request.max_output_tokens > self.context_limit:
             raise AdmissionDenied("request exceeds compatible context; workflow must split input")
-        ref = await artifacts.put(tenant_id, raw)
         return {
-            "payload": ref.model_dump(mode="json"),
             "model_profile": request.model_profile,
             "input_tokens_bound": bound,
             "max_output_tokens": request.max_output_tokens,
             "expected_cost": bound + min(request.max_output_tokens, self.expected_output),
             "capacity_profile_id": self.profile_id,
+            **(
+                {"attempt_timeout_seconds": request.attempt_timeout_seconds}
+                if request.attempt_timeout_seconds is not None else {}
+            ),
         }
+
+    async def prepare(self, request: PrepareRequest, artifacts, tenant_id: str):
+        sized = await self.size(request)
+        raw = json.dumps(request.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ref = await artifacts.put(tenant_id, raw)
+        return {"payload": ref.model_dump(mode="json"), **sized}
 
 
 def validate_tools(tools: list) -> None:

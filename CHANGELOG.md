@@ -1,7 +1,32 @@
 # Changelog
 
+## 0.2.0rc6 — unreleased
+
+- `TaskContext.embedding_outcome` exposes only confirmed terminal backend failures
+  to an application's accepted fallback. Budget, revision/vector corruption,
+  deadline, cancellation and uncertain compute still propagate through recovery.
+
+## 0.2.0rc5 — unreleased
+
+- Embedding operations share admission, root identities and attempt limits while
+  keeping a separate character budget. Migration `0004` retains existing reservations.
+- Pinned embedding profiles bound batches and validate model revision, dimension,
+  finite vectors and response bytes. Timeout/unconfirmed compute remains UNKNOWN.
+- `TaskContext.embedding`, service preparation and broker completion keep vectors
+  through persistence retries, downstream failure, Continue-As-New and history replay.
+
 ## 0.1.0 — unreleased
 
+- Bounded file-based artifact uploads support 128 MiB binary results while retaining
+  the 16 MiB JSON limit, with incremental checksum verification and cancellation cleanup.
+- Speech operations with independent character budgets, shared root/group accounting,
+  bounded WAV artifacts and a serving termination contract; migration `0002` retains
+  legacy token reservations. Audio integration covers confirmed fallback and UNKNOWN cancellation.
+- Per-session test namespaces avoid accumulating worker deployments against one namespace's limit.
+- Accepted configuration artifacts retained across retries, children and rollover.
+- Per-feature child windows bounded by the workflow's hard cap.
+- Total attempt deadlines derived from the ledger, preserving UNKNOWN accounting
+  after send and retaining completed output through persistence failures.
 - Durable task facade for activities, LLM operations, child workflows and waits.
 - Stable identities and root accounting across children and Continue-As-New.
 - PostgreSQL operation, attempt, reservation and budget ledger.

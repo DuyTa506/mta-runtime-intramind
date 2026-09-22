@@ -17,6 +17,10 @@ The gate checks bytes, executed cases, measurements and declared policy bounds.
 It cannot prove test quality, authenticity of measurements, deployment identity,
 or that a declared fingerprint describes the actual GPU. Those require review and
 trusted qualification runners. No existing report is silently grandfathered in.
+
+The accepted rollout uses direct cutover: overload observation, a timed soak,
+canary percentages and seven days of routing are not prerequisites. Functional,
+recovery, engine-capacity, restore and existing-work reconciliation remain required.
 """
 
 import argparse
@@ -34,12 +38,8 @@ REQUIRED_EVIDENCE = (
     "api_security",
     "minio_contract",
     "gpu_capacity",
-    "overload",
-    "soak_72h",
     "offhost_restore",
-    "canary",
     "celery_drained",
-    "seven_days_full_routing",
 )
 
 TEST_GATES = frozenset(REQUIRED_EVIDENCE[:5])
@@ -51,19 +51,6 @@ INVENTORY_IDS = frozenset(
 # Accepted duration/recovery targets and correctness conditions, not GPU/SLO guesses.
 REQUIRED_MEASUREMENTS = {
     "gpu_capacity": {"samples": (1, None), "oom_count": (0, 0), "memory_headroom_bytes": (1, None)},
-    "overload": {
-        "samples_at_2x": (1, None),
-        "samples_at_5x": (1, None),
-        "lost_accepted_runs": (0, 0),
-        "unbounded_queue_events": (0, 0),
-    },
-    "soak_72h": {
-        "duration_seconds": (72 * 3600, None),
-        "workflows_completed": (1, None),
-        "lost_accepted_runs": (0, 0),
-        "ledger_invariant_violations": (0, 0),
-        "oom_count": (0, 0),
-    },
     "offhost_restore": {
         "rpo_seconds": (0, 900),
         "rto_seconds": (0, 14400),
@@ -71,21 +58,10 @@ REQUIRED_MEASUREMENTS = {
         "restored_artifact_checks": (1, None),
         "broken_artifact_refs": (0, 0),
     },
-    "canary": {
-        "runs_at_5_percent": (1, None),
-        "runs_at_25_percent": (1, None),
-        "runs_at_50_percent": (1, None),
-        "runs_at_100_percent": (1, None),
-    },
     "celery_drained": {
         "queued_business_tasks": (0, 0),
         "active_business_tasks": (0, 0),
         "reserved_business_tasks": (0, 0),
-    },
-    "seven_days_full_routing": {
-        "duration_seconds": (7 * 24 * 3600, None),
-        "minimum_routing_percent": (100, 100),
-        "workflows_completed": (1, None),
     },
 }
 MAX_REPORT_BYTES = 16 * 1024 * 1024

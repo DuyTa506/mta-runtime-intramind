@@ -11,10 +11,10 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from conftest import pool
+from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
+from feature_harness import peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
@@ -37,14 +37,13 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
     from api.background.rewrite.workflows import WORKFLOWS
     from api.config import RewriteSettings
 
-    address = os.environ["RUNTIME_TEST_TEMPORAL_ADDRESS"]
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("disposable loopback Temporal required")
-    uid, namespace = uuid4().hex, "intramind-runtime-test"
+    client = await temporal_test_client()
+    uid, namespace = uuid4().hex, client.namespace
     queue, token = "rewrite-test-" + uid, "rewrite-test-service-token-1234567890"
-    client = await Client.connect(address, namespace=namespace)
     blobs = MemoryArtifacts()
     settings = RewriteSettings()
+    settings.llm.concurrency = 1
+    settings.llm.timeout_seconds = 13
     settings.limits.segment_target_chars = 200
     monkeypatch.setattr(rewrite_activities.config, "get_settings", lambda: settings)
     source = "\n\n".join(f"Đoạn văn số {i} trình bày công tác quản lý đô thị trên địa bàn phường "
@@ -72,9 +71,13 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
 
     class EchoEngine:
         calls = []
+        timeouts = []
 
         async def execute(self, reservation, payload):
             self.calls.append(reservation.attempt_id)
+            self.timeouts.append(reservation.operation.attempt_timeout_seconds)
+            settings.llm.concurrency = 16
+            settings.llm.timeout_seconds = 1
             user = payload["messages"][-1]["content"]
             body = user.split('"""')[1].strip("\n")
             return EngineResult(body={"choices": [{"message": {"content": body}}]},
@@ -126,10 +129,12 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
                 assert result["segments_rewritten"] >= 2
                 assert result["segments_failed"] == 0
                 assert len(engine.calls) == result["llm_calls"]
+                assert engine.timeouts == [13] * result["llm_calls"]
                 before = len(engine.calls)
                 handle = client.get_workflow_handle(submission["run_id"])
                 await asyncio.wait_for(handle.result(), timeout=10)
                 history = await handle.fetch_history()
+                assert peak_children(history) == 1
                 await Replayer(workflows=WORKFLOWS).replay_workflow(history)
                 for event in history.events:
                     if event.HasField("child_workflow_execution_started_event_attributes"):
@@ -138,6 +143,10 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
                         await Replayer(workflows=WORKFLOWS).replay_workflow(child_history)
                 assert len(engine.calls) == before
             finally:
+                with suppress(RPCError):
+                    handle = client.get_workflow_handle(submission["run_id"])
+                    if (await handle.describe()).close_time is None:
+                        await handle.terminate("disposable rewrite test cleanup")
                 work.cancel()
                 with suppress(asyncio.CancelledError):
                     await work

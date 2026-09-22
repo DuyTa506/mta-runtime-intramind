@@ -3,7 +3,7 @@
 import os
 
 import pytest
-from feature_harness import feature_environment
+from feature_harness import feature_environment, peak_children
 
 pytestmark = pytest.mark.integration
 
@@ -40,7 +40,8 @@ async def test_enrichment_preserves_prose_and_replays_completed_model_leaves(sto
         store, name="enrich", workflows=WORKFLOWS, build_activities=activities, respond=respond,
     ) as env:
         status, result = await env.submit({
-            "draft_markdown": DRAFT, "document_ids": ["d1"], "options": {"dedup_threshold": 0.99},
+            "draft_markdown": DRAFT, "document_ids": ["d1"],
+            "options": {"dedup_threshold": 0.99, "concurrency": 1},
         })
         assert status["state"] == "SUCCEEDED"
         assert len(result["insertions"]) == 2
@@ -50,5 +51,7 @@ async def test_enrichment_preserves_prose_and_replays_completed_model_leaves(sto
         assert restored == DRAFT
         assert len(env.calls) == result["telemetry"]["llm_calls"]
         assert reads == [True]
+        history = await env.temporal.get_workflow_handle(status["root_id"]).fetch_history()
+        assert peak_children(history) == 1
         await env.replay(status["root_id"])
         assert len(env.calls) == result["telemetry"]["llm_calls"]

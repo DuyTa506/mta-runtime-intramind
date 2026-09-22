@@ -13,7 +13,16 @@ from temporalio.exceptions import ApplicationError, CancelledError, WorkflowAlre
 from temporalio.service import RPCError, RPCStatusCode
 
 from .artifacts import ArtifactPort
-from .contracts import AdmissionDenied, Artifact, NotFound, OperationSpec, RuntimeConflict
+from .contracts import (
+    AdmissionDenied,
+    Artifact,
+    EmbeddingOperationSpec,
+    InferenceOperation,
+    NotFound,
+    OperationSpec,
+    RuntimeConflict,
+    SpeechOperationSpec,
+)
 from .store import Store
 
 logger = logging.getLogger(__name__)
@@ -26,7 +35,17 @@ class BrokerActivities:
 
     @activity.defn(name="runtime.submit_or_attach_llm")
     async def submit_or_attach(self, payload: dict) -> dict:
-        spec = OperationSpec.model_validate(payload)
+        return await self._submit(OperationSpec.model_validate(payload))
+
+    @activity.defn(name="runtime.submit_or_attach_speech")
+    async def submit_speech(self, payload: dict) -> dict:
+        return await self._submit(SpeechOperationSpec.model_validate(payload))
+
+    @activity.defn(name="runtime.submit_or_attach_embedding")
+    async def submit_embedding(self, payload: dict) -> dict:
+        return await self._submit(EmbeddingOperationSpec.model_validate(payload))
+
+    async def _submit(self, spec: InferenceOperation) -> dict:
         try:
             await self.store.submit_operation(spec)
             result = await self.store.operation(spec.operation_id, spec.tenant_id)

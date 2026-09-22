@@ -1,22 +1,20 @@
 """Real Temporal/PostgreSQL integration, including history replay."""
 
 import asyncio
-import os
 from contextlib import suppress
 from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from conftest import pool, root
+from conftest import pool, root, temporal_test_client
+from deadline_workflows import deadline_feature
 from fakes import IndependentEngine, MemoryArtifacts
-from google.protobuf.duration_pb2 import Duration
+from feature_harness import feature_environment
 from temporalio.api.workflowservice.v1 import (
-    RegisterNamespaceRequest,
     SetWorkerDeploymentCurrentVersionRequest,
 )
-from temporalio.client import Client
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
-from temporalio.service import RPCError, RPCStatusCode
+from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker, WorkerDeploymentConfig
 
 from intramind_runtime.admin import worker_health
@@ -27,20 +25,45 @@ from intramind_runtime.temporal_adapter import BrokerActivities, OutboxPublisher
 pytestmark = pytest.mark.integration
 
 
-async def test_real_temporal_async_completion_and_replay(store):
-    address = os.environ.get("RUNTIME_TEST_TEMPORAL_ADDRESS")
-    if not address:
-        pytest.skip("explicit disposable RUNTIME_TEST_TEMPORAL_ADDRESS required")
-    if not address.startswith("127.0.0.1:"):
-        pytest.fail("test requires a disposable loopback Temporal endpoint")
-    namespace = "intramind-runtime-test"
-    client = await Client.connect(address, namespace=namespace)
+async def test_phase_expiry_completes_and_replays_while_backend_cleanup_is_pending(store):
+    gate, completed, jobs = asyncio.Event(), [], []
+
+    async def respond(reservation, payload):
+        async def compute():
+            await gate.wait()
+            completed.append(reservation.attempt_id)
+            return {"choices": [{"message": {"content": "late"}}]}
+
+        task = asyncio.create_task(compute())
+        jobs.append(task)
+        return await asyncio.shield(task)
+
     try:
-        await client.workflow_service.register_namespace(RegisterNamespaceRequest(
-            namespace=namespace, workflow_execution_retention_period=Duration(seconds=86400)))
-    except RPCError as exc:
-        if exc.status != RPCStatusCode.ALREADY_EXISTS:
-            raise
+        async with feature_environment(
+            store, name="deadline-contract", workflows=[deadline_feature],
+            build_activities=lambda factory: [], respond=respond,
+        ) as env:
+            status, _ = await env.submit({"messages": [{"role": "user", "content": "review"}]})
+            assert status["state"] == "PARTIAL"
+            assert status["terminal_reason"] == "assessment_timeout"
+            assert status["cleanup_pending"] and status["reserved"] == 30
+            assert len(env.calls) == 1 and completed == []
+            await env.replay(status["root_id"])
+            assert len(env.calls) == 1 and completed == []
+            gate.set()
+            await asyncio.gather(*jobs)
+            await store.confirm_epoch_stopped("p", "e1", "all isolated engine jobs joined")
+            state = await store.run(status["root_id"], "user:test")
+            assert state["state"] == "PARTIAL"
+            assert not state["cleanup_pending"] and state["spent"] == 30
+    finally:
+        gate.set()
+        await asyncio.gather(*jobs)
+
+
+async def test_real_temporal_async_completion_and_replay(store):
+    client = await temporal_test_client()
+    namespace = client.namespace
     uid = uuid4().hex
     queue = "runtime-test-"+uid
     root_spec = root(root_id=uid)

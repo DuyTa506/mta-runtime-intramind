@@ -1,6 +1,7 @@
 """Trusted-service HTTP client; public identity verification remains at gateway."""
 
 import json
+from urllib.parse import quote
 
 import httpx
 
@@ -20,6 +21,16 @@ class RuntimeClient:
 
     async def get_run(self, run_id: str):
         response = await self.client.get(f"/v1/runs/{run_id}")
+        response.raise_for_status()
+        return response.json()
+
+    async def buffer(self, submission: dict):
+        response = await self.client.post("/v1/buffers", json=submission)
+        response.raise_for_status()
+        return response.json()
+
+    async def get_buffered(self, item_id: str):
+        response = await self.client.get(f"/v1/buffers/{item_id}")
         response.raise_for_status()
         return response.json()
 
@@ -58,14 +69,55 @@ class RuntimeClient:
         response.raise_for_status()
         return response.content
 
-    async def prepare(self, *, model_profile: str, payload: dict, max_output_tokens: int):
+    async def prepare(
+        self, *, model_profile: str, payload: dict, max_output_tokens: int,
+        attempt_timeout_seconds: float | None = None,
+    ):
         response = await self.client.post(
             "/v1/requests/prepare",
             json={
                 "model_profile": model_profile,
                 "payload": payload,
                 "max_output_tokens": max_output_tokens,
+                **(
+                    {"attempt_timeout_seconds": attempt_timeout_seconds}
+                    if attempt_timeout_seconds is not None else {}
+                ),
             },
         )
+        response.raise_for_status()
+        return response.json()
+
+    async def llm_profile(self, model_profile: str):
+        """Read the configured context/tool contract; actual admission remains atomic at dispatch."""
+        response = await self.client.get(f"/v1/llm/profiles/{quote(model_profile, safe='')}")
+        response.raise_for_status()
+        return response.json()
+
+    async def speech_profile(self, model_profile: str):
+        response = await self.client.get(f"/v1/speech/profiles/{quote(model_profile, safe='')}")
+        response.raise_for_status()
+        return response.json()
+
+    async def prepare_speech(self, *, model_profile: str, capacity_profile_id: str,
+                             payload: dict, attempt_timeout_seconds: float):
+        response = await self.client.post("/v1/speech/prepare", json={
+            "model_profile": model_profile, "capacity_profile_id": capacity_profile_id,
+            "payload": payload, "attempt_timeout_seconds": attempt_timeout_seconds,
+        })
+        response.raise_for_status()
+        return response.json()
+
+    async def embedding_profile(self, model_profile: str):
+        response = await self.client.get(f"/v1/embedding/profiles/{quote(model_profile, safe='')}")
+        response.raise_for_status()
+        return response.json()
+
+    async def prepare_embedding(self, *, model_profile: str, capacity_profile_id: str,
+                                payload: dict, attempt_timeout_seconds: float):
+        response = await self.client.post("/v1/embedding/prepare", json={
+            "model_profile": model_profile, "capacity_profile_id": capacity_profile_id,
+            "payload": payload, "attempt_timeout_seconds": attempt_timeout_seconds,
+        })
         response.raise_for_status()
         return response.json()

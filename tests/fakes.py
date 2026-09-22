@@ -19,6 +19,10 @@ class MemoryArtifacts:
             raise ValueError("checksum mismatch")
         return data
 
+    async def put_file(self, tenant_id, source, content_type="application/json"):
+        source.seek(0)
+        return await self.put(tenant_id, source.read(), content_type)
+
 
 class IndependentEngine:
     """Engine task is shielded from the client's transport cancellation."""

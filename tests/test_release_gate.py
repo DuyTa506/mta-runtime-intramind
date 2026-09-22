@@ -87,13 +87,20 @@ def bundle(tmp_path: Path) -> dict:
 
 def test_a_green_unit_suite_cannot_authorize_celery_removal():
     result = violations({"inventory": [], "artifact_backend": "minio", "evidence": {}})
-    assert any("soak_72h" in message for message in result)
+    assert any("workflow_replay" in message for message in result)
     assert any("offhost_restore" in message for message in result)
     assert any("celery_drained" in message for message in result)
     assert any("43" in message for message in result)
 
 
 def test_complete_synthetic_evidence_bundle_passes(tmp_path: Path, bundle: dict) -> None:
+    assert violations(bundle, base_dir=tmp_path) == []
+
+
+def test_direct_cutover_does_not_wait_for_load_observation(tmp_path: Path, bundle: dict) -> None:
+    """The accepted rollout requires correctness evidence, not a timed canary."""
+    for gate in ("overload", "soak_72h", "canary", "seven_days_full_routing"):
+        bundle["evidence"].pop(gate, None)
     assert violations(bundle, base_dir=tmp_path) == []
 
 
@@ -147,14 +154,10 @@ def test_required_testcase_coverage_cannot_be_omitted(tmp_path: Path, bundle: di
         ("gpu_capacity", "samples", 0),
         ("gpu_capacity", "oom_count", 1),
         ("gpu_capacity", "memory_headroom_bytes", 256),
-        ("overload", "samples_at_5x", 0),
-        ("soak_72h", "duration_seconds", 71 * 3600),
         ("offhost_restore", "rpo_seconds", 901),
         ("offhost_restore", "rto_seconds", 14401),
         ("offhost_restore", "offhost_restore_completed", 0),
         ("celery_drained", "active_business_tasks", 1),
-        ("seven_days_full_routing", "duration_seconds", 6 * 24 * 3600),
-        ("seven_days_full_routing", "minimum_routing_percent", 99),
         ("gpu_capacity", "samples", float("nan")),
     ],
 )
