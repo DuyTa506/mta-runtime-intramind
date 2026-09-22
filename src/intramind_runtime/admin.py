@@ -103,7 +103,27 @@ async def worker_health(client, workers, *, max_poller_age=120, now=None):
     return {"namespace": client.namespace, "status": status, "workers": observations}
 
 
+async def confirm_epoch_stopped(store, pool_id: str, engine_epoch: str, evidence: str) -> dict:
+    """Settle UNKNOWN work for one stopped engine epoch. Does not edit pool config."""
+    settled = await store.confirm_epoch_stopped(pool_id, engine_epoch, evidence)
+    return {"pool_id": pool_id, "engine_epoch": engine_epoch, "settled": settled}
+
+
 async def execute(args):
+    if args.command == "confirm-epoch-stopped":
+        from .settings import Settings
+        from .store import Store
+
+        settings = Settings()
+        store = Store(
+            settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds
+        )
+        try:
+            report = await confirm_epoch_stopped(store, args.pool, args.epoch, args.evidence)
+        finally:
+            await store.close()
+        print(json.dumps(report, sort_keys=True))
+        return 0
     client = await Client.connect(args.address, namespace=args.namespace)
     if args.command == "init-namespace":
         try:
@@ -166,7 +186,13 @@ def main():
     )
     health.add_argument("--max-poller-age", type=int, default=120)
     health.add_argument("--allow-unpromoted", action="store_true")
+    stopped = commands.add_parser("confirm-epoch-stopped")
+    stopped.add_argument("--pool", required=True)
+    stopped.add_argument("--epoch", required=True)
+    stopped.add_argument("--evidence", required=True)
     args = parser.parse_args()
+    if args.command == "confirm-epoch-stopped" and not args.evidence.strip():
+        parser.error("termination evidence is required")
     if args.command == "health":
         if args.max_poller_age <= 0 or any(
             item[3] not in {"activity", "workflow", "both"} for item in args.worker

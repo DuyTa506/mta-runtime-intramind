@@ -13,7 +13,7 @@ from typing import Any, NoReturn
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy, VersioningBehavior
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 with workflow.unsafe.imports_passed_through():
@@ -22,6 +22,43 @@ with workflow.unsafe.imports_passed_through():
 
 class OperationDeadlineExceeded(TimeoutError):
     """The operation has expired; backend cleanup and accounting may still be pending."""
+
+
+_WRAPPER_TYPES = frozenset({"ActivityError", "ChildWorkflowError"})
+
+
+def exception_chain(exc: BaseException):
+    """Yield an exception and each explicit cause once."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__
+
+
+def is_cancellation(exc: BaseException) -> bool:
+    """True when a workflow, activity or child was cancelled rather than failed."""
+    return any(
+        isinstance(item, (CancelledError, asyncio.CancelledError)) for item in exception_chain(exc)
+    )
+
+
+def terminal_reason(exc: BaseException) -> str:
+    """Public failure reason, preferring the ledger cause over a Temporal wrapper."""
+    for item in reversed(list(exception_chain(exc))):
+        if isinstance(item, ApplicationError):
+            if item.type == "OperationFailed" and item.message and item.message != "feature failed":
+                return item.message
+            if item.message == "feature failed":
+                continue
+            if item.type and item.type not in _WRAPPER_TYPES:
+                return item.type
+            continue
+        name = type(item).__name__
+        if name not in _WRAPPER_TYPES:
+            return name
+    return type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -108,8 +145,11 @@ class TaskContext:
         max_attempts: int = 3,
         task_queue: str | None = None,
         deadline: datetime | None = None,
+        heartbeat_timeout_seconds: int | None = None,
     ) -> Any:
         if timeout_seconds <= 0 or not 1 <= max_attempts <= 100:
+            raise ValueError("activity timeout and retry policy must be finite and positive")
+        if heartbeat_timeout_seconds is not None and heartbeat_timeout_seconds <= 0:
             raise ValueError("activity timeout and retry policy must be finite and positive")
         remaining = self.remaining()
         timeout = timedelta(seconds=timeout_seconds)
@@ -120,6 +160,11 @@ class TaskContext:
             if remaining.total_seconds() <= 0:
                 raise OperationDeadlineExceeded("activity deadline exceeded")
             timeout = min(timeout, remaining)
+        heartbeat = (
+            {"heartbeat_timeout": timedelta(seconds=heartbeat_timeout_seconds)}
+            if heartbeat_timeout_seconds is not None
+            else {}
+        )
         with self._command():
             try:
                 return await workflow.execute_activity(
@@ -130,10 +175,14 @@ class TaskContext:
                     start_to_close_timeout=timeout,
                     schedule_to_close_timeout=remaining,
                     retry_policy=RetryPolicy(maximum_attempts=max_attempts),
+                    **heartbeat,
                 )
             except ActivityError as exc:
-                if (deadline is not None and deadline <= workflow.now()
-                    and isinstance(exc.cause, ActivityTimeoutError)):
+                if (
+                    deadline is not None
+                    and deadline <= workflow.now()
+                    and isinstance(exc.cause, ActivityTimeoutError)
+                ):
                     raise OperationDeadlineExceeded("activity deadline exceeded") from exc
                 raise
 
@@ -163,7 +212,8 @@ class TaskContext:
             deadline=deadline,
             **(
                 {"attempt_timeout_seconds": attempt_timeout_seconds}
-                if attempt_timeout_seconds is not None else {}
+                if attempt_timeout_seconds is not None
+                else {}
             ),
         )
         payload = spec.model_dump(mode="json")
@@ -175,16 +225,28 @@ class TaskContext:
         return await self._inference("runtime.submit_or_attach_llm", payload)
 
     async def speech(
-        self, *, key: str, payload: dict, model_profile: str, capacity_profile_id: str,
-        characters_bound: int, expected_cost: int, attempt_timeout_seconds: float,
+        self,
+        *,
+        key: str,
+        payload: dict,
+        model_profile: str,
+        capacity_profile_id: str,
+        characters_bound: int,
+        expected_cost: int,
+        attempt_timeout_seconds: float,
         deadline: datetime | None = None,
     ) -> dict[str, Any]:
         """A speech operation inherits root identity and waits without holding a worker slot."""
         spec = SpeechOperationSpec(
-            operation_id=self.key(key), root_id=self.root_id, tenant_id=self.tenant_id,
-            payload=Artifact.model_validate(payload), model_profile=model_profile,
-            capacity_profile_id=capacity_profile_id, characters_bound=characters_bound,
-            expected_cost=expected_cost, attempt_timeout_seconds=attempt_timeout_seconds,
+            operation_id=self.key(key),
+            root_id=self.root_id,
+            tenant_id=self.tenant_id,
+            payload=Artifact.model_validate(payload),
+            model_profile=model_profile,
+            capacity_profile_id=capacity_profile_id,
+            characters_bound=characters_bound,
+            expected_cost=expected_cost,
+            attempt_timeout_seconds=attempt_timeout_seconds,
             deadline=deadline,
         )
         payload = spec.model_dump(mode="json")
@@ -193,17 +255,33 @@ class TaskContext:
         return await self._inference("runtime.submit_or_attach_speech", payload)
 
     async def embedding(
-        self, *, key: str, payload: dict, model_profile: str, capacity_profile_id: str, model_revision: str,
-        characters_bound: int, texts_count: int, expected_cost: int, attempt_timeout_seconds: float,
+        self,
+        *,
+        key: str,
+        payload: dict,
+        model_profile: str,
+        capacity_profile_id: str,
+        model_revision: str,
+        characters_bound: int,
+        texts_count: int,
+        expected_cost: int,
+        attempt_timeout_seconds: float,
         deadline: datetime | None = None,
     ) -> dict[str, Any]:
         """Wait durably for one embedding batch under the same root and shared admission."""
         spec = EmbeddingOperationSpec(
-            operation_id=self.key(key), root_id=self.root_id, tenant_id=self.tenant_id,
-            payload=Artifact.model_validate(payload), model_profile=model_profile,
-            capacity_profile_id=capacity_profile_id, characters_bound=characters_bound,
-            texts_count=texts_count, expected_cost=expected_cost, model_revision=model_revision,
-            attempt_timeout_seconds=attempt_timeout_seconds, deadline=deadline,
+            operation_id=self.key(key),
+            root_id=self.root_id,
+            tenant_id=self.tenant_id,
+            payload=Artifact.model_validate(payload),
+            model_profile=model_profile,
+            capacity_profile_id=capacity_profile_id,
+            characters_bound=characters_bound,
+            texts_count=texts_count,
+            expected_cost=expected_cost,
+            model_revision=model_revision,
+            attempt_timeout_seconds=attempt_timeout_seconds,
+            deadline=deadline,
         )
         command = spec.model_dump(mode="json")
         if deadline is None:
@@ -216,10 +294,19 @@ class TaskContext:
             return {"result": await self.embedding(**request)}
         except ActivityError as exc:
             cause = exc.cause
-            if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
-                and cause.message in {"embedding_backend_400", "embedding_backend_500",
-                                      "embedding_backend_502", "embedding_backend_503",
-                                      "embedding_backend_504", "max_attempts"}):
+            if (
+                isinstance(cause, ApplicationError)
+                and cause.type == "OperationFailed"
+                and cause.message
+                in {
+                    "embedding_backend_400",
+                    "embedding_backend_500",
+                    "embedding_backend_502",
+                    "embedding_backend_503",
+                    "embedding_backend_504",
+                    "max_attempts",
+                }
+            ):
                 return {"error": cause.message}
             raise
 
@@ -229,9 +316,17 @@ class TaskContext:
             return {"result": await self.speech(**request)}
         except ActivityError as exc:
             cause = exc.cause
-            if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
-                and cause.message in {"speech_backend_400", "speech_backend_500",
-                                      "speech_backend_503", "max_attempts"}):
+            if (
+                isinstance(cause, ApplicationError)
+                and cause.type == "OperationFailed"
+                and cause.message
+                in {
+                    "speech_backend_400",
+                    "speech_backend_500",
+                    "speech_backend_503",
+                    "max_attempts",
+                }
+            ):
                 return {"error": cause.message}
             raise
 
@@ -252,16 +347,23 @@ class TaskContext:
                     start_to_close_timeout=remaining,
                     schedule_to_close_timeout=remaining,
                     retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=30)
+                        initial_interval=timedelta(seconds=2),
+                        maximum_interval=timedelta(seconds=30),
                     ),
                 )
             except ActivityError as exc:
                 cause = exc.cause
-                if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
-                    and cause.message == "operation_deadline_exceeded"):
+                if (
+                    isinstance(cause, ApplicationError)
+                    and cause.type == "OperationFailed"
+                    and cause.message == "operation_deadline_exceeded"
+                ):
                     raise OperationDeadlineExceeded(cause.message) from exc
-                if (deadline is not None and deadline <= workflow.now()
-                    and isinstance(cause, ActivityTimeoutError)):
+                if (
+                    deadline is not None
+                    and deadline <= workflow.now()
+                    and isinstance(cause, ActivityTimeoutError)
+                ):
                     raise OperationDeadlineExceeded("operation deadline exceeded") from exc
                 raise
 
@@ -297,9 +399,17 @@ class TaskContext:
             return {"result": await self.llm(**request)}
         except ActivityError as exc:
             cause = exc.cause
-            if (isinstance(cause, ApplicationError) and cause.type == "OperationFailed"
-                and cause.message in {"backend_rejected_400", "backend_rejected_422",
-                                      "invalid_response", "max_attempts"}):
+            if (
+                isinstance(cause, ApplicationError)
+                and cause.type == "OperationFailed"
+                and cause.message
+                in {
+                    "backend_rejected_400",
+                    "backend_rejected_422",
+                    "invalid_response",
+                    "max_attempts",
+                }
+            ):
                 return {"error": "OperationFailed"}
             raise
 
@@ -445,21 +555,23 @@ def durable_task(*, name: str, version: int, policy: TaskPolicy):
                 artifact = result["result"] if terminal == "PARTIAL" else result
                 artifact = Artifact.model_validate(artifact).model_dump(mode="json")
             except Exception as exc:
+                cancelled = is_cancellation(exc)
+                reason = "user_cancelled" if cancelled else terminal_reason(exc)
                 if not self.ctx.path:
                     await workflow.execute_activity(
                         "runtime.finish_run",
                         {
                             "root_id": self.ctx.root_id,
                             "tenant_id": self.ctx.tenant_id,
-                            "state": "FAILED",
-                            "reason": type(exc).__name__,
+                            "state": "CANCELLED" if cancelled else "FAILED",
+                            "reason": reason,
                         },
                         task_queue=self.ctx.control_queue,
                         start_to_close_timeout=timedelta(seconds=30),
                     )
-                raise ApplicationError(
-                    "feature failed", type=type(exc).__name__, non_retryable=True
-                ) from exc
+                if cancelled:
+                    raise
+                raise ApplicationError("feature failed", type=reason, non_retryable=True) from exc
             if not self.ctx.path:
                 await workflow.execute_activity(
                     "runtime.finish_run",

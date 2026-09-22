@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    CancelledError,
+    ChildWorkflowError,
+)
 from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 from intramind_runtime import sdk
@@ -295,7 +300,29 @@ async def test_feature_activity_has_finite_attempts_and_original_deadline(
     assert options["retry_policy"].maximum_attempts == 3
     assert options["schedule_to_close_timeout"] == timedelta(seconds=45)
     assert options["start_to_close_timeout"] == timedelta(seconds=20)
+    assert "heartbeat_timeout" not in options
     assert ctx._active_commands == 0
+
+
+async def test_heartbeat_timeout_is_set_only_when_the_activity_pulses(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    execute = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+
+    await context(now).activity("render", {}, key="render", heartbeat_timeout_seconds=30)
+
+    assert execute.await_args.kwargs["heartbeat_timeout"] == timedelta(seconds=30)
+
+
+async def test_non_positive_heartbeat_timeout_is_rejected(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    execute = AsyncMock()
+    monkeypatch.setattr(sdk.workflow, "execute_activity", execute)
+
+    with pytest.raises(ValueError, match="retry policy"):
+        await context(now).activity("render", {}, key="render", heartbeat_timeout_seconds=0)
+
+    execute.assert_not_called()
 
 
 @pytest.mark.parametrize("max_attempts", [0, -1, 101])
@@ -527,3 +554,74 @@ async def test_model_step_bound_does_not_send_extra_inference(runtime_clock):
         await ctx.model_step(key="leaf", planner="leaf.plan/v1", inputs={}, max_model_calls=1)
     ctx.llm_outcome.assert_awaited_once()
     assert ctx._active_commands == 0
+
+
+def child_failure(cause):
+    error = ChildWorkflowError(
+        "child failed",
+        namespace="intramind",
+        workflow_id="child",
+        run_id="run",
+        workflow_type="feature/v1",
+        initiated_event_id=1,
+        started_event_id=2,
+        retry_state=None,
+    )
+    error.__cause__ = cause
+    return error
+
+
+def test_terminal_reason_unwraps_child_workflow_to_the_ledger_cause():
+    inner = ApplicationError("engine_epoch_stopped", type="OperationFailed", non_retryable=True)
+    wrapped = ApplicationError("feature failed", type="ActivityError", non_retryable=True)
+    wrapped.__cause__ = failed_activity(inner)
+
+    assert sdk.terminal_reason(child_failure(wrapped)) == "engine_epoch_stopped"
+    assert sdk.is_cancellation(failed_activity(CancelledError("stopped")))
+
+
+def _envelope(now):
+    return {
+        "root_id": "root",
+        "tenant_id": "tenant",
+        "control_queue": "control",
+        "deadline": (now + timedelta(hours=1)).isoformat(),
+        "input": {},
+    }
+
+
+async def test_cancelled_activity_is_not_recorded_as_feature_failed(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    finish = AsyncMock()
+    monkeypatch.setattr(sdk.workflow, "execute_activity", finish)
+
+    @sdk.durable_task(name="sdk-cancel-test", version=1, policy=sdk.TaskPolicy(max_iterations=1))
+    async def feature(ctx, inputs):
+        raise failed_activity(CancelledError("activity cancelled"))
+
+    with pytest.raises(ActivityError):
+        await feature().run(_envelope(now))
+
+    payload = finish.await_args.args[1]
+    assert payload["state"] == "CANCELLED"
+    assert payload["reason"] == "user_cancelled"
+
+
+async def test_failed_feature_records_the_operation_reason(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    finish = AsyncMock()
+    monkeypatch.setattr(sdk.workflow, "execute_activity", finish)
+
+    @sdk.durable_task(name="sdk-reason-test", version=1, policy=sdk.TaskPolicy(max_iterations=1))
+    async def feature(ctx, inputs):
+        raise failed_activity(
+            ApplicationError("engine_epoch_stopped", type="OperationFailed", non_retryable=True)
+        )
+
+    with pytest.raises(ApplicationError) as caught:
+        await feature().run(_envelope(now))
+
+    assert caught.value.type == "engine_epoch_stopped"
+    payload = finish.await_args.args[1]
+    assert payload["state"] == "FAILED"
+    assert payload["reason"] == "engine_epoch_stopped"

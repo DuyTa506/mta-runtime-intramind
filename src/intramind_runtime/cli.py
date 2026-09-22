@@ -5,10 +5,13 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
@@ -23,6 +26,7 @@ from .artifacts import MinioArtifacts
 from .contracts import EmbeddingPoolSpec, PoolSpec, RerankPoolSpec, SpeechPoolSpec, parse_pool
 from .drivers import OpenAICompletionDriver
 from .embedding import EmbeddingPreparer, EmbeddingProfile, ServingEmbeddingDriver
+from .epochs import epoch_lags_engine
 from .executor import Executor
 from .preparation import LlamaCppPromptSizer
 from .rerank import RerankProfile
@@ -195,7 +199,36 @@ def direct_proxies(config, store, sizing):
     }
 
 
+def engine_started_at(host: str) -> str | None:
+    """Container start time when the docker CLI can see it, otherwise unknown."""
+    if shutil.which("docker") is None or not host:
+        return None
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.StartedAt}}", host],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if result.returncode:
+        return None
+    started = result.stdout.strip()
+    return started or None
+
+
+def reject_stale_engine_epochs(config, started_at=engine_started_at) -> None:
+    """Refuse to load a timestamp epoch older than the engine instance now running."""
+    for pool in config.get("pools", []):
+        admission = pool.get("admission") or {}
+        epoch = admission.get("engine_epoch", "")
+        host = urlparse(pool.get("base_url") or "").hostname
+        started = started_at(host) if host else None
+        if started and epoch_lags_engine(epoch, started):
+            raise ValueError(
+                f"Pool {admission.get('pool_id')} engine epoch {epoch} is older than "
+                f"{host} start {started}"
+            )
+
+
 async def services(command, settings, config):
+    reject_stale_engine_epochs(config)
     store = Store(settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds)
     tasks = []
     drivers = []
