@@ -4,7 +4,6 @@ import asyncio
 import os
 from contextlib import suppress
 from hashlib import sha256
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -70,8 +69,8 @@ async def test_webhook_restart_preserves_delivery_identity_without_inference(sto
                 build_activities=lambda factory: [webhooks.WebhookActivities(factory).deliver],
                 respond=unexpected_inference) as env:
             monkeypatch.setattr(webhooks, "RuntimeClient", lambda url, token, tenant: env.runtime_client(tenant))
-            monkeypatch.setattr(webhooks, "get_settings", lambda: SimpleNamespace(url="http://runtime",
-                service_token=SimpleNamespace(get_secret_value=lambda: "x" * 32)))
+            monkeypatch.setenv("BACKGROUND_RUNTIME__URL", "http://runtime")
+            monkeypatch.setenv("BACKGROUND_RUNTIME__SERVICE_TOKEN", "x" * 32)
             api = env.runtime_client("system:pptx")
             try:
                 await relay_once(sessions, webhooks.accept)
