@@ -88,7 +88,7 @@ async def test_pptx_context_retains_sources_policy_and_budget_across_rollover(st
     async with feature_environment(store, name="pptx-context-checkpoint", workflows=workflows,
                                    build_activities=activities, respond=respond) as env:
         status, result = await env.submit({"document_ids": [str(i) for i in range(document_count)],
-            "primary_document_id": "0", "language": "vi", "instructions": "User intent: use the designated source",
+            "primary_document_id": "0", "language": "en", "instructions": "User intent: use the designated source",
             "n_slides": 6, "avoid_layout_repetition": True}, configuration=policy.model_dump(mode="json"))
         assert len(loaded) == 1 and len(publications) == 2 and publications[0] == publications[1]
         client = env.runtime_client("user:test")

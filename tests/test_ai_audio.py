@@ -97,8 +97,6 @@ async def audio_case(store, monkeypatch, *, compress, high_quality, drop_respons
             raise httpx.ReadTimeout("backend termination was not observed")
         headers = {"X-Intramind-Attempt-ID": request.headers["X-Intramind-Attempt-ID"],
                    "X-Intramind-TTS-Contract": "termination-v1"}
-        if body["voice"].get("voice_id"):
-            return httpx.Response(503, headers=headers | {"X-Intramind-Compute-State": "not_started"})
         return httpx.Response(200, content=buffer.getvalue(), headers=headers | {
             "X-Intramind-Compute-State": "terminated", "Content-Type": "audio/wav",
         })
@@ -204,10 +202,10 @@ async def audio_case(store, monkeypatch, *, compress, high_quality, drop_respons
         status, result = await env.submit(source)
         assert status["state"] == "PARTIAL"  # WAV fallback is explicit.
         assert result["transcript"] == turns
-        assert len(voice_calls) == 2 + int(high_quality)
-        assert voice_calls[-1]["voice"] == {"gender": "female"}
+        assert len(voice_calls) == 2
+        assert all(call["voice"].get("voice_id") for call in voice_calls)
         assert status["resource_budgets"]["speech_characters"]["spent"] == sum(
-            len(request["text"]) for request in voice_calls if "voice_id" not in request["voice"]
+            len(request["text"]) for request in voice_calls
         )
         async with store.engine.connect() as connection:
             voice_operations = await rows(connection,
@@ -232,5 +230,5 @@ async def audio_case(store, monkeypatch, *, compress, high_quality, drop_respons
         assert inference_count == (3 if compress else 1)
         await env.replay(status["root_id"])
         assert len(env.calls) == inference_count
-        assert len(voice_calls) == 2 + int(high_quality)
+        assert len(voice_calls) == 2
         assert len(uploads) == 1

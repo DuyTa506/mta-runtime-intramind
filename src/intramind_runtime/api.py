@@ -4,6 +4,7 @@ import hmac
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -24,6 +25,10 @@ class Submission(Contract):
     submission_key: str = Field(min_length=1, max_length=200)
     input: Artifact
     configuration: Artifact | None = None
+
+
+class RunSnapshotRequest(Contract):
+    run_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(min_length=1, max_length=100)
 
 
 def create_app(
@@ -234,6 +239,10 @@ def create_app(
     @app.get("/v1/runs/{run_id}")
     async def status(run_id: str, tenant_id=Depends(tenant)):
         return await store.run(run_id, tenant_id)
+
+    @app.post("/v1/runs/snapshot")
+    async def snapshots(request: RunSnapshotRequest, tenant_id=Depends(tenant)):
+        return {"items": await store.run_snapshots(request.run_ids, tenant_id)}
 
     @app.post("/v1/runs/{run_id}/cancel", status_code=202)
     async def cancel(run_id: str, tenant_id=Depends(tenant)):
