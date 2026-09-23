@@ -12,6 +12,22 @@ pytestmark = pytest.mark.integration
 TOKEN = "isolated-test-credential-only-12345678"
 
 
+async def test_lifecycle_snapshot_is_bounded_tenant_scoped_and_content_free(store):
+    await store.create_root(root("visible", "owner"))
+    await store.create_root(root("hidden", "other"))
+    app = create_app(store, MemoryArtifacts(), TOKEN, {})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+        assert (await client.post("/v1/runs/snapshot", json={"run_ids": ["visible"]})).status_code == 401
+        client.headers.update({"Authorization": f"Bearer {TOKEN}", "X-Tenant-ID": "owner"})
+        response = await client.post("/v1/runs/snapshot", json={"run_ids": ["visible", "hidden"]})
+        assert response.json() == {"items": [{"root_id": "visible", "state": "RUNNING",
+            "cleanup_pending": False, "cancel_requested": False}]}
+        assert (await client.post("/v1/runs/snapshot", json={"run_ids": ["visible"] * 101})).status_code == 422
+        await store.cancel("visible", "owner")
+        response = await client.post("/v1/runs/snapshot", json={"run_ids": ["visible"]})
+        assert response.json()["items"][0]["state"] == "CANCELLED"
+
+
 async def test_submit_is_idempotent_and_server_owns_policy(store):
     blobs = MemoryArtifacts()
     ref = await blobs.put("t", b"{}")

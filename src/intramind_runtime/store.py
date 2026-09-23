@@ -229,6 +229,19 @@ class Store:
                 "resource_budgets": {b["unit"]: {"limit": b["budget_limit"],
                     "reserved": b["reserved"], "spent": b["spent"]} for b in budgets}}
 
+    async def run_snapshots(self, root_ids: list[str], tenant_id: str):
+        """Bounded lifecycle-only reads for the shared observer, without artifacts."""
+        if not 1 <= len(root_ids) <= 100:
+            raise ValueError("Between 1 and 100 run identities are required")
+        async with self.engine.connect() as c:
+            result = await rows(c, """SELECT r.root_id,r.state,r.cancel_requested,
+                EXISTS(SELECT 1 FROM runtime_attempts a JOIN runtime_operations o USING(operation_id)
+                    WHERE o.root_id=r.root_id AND (a.compute_held OR a.budget_held)) AS cleanup_pending
+                FROM runtime_roots r WHERE r.tenant_id=:tenant
+                    AND r.root_id=ANY(CAST(:ids AS text[])) ORDER BY r.root_id""",
+                tenant=tenant_id, ids=root_ids)
+            return [dict(item) for item in result]
+
     async def reserve_next(self, pool_id: str, owner_id: str) -> Reservation | None:
         """Called only by an idle executor; no downstream worker queue."""
         async with self.transaction() as c:
