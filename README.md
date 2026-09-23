@@ -396,3 +396,14 @@ other consumers supply their own evidence to `intramind_runtime.release_gate`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contract, compatibility and release rules,
 and [CHANGELOG.md](CHANGELOG.md) for the unreleased package contents.
+
+### Output-language contracts
+
+`intramind_runtime.language` provides local Han-script detection, immutable
+language policies, and a bounded text-patch validator. Application adapters choose
+prose fields and protected source literals; it is not a general language detector.
+`LanguageGuardedPort` records one optional correction through the existing
+`ModelPort`, retaining operation identity, replay and root accounting. Explicit
+Chinese/Japanese/Korean targets permit Han. A rejected correction is terminal for
+the leaf and cannot silently change numbers, citations or protected identifiers.
+No model or downloadable language assets are added.

@@ -7,8 +7,10 @@ from intramind_runtime.language import (
     LanguagePolicy,
     LanguageValidationError,
     apply_repair,
+    completion_value,
     inspect_language,
     repair_payload,
+    source_literals,
 )
 from intramind_runtime.model_step import ModelRecord, plan_model_step
 
@@ -101,3 +103,33 @@ def test_policy_is_portable_and_does_not_accept_auto():
     with pytest.raises(ValueError):
         LanguagePolicy("auto")
     assert repair_payload((), policy)["response_format"] == {"type": "json_object"}
+
+
+def test_only_explicit_source_literals_are_exempt():
+    terms = source_literals("Văn bản 中文, trích “北京”, mã `变量`")
+    assert terms == ("北京", "变量")
+    policy = LanguagePolicy("vi", protected_terms=terms)
+    assert not inspect_language("Trích 北京, mã 变量", policy)
+    assert inspect_language("Tự sinh 中文", policy)
+
+
+def test_completion_does_not_repair_truncated_json_or_tool_calls():
+    assert (
+        completion_value(body('{"text":"问题"}', finish_reason="length"), structured=True)[1]
+        is False
+    )
+    assert completion_value(body(None, finish_reason="tool_calls"))[1] is False
+    assert completion_value(body('```json\n{"text":"问题"}\n```')) == ({"text": "问题"}, True)
+
+
+@pytest.mark.asyncio
+async def test_failed_repair_prevents_hidden_leaf_retry():
+    from unittest.mock import AsyncMock
+
+    port = AsyncMock()
+    port.invoke.side_effect = [body("问题 12"), body('{"texts":["sửa 13"]}')]
+    guard = LanguageGuardedPort(port, LanguagePolicy("vi"))
+    for _ in range(3):
+        with pytest.raises(LanguageValidationError):
+            await guard.invoke({"messages": []}, max_output_tokens=100)
+    assert port.invoke.await_count == 2

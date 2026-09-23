@@ -17,6 +17,7 @@ _HAN = re.compile(
     "\U00020000-\U0002ee5f\U0002f800-\U0002fa1f\U00030000-\U000323af]"
 )
 _FIXED = re.compile(r"https?://\S+|\[[^\]\n]+\]|<[^>\n]+>|\{\{.*?\}\}|\d+(?:[.,:/-]\d+)*")
+_LITERAL = re.compile(r'"[^"\n]+"|“[^”\n]+”|「[^」\n]+」|`[^`\n]+`|\$\$[^$]+\$\$')
 _ALIASES = {
     "vietnamese": "vi",
     "english": "en",
@@ -76,6 +77,17 @@ def _strings(value, path=()):
     elif isinstance(value, list):
         for index, item in enumerate(value):
             yield from _strings(item, (*path, index))
+
+
+def source_literals(text: str) -> tuple[str, ...]:
+    """Keep explicit source quotations/code literal; never exempt an entire source."""
+    return tuple(
+        dict.fromkeys(
+            match[1:-1] if not match.startswith("$$") else match[2:-2]
+            for match in _LITERAL.findall(text)
+            if _HAN.search(match)
+        )
+    )
 
 
 def inspect_language(value: Any, policy: LanguagePolicy) -> tuple[LanguageIssue, ...]:
@@ -181,14 +193,20 @@ def apply_repair(value: Any, issues: tuple[LanguageIssue, ...], raw: str, policy
 def completion_value(body: dict, *, structured: bool = False):
     """Never mistake truncation or invalid JSON for a repairable language issue."""
     choice = body["choices"][0]
+    if choice.get("finish_reason") == "tool_calls" or choice["message"].get("tool_calls"):
+        return "", False
     text = choice["message"]["content"]
     if not isinstance(text, str):
         raise LanguageValidationError("invalid_completion_body")
     if choice.get("finish_reason") not in (None, "stop"):
         return text, False
+    candidate = text.strip()
+    if candidate.startswith("```json\n") and candidate.endswith("```"):
+        candidate = candidate[8:-3].strip()
+        structured = True
     if structured:
         try:
-            return json.loads(text), True
+            return json.loads(candidate), True
         except ValueError:
             return text, False
     return text, True
@@ -210,11 +228,19 @@ class LanguageGuardedPort:
         return self.port.reject(reason)
 
     async def invoke(self, payload: dict, *, max_output_tokens: int):
+        if self.failures:
+            raise LanguageValidationError()
         body = await self.port.invoke(
             constrain_messages(payload, self.policy), max_output_tokens=max_output_tokens
         )
-        structured = bool(payload.get("response_format"))
+        raw = body["choices"][0]["message"].get("content") or ""
+        structured = payload.get("response_format", {}).get("type") in {
+            "json_object",
+            "json_schema",
+        }
+        structured = structured or raw.lstrip().startswith(("{", "["))
         value, checkable = completion_value(body, structured=structured)
+        structured = structured or not isinstance(value, str)
         issues = inspect_language(value, self.policy) if checkable else ()
         if not issues:
             return body
