@@ -1,8 +1,7 @@
 """Local output-language contracts. Applications own policy and repair scheduling.
 
-No network client, model discovery, or language model is loaded here. Han is a
-script signal, not a language classifier; source literals require explicit host
-protection and Chinese/Japanese/Korean targets permit Han.
+Policy v1 retains the original Han-only check. Policy v2 adds offline language
+identification and script checks against the accepted output target.
 """
 
 import json
@@ -24,6 +23,13 @@ _ALIASES = {
     "chinese": "zh",
     "japanese": "ja",
     "korean": "ko",
+    "french": "fr",
+    "german": "de",
+    "spanish": "es",
+    "russian": "ru",
+    "thai": "th",
+    "arabic": "ar",
+    "portuguese": "pt",
     "zh-cn": "zh",
     "zh-tw": "zh",
 }
@@ -42,14 +48,14 @@ class LanguagePolicy:
     text_paths: tuple[str, ...] = ("*",)
     protected_paths: tuple[str, ...] = ()
     protected_terms: tuple[str, ...] = ()
-    version: int = 1
+    version: int = 2
 
     def __post_init__(self):
         target = self.target.strip().lower().replace("_", "-")
         target = _ALIASES.get(target, target)
         if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", target):
             raise ValueError("A resolved output language is required")
-        if self.version != 1:
+        if self.version not in {1, 2}:
             raise ValueError("Unsupported language policy version")
         object.__setattr__(self, "target", target)
         for name in ("text_paths", "protected_paths", "protected_terms"):
@@ -85,13 +91,14 @@ def source_literals(text: str) -> tuple[str, ...]:
         dict.fromkeys(
             match[1:-1] if not match.startswith("$$") else match[2:-2]
             for match in _LITERAL.findall(text)
-            if _HAN.search(match)
+            if any(character.isalpha() for character in match)
         )
     )
 
 
 def inspect_language(value: Any, policy: LanguagePolicy) -> tuple[LanguageIssue, ...]:
-    if policy.target.split("-")[0] in {"zh", "ja", "ko"}:
+    permits_han = policy.target.split("-")[0] in {"zh", "ja", "ko"}
+    if policy.version == 1 and permits_han:
         return ()
     issues = []
     for path, text in _strings(value):
@@ -104,7 +111,12 @@ def inspect_language(value: Any, policy: LanguagePolicy) -> tuple[LanguageIssue,
         for term in sorted(policy.protected_terms, key=len, reverse=True):
             if term:
                 candidate = candidate.replace(term, "")
-        if _HAN.search(candidate):
+        invalid = not permits_han and _HAN.search(candidate)
+        if not invalid and policy.version >= 2:
+            from .language_detection import wrong_language
+
+            invalid = wrong_language(candidate, policy.target)
+        if invalid:
             issues.append(LanguageIssue(path, text))
     return tuple(issues)
 

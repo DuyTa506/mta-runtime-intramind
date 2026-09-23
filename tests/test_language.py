@@ -20,6 +20,68 @@ def test_clean_output(text):
     assert not inspect_language(text, LanguagePolicy("vietnamese"))
 
 
+VI = "Tài liệu này giải thích cách hệ thống xử lý dữ liệu và tạo ra kết quả cho người sử dụng."
+EN = "The system processes the uploaded documents and produces a detailed summary of the available information."
+FR = "Ce document décrit les principales étapes du traitement des données et présente les résultats obtenus."
+
+
+@pytest.mark.parametrize(
+    "target,text",
+    [
+        ("vi", EN),
+        ("en", VI),
+        ("vi", FR),
+        ("fr", EN),
+        ("zh", EN),
+        ("vi", "Настройка сервера завершена"),
+        ("en", "การประมวลผลข้อมูล"),
+    ],
+)
+def test_target_language_mismatch_is_not_limited_to_han(target, text):
+    assert inspect_language(text, LanguagePolicy(target))
+
+
+@pytest.mark.parametrize(
+    "target,text",
+    [
+        ("vi", VI),
+        ("en", EN),
+        ("fr", FR),
+        ("vi", "Hệ thống dùng PostgreSQL và GPU NVIDIA để xử lý dữ liệu của người dùng."),
+        ("vi", "Docker Kubernetes PostgreSQL Temporal Redis MinIO FastAPI NVIDIA"),
+        ("vi", "Công thức $α + β + γ$ và mã `print('hello world')` được giữ nguyên."),
+    ],
+)
+def test_target_prose_and_technical_literals_remain_untouched(target, text):
+    assert not inspect_language(text, LanguagePolicy(target))
+
+
+def test_mixed_sentence_is_found_and_declared_source_quote_is_preserved():
+    assert inspect_language(VI + " " + EN, LanguagePolicy("vi"))
+    assert not inspect_language(VI + " " + EN, LanguagePolicy("vi", protected_terms=(EN,)))
+
+
+def test_saved_v1_policy_preserves_its_original_inspection_semantics():
+    assert not inspect_language(EN, LanguagePolicy("vi", version=1))
+    assert inspect_language("问题", LanguagePolicy("vi", version=1))
+
+
+def test_confident_detector_is_deterministic_and_short_terms_are_uncertain():
+    from intramind_runtime.language_detection import detect_language
+
+    assert {detect_language(VI) for _ in range(5)} == {"vi"}
+    assert detect_language(EN) == "en"
+    assert detect_language("GPU RAG") is None
+
+
+def test_non_han_repair_must_reach_the_requested_target():
+    policy = LanguagePolicy("vi")
+    issues = inspect_language(EN, policy)
+    assert apply_repair(EN, issues, json.dumps({"texts": [VI]}), policy) == VI
+    with pytest.raises(LanguageValidationError):
+        apply_repair(EN, issues, json.dumps({"texts": [FR]}), policy)
+
+
 @pytest.mark.parametrize("text", ["Có 问题 trong câu", "中文内容", "ký tự 𠀀", "ký tự 𰀀"])
 def test_han_across_unicode_planes(text):
     assert inspect_language(text, LanguagePolicy("vi"))
@@ -117,8 +179,12 @@ def test_repair_schema_cannot_echo_input_metadata():
     assert schema["properties"]["texts"]["minItems"] == 1
     assert schema["properties"]["texts"]["maxItems"] == 1
     with pytest.raises(LanguageValidationError):
-        apply_repair({"text": "北京 có 问题 12"}, issues,
-                     '{"texts":["北京 có vấn đề 12"],"preserve_verbatim":["北京"]}', policy)
+        apply_repair(
+            {"text": "北京 có 问题 12"},
+            issues,
+            '{"texts":["北京 có vấn đề 12"],"preserve_verbatim":["北京"]}',
+            policy,
+        )
 
 
 def test_only_explicit_source_literals_are_exempt():
