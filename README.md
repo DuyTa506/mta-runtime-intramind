@@ -396,3 +396,21 @@ other consumers supply their own evidence to `intramind_runtime.release_gate`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contract, compatibility and release rules,
 and [CHANGELOG.md](CHANGELOG.md) for the unreleased package contents.
+
+### Output-language contracts
+
+`intramind_runtime.language` provides immutable target-language policies and a
+bounded text-patch validator. Policy v2 combines script checks with deterministic
+offline language identification, including Latin-script mismatches (e.g. English
+when Vietnamese was requested). Saved v1 policies retain their Han-only semantics.
+Application adapters choose prose fields and protected source literals.
+`LanguageGuardedPort` records one optional correction through the existing
+`ModelPort`, retaining operation identity, replay and root accounting. Explicit
+Chinese/Japanese/Korean targets permit Han. A rejected correction is terminal for
+the leaf and cannot silently change numbers, citations or protected identifiers.
+Short/ambiguous text and technical names are not classified as wrong merely for
+being foreign words. Longer sentences require strong detector confidence; this is
+not a semantic translation guarantee. `langdetect==1.0.9` ships the small profiles
+inside its wheel, covered by the lockfile: no runtime download, GPU or extra LLM
+call is needed for detection. See the [detector documentation](https://github.com/Mimino666/langdetect)
+for supported languages and the deterministic seed behavior.
