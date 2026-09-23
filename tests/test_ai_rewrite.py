@@ -13,7 +13,7 @@ import httpx
 import pytest
 from conftest import pool, temporal_test_client
 from fakes import MemoryArtifacts
-from feature_harness import peak_children, ai_language_activities
+from feature_harness import ai_language_activities, peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
