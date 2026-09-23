@@ -81,6 +81,8 @@ async def test_pptx_root_keeps_accepted_policy_across_every_phase_and_publicatio
         monkeypatch.setenv("CUSTOM_MODEL", "changed-worker-model")
         monkeypatch.setenv("BACKGROUND_RUNTIME__PPTX_TASK_QUEUE", "wrong-after-acceptance")
         system, prompt = [message["content"] for message in payload["messages"]]
+        # The accepted language guard appends its instruction to the native prompt.
+        system = system.partition("\n\nOUTPUT LANGUAGE CONTRACT:")[0]
         schema = payload.get("response_format", {}).get("json_schema", {}).get("name")
         if schema == "presentation_brief":
             answer = fixture.read_text(encoding="utf-8")

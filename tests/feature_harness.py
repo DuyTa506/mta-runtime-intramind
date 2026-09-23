@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from types import SimpleNamespace
 from uuid import uuid4
@@ -23,6 +24,15 @@ from intramind_runtime.executor import Executor
 from intramind_runtime.preparation import LlamaCppPromptSizer
 from intramind_runtime.speech import ServingSpeechDriver, SpeechPreparer
 from intramind_runtime.temporal_adapter import BrokerActivities, OutboxPublisher
+
+
+def ai_language_activities(factory):
+    """Register the same language guards as the current AI worker in feature tests."""
+    if os.environ.get("RUNTIME_TEST_AI_FEATURES") != "yes":
+        return []
+    from api.background.common.language import LanguageActivities
+    language = LanguageActivities(factory)
+    return [language.check, language.accept]
 
 
 def peak_children(history):
@@ -162,7 +172,7 @@ async def feature_environment(
             task_queue=queue,
             workflows=workflows,
             activities=[broker.submit_or_attach, broker.submit_speech, broker.submit_embedding, broker.finish,
-                        *build_activities(runtime_client)],
+                        *build_activities(runtime_client), *ai_language_activities(runtime_client)],
             deployment_config=WorkerDeploymentConfig(
                 version=version,
                 use_worker_versioning=True,
