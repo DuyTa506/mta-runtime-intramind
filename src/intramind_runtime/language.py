@@ -148,8 +148,10 @@ def repair_payload(issues: tuple[LanguageIssue, ...], policy: LanguagePolicy) ->
     if policy.version >= 2:
         instruction = (
             f"Translate the supplied generated prose into {target_name} ({policy.target}). "
-            "Translate every sentence in another language, including when the entire input "
-            "is in another language. Retain prose already in the target language. "
+            "Correct both entirely wrong-language sentences and unintended foreign words or "
+            "phrases embedded in otherwise target-language sentences. Every supplied text "
+            "has a language violation: translate those off-target fragments, and retain "
+            "the parts already in the target language. "
         )
     return {
         "messages": [
