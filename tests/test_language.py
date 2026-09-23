@@ -102,7 +102,23 @@ def test_policy_is_portable_and_does_not_accept_auto():
     assert LanguagePolicy(**json.loads(json.dumps(policy.snapshot()))) == policy
     with pytest.raises(ValueError):
         LanguagePolicy("auto")
-    assert repair_payload((), policy)["response_format"] == {"type": "json_object"}
+    response_format = repair_payload((), policy)["response_format"]
+    assert response_format["type"] == "json_schema"
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["texts"] and schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"texts"}
+
+
+def test_repair_schema_cannot_echo_input_metadata():
+    policy = LanguagePolicy("vi", protected_terms=("北京",))
+    issues = inspect_language({"text": "北京 có 问题 12"}, policy)
+    request = repair_payload(issues, policy)
+    schema = request["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["texts"]["minItems"] == 1
+    assert schema["properties"]["texts"]["maxItems"] == 1
+    with pytest.raises(LanguageValidationError):
+        apply_repair({"text": "北京 có 问题 12"}, issues,
+                     '{"texts":["北京 có vấn đề 12"],"preserve_verbatim":["北京"]}', policy)
 
 
 def test_only_explicit_source_literals_are_exempt():

@@ -154,7 +154,26 @@ def repair_payload(issues: tuple[LanguageIssue, ...], policy: LanguagePolicy) ->
             },
         ],
         "temperature": 0,
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "language_repair",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "texts": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": len(issues),
+                            "maxItems": len(issues),
+                        }
+                    },
+                    "required": ["texts"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     }
 
 
