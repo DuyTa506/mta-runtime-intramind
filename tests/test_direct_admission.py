@@ -13,6 +13,7 @@ from intramind_runtime.contracts import (
     EmbeddingPoolSpec,
     RerankPoolSpec,
     RuntimeConflict,
+    SendBudgetUnavailable,
 )
 from intramind_runtime.direct import DirectRequest
 from intramind_runtime.memory_scheduler import MemoryScheduler
@@ -455,3 +456,115 @@ async def test_cancelled_durable_operation_cannot_block_queue_head(store):
         waiting.cancel()
         await asyncio.gather(waiting, return_exceptions=True)
         await scheduler.close()
+
+
+async def test_retried_durable_waiter_keeps_operation_age_ahead_of_later_same_class(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    await store.create_root(root(priority="background"))
+    await store.submit_operation(operation(attempt_timeout_seconds=0.35))
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    blocker = await admit(scheduler, request("occupy", workload_class="qa"))
+    first = await store.reserve_next("p", "worker")
+    waiting = asyncio.create_task(durable(scheduler, first))
+    retry_waiting = None
+    try:
+        async with asyncio.timeout(2):
+            while first.attempt_id not in scheduler.waiters:
+                await asyncio.sleep(0.01)
+        later = request("later-background", workload_class="background")
+        await scheduler.enqueue(later, "p", "direct")
+        with pytest.raises(TimeoutError, match="deadline"):
+            await asyncio.wait_for(waiting, 2)
+        await store.fail(first, "attempt_deadline_exceeded", not_sent=True, retry=True)
+        retry = await store.reserve_next("p", "worker")
+        assert retry.sent_attempts == 0 and retry.lease_epoch > first.lease_epoch
+        retry_waiting = asyncio.create_task(durable(scheduler, retry))
+        async with asyncio.timeout(2):
+            while retry.attempt_id not in scheduler.waiters:
+                await asyncio.sleep(0.01)
+        assert scheduler._first("p").identity == retry.attempt_id
+        await scheduler.finish(blocker, evidence="not_sent")
+        permit = await asyncio.wait_for(retry_waiting, 2)
+        assert permit.attempt_id == retry.attempt_id
+        assert await scheduler.reserve(later, "p", "direct") is None
+        await store.fail(retry, "test_done", not_sent=True, retry=False)
+        await scheduler.durable_release(retry.attempt_id, retry.owner_id)
+        assert await scheduler.reserve(later, "p", "direct") is not None
+    finally:
+        waiting.cancel()
+        if retry_waiting is not None:
+            retry_waiting.cancel()
+            await asyncio.gather(retry_waiting, return_exceptions=True)
+        await asyncio.gather(waiting, return_exceptions=True)
+        await scheduler.close()
+
+
+@pytest.mark.parametrize("review_date", [datetime(2000, 1, 1, tzinfo=UTC), None])
+async def test_pool_review_date_does_not_stop_direct_or_durable(store, caplog, review_date):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1,
+                valid_until=review_date)
+    await store.configure_pool(spec, 1)
+    await store.create_root(root())
+    await store.submit_operation(operation())
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        direct = await admit(scheduler, request("validity-direct"))
+        assert direct is not None
+        await scheduler.finish(direct, evidence="not_sent")
+        reserved = await store.reserve_next("p", "worker")
+        assert reserved is not None
+        permit = await durable(scheduler, reserved)
+        assert permit.attempt_id == reserved.attempt_id
+        await store.fail(reserved, "test_done", not_sent=True, retry=False)
+        await scheduler.durable_release(reserved.attempt_id, reserved.owner_id)
+        metrics = (await snapshot(store, scheduler)).decode()
+        if review_date is None:
+            assert 'intramind_runtime_pool_valid_until_seconds{pool="p"}' not in metrics
+        else:
+            assert 'intramind_runtime_pool_valid_until_seconds{pool="p"} -' in metrics
+            await scheduler._refresh()
+            assert caplog.text.count("valid_until passed; capacity remains available") == 1
+    finally:
+        await scheduler.close()
+
+
+async def test_send_budget_conflict_has_machine_reason_and_no_charge(store):
+    await store.configure_pool(pool(target=2), 2)
+    await store.create_root(root(max_attempts=1))
+    await store.submit_operation(operation("first"))
+    await store.submit_operation(operation("second"))
+    first = await store.reserve_next("p", "worker-1")
+    second = await store.reserve_next("p", "worker-2")
+    await store.mark_send(first)
+    with pytest.raises(SendBudgetUnavailable) as caught:
+        await store.mark_send(second)
+    assert caught.value.reason == "send_attempts_exhausted"
+    await store.fail(second, caught.value.reason, not_sent=True, retry=True)
+    assert second.sent_attempts == 0
+    async with store.engine.connect() as c:
+        attempts = (await c.execute(text(
+            "SELECT attempts FROM runtime_roots WHERE root_id='r'"))).scalar_one()
+    assert attempts == 1
+
+
+async def test_reconcile_prunes_only_old_settled_direct_attempts(store):
+    await store.configure_pool(pool(), 1)
+    payload = request("old-direct").model_dump_json()
+    async with store.engine.begin() as c:
+        await c.execute(text("""INSERT INTO runtime_direct_attempts
+            (attempt_id,request_id,tenant_id,spec,pool_id,engine_epoch,owner_id,state,
+             compute_held,lease_expires_at,deadline,created_at)
+            VALUES ('settled','old-direct','t',CAST(:spec AS jsonb),'p','e1','owner',
+                    'FINISHED',false,now()-interval '2 days',now()-interval '2 days',
+                    now()-interval '2 days'),
+                   ('held','held-direct','t',CAST(:spec AS jsonb),'p','e1','owner',
+                    'UNKNOWN',true,now()-interval '2 days',now()-interval '2 days',
+                    now()-interval '2 days')"""), {"spec": payload})
+    await store.reconcile_expired()
+    async with store.engine.connect() as c:
+        remaining = (await c.execute(text(
+            "SELECT attempt_id FROM runtime_direct_attempts ORDER BY attempt_id"))).scalars().all()
+    assert remaining == ["held"]

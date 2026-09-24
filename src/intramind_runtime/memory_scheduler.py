@@ -71,7 +71,7 @@ class SlotCapacity:
     def try_acquire(pool: _Pool, permits: dict[str, _Permit], pools: dict[str, _Pool],
                     workload_class: str) -> bool:
         if (pool.health != "HEALTHY" or pool.group_health != "HEALTHY"
-                or pool.target <= 0 or pool.spec.valid_until <= datetime.now(UTC)):
+                or pool.target <= 0):
             return False
         active = [p for p in permits.values() if p.pool_id == pool.spec.pool_id]
         endpoint_limit = (pool.spec.transport_limit if pool.spec.kind == "llm" else
@@ -120,6 +120,7 @@ class MemoryScheduler:
         self._ready_by_pool = {}
         self._slot_fallback_at = {}
         self._dirty_timers = []
+        self._valid_until_warned_at = {}
         self.control_ready = True
         self.boot_generation = uuid4().hex
         self.pools: dict[str, _Pool] = {}
@@ -259,6 +260,11 @@ class MemoryScheduler:
                             item["target"], item["group_id"], item["group_health"],
                             item["group_ceiling"])
             self.pools[pool_id] = current
+            if (current.spec.valid_until is not None
+                    and current.spec.valid_until <= datetime.now(UTC)
+                    and now - self._valid_until_warned_at.get(pool_id, float("-inf")) >= 3600):
+                log.warning("pool %s valid_until passed; capacity remains available", pool_id)
+                self._valid_until_warned_at[pool_id] = now
             if previous and previous.epoch != current.epoch:
                 for permit in list(self.permits.values()):
                     if permit.pool_id != pool_id or permit.engine_epoch == current.epoch:
@@ -563,7 +569,8 @@ class MemoryScheduler:
         # authority for attempt identity and root class.
         async with self.store.engine.connect() as c:
             actual = await row(c, """SELECT a.pool_id,a.owner_id,a.engine_epoch,
-                a.compute_held,a.state,a.created_at,r.priority,
+                a.compute_held,a.state,a.created_at,o.created_at AS operation_created_at,
+                r.priority,
                 r.deadline AS root_deadline,o.spec AS operation_spec FROM runtime_attempts a
                 JOIN runtime_operations o USING(operation_id)
                 JOIN runtime_roots r USING(root_id) WHERE a.attempt_id=:id""", id=attempt_id)
@@ -596,9 +603,11 @@ class MemoryScheduler:
         waiter = self.waiters.get(attempt_id)
         if waiter is None:
             now = monotonic()
+            observed_at = datetime.now(UTC)
             waiter = _Waiter(attempt_id, "", pool_id, owner_id, workload_class,
-                             now + max(0, (deadline-datetime.now(UTC)).total_seconds()),
-                             now, "durable")
+                             now + max(0, (deadline-observed_at).total_seconds()),
+                             now - max(0, (observed_at-actual["operation_created_at"]).total_seconds()),
+                             "durable")
             self._add_waiter(waiter)
         elif (waiter.kind != "durable" or waiter.pool_id != pool_id or
               waiter.owner_id != owner_id or waiter.workload_class != workload_class):

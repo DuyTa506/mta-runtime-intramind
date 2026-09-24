@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
 
 from .store import Store, row, rows
@@ -8,6 +10,9 @@ async def snapshot(store: Store, scheduler=None) -> bytes:
     states = Gauge("intramind_runtime_operations", "Persisted operation count", ["state"], registry=registry)
     held = Gauge("intramind_runtime_compute_held", "Attempts without termination evidence", ["pool"], registry=registry)
     target = Gauge("intramind_runtime_admission_target", "Current pool target", ["pool"], registry=registry)
+    valid_until = Gauge("intramind_runtime_pool_valid_until_seconds",
+                        "Seconds until the advisory pool review date (negative when overdue)",
+                        ["pool"], registry=registry)
     unknown_age = Gauge("intramind_runtime_unknown_oldest_seconds", "Oldest unreconciled attempt", registry=registry)
     outbox_age = Gauge("intramind_runtime_outbox_oldest_seconds", "Oldest undelivered event", registry=registry)
     direct_queue = Gauge("intramind_runtime_direct_waiting", "RAM direct queue depth",
@@ -20,13 +25,16 @@ async def snapshot(store: Store, scheduler=None) -> bytes:
     async with store.engine.connect() as c:
         for r in await rows(c, "SELECT state,count(*) AS n FROM runtime_operations GROUP BY state"):
             states.labels(r["state"]).set(r["n"])
-        for r in await rows(c, """SELECT p.pool_id,p.target,count(a.attempt_id) AS n
+        for r in await rows(c, """SELECT p.pool_id,p.target,p.valid_until,count(a.attempt_id) AS n
             FROM runtime_pools p LEFT JOIN runtime_attempts a ON a.pool_id=p.pool_id AND a.compute_held
-            GROUP BY p.pool_id,p.target"""):
+            GROUP BY p.pool_id,p.target,p.valid_until"""):
             count = (sum(p.pool_id == r["pool_id"] for p in scheduler.permits.values())
                      if scheduler is not None else r["n"])
             held.labels(r["pool_id"]).set(count)
             target.labels(r["pool_id"]).set(r["target"])
+            if r["valid_until"] is not None:
+                valid_until.labels(r["pool_id"]).set(
+                    (r["valid_until"] - datetime.now(UTC)).total_seconds())
         value = await row(c, """SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(unknown_at)),0) AS age
             FROM runtime_attempts WHERE state='UNKNOWN'""")
         unknown_age.set(value["age"])

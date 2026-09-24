@@ -8,7 +8,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 
 from .artifacts import ArtifactPort
-from .contracts import EmbeddingResult, RuntimeConflict, SpeechResult
+from .contracts import EmbeddingResult, RuntimeConflict, SendBudgetUnavailable, SpeechResult
 from .drivers import DriverFailure, EngineDriver
 from .store import Store, encode
 
@@ -116,7 +116,7 @@ class Executor:
                 await self.store.fail(reservation, str(exc), not_sent=exc.not_sent, retry=exc.retry,
                     delay=(0 if (exc.not_sent and not permit_ready.is_set()
                                  and str(exc) == "attempt_deadline_exceeded")
-                           else random.uniform(0, min(60, 2 ** reservation.lease_epoch))))
+                           else random.uniform(0, min(60, 2 ** (reservation.sent_attempts + 1)))))
             else:
                 await self.store.unknown(reservation, str(exc))
         except asyncio.CancelledError:
@@ -127,6 +127,11 @@ class Executor:
                 else:
                     await self.store.fail(reservation, "shutdown_before_send", not_sent=True, retry=True)
             raise
+        except SendBudgetUnavailable as exc:
+            if not send_marked:
+                await self.store.fail(reservation, exc.reason, not_sent=True, retry=True)
+            log.info("attempt could not send under current budget: %s (%s)",
+                     reservation.attempt_id, exc.reason)
         except RuntimeConflict:
             # A fenced worker may neither send nor change another owner's state.
             if not send_marked:

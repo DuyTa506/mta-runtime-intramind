@@ -23,6 +23,7 @@ from .contracts import (
     Reservation,
     RootSpec,
     RuntimeConflict,
+    SendBudgetUnavailable,
     parse_operation,
     parse_pool,
 )
@@ -323,8 +324,7 @@ class Store:
         """Reserve durable work; runtime-api alone grants engine capacity."""
         async with self.transaction() as c:
             pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
-            if (not pool or pool["health"] != "HEALTHY" or pool["target"] == 0
-                or pool["valid_until"] <= datetime.now(UTC)):
+            if (not pool or pool["health"] != "HEALTHY" or pool["target"] == 0):
                 return None
             profile = parse_pool(pool["spec"])
             group = await row(c, "SELECT health FROM runtime_groups WHERE group_id=:id",
@@ -454,6 +454,7 @@ class Store:
                 return Reservation(attempt_id=attempt_id, operation=spec, pool_id=pool_id,
                     engine_epoch=pool["engine_epoch"], model_revision=pool["spec"]["model_revision"],
                     owner_id=owner_id, lease_epoch=number,
+                    sent_attempts=current_op["attempts"],
                     workload_class=("user_task" if candidate["root_priority"] == "interactive"
                                     else candidate["root_priority"]),
                     attempt_deadline=min(candidate["root_deadline"], spec.deadline or candidate["root_deadline"], attempt["created_at"]
@@ -502,14 +503,14 @@ class Store:
                     raise RuntimeConflict("attempt cannot send")
                 if (operation["attempts"] >= spec.max_attempts
                     or root["attempts"] >= root["spec"]["max_attempts"]):
-                    raise RuntimeConflict("attempt budget exhausted before send")
+                    raise SendBudgetUnavailable("send_attempts_exhausted")
                 budget = root if spec.budget_unit == "tokens" else await row(c,
                     """SELECT budget_limit,reserved,spent FROM runtime_resource_budgets
                     WHERE root_id=:root AND unit=:unit FOR UPDATE""",
                     root=a["root_id"], unit=spec.budget_unit)
                 if (budget is None or budget["spent"] + budget["reserved"]
                     + spec.budget_bound > budget["budget_limit"]):
-                    raise RuntimeConflict("resource budget unavailable before send")
+                    raise SendBudgetUnavailable("send_budget_unavailable")
                 await execute(c, """UPDATE runtime_operations SET attempts=attempts+1
                     WHERE operation_id=:id""", id=a["operation_id"])
                 await execute(c, """UPDATE runtime_roots SET attempts=attempts+1,
@@ -835,6 +836,9 @@ class Store:
 
     async def reconcile_expired(self):
         async with self.transaction() as c:
+            await execute(c, """DELETE FROM runtime_direct_attempts
+                WHERE state IN ('FINISHED','FAILED_NOT_SENT','FAILED','FAILED_RECOVERABLE')
+                    AND NOT compute_held AND created_at < now()-interval '1 day'""")
             direct = await execute(c, """UPDATE runtime_direct_attempts SET
                 state=CASE WHEN state='RESERVED' THEN 'FAILED_NOT_SENT' ELSE 'UNKNOWN' END,
                 compute_held=state<>'RESERVED',

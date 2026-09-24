@@ -77,4 +77,5 @@ def operation(op="o", root_id="r", tenant_id="t", **kwargs):
 def pool(pool_id="p", **kwargs):
     return PoolSpec(pool_id=pool_id, group_id="gpu", engine_epoch="e1", profile_id="test-v1",
         model_profile="test", model_revision="model-1", hard_ceiling=4, target=kwargs.pop("target", 2),
-        context_limit=1024, valid_until=datetime.now(UTC)+timedelta(hours=1), **kwargs)
+        context_limit=1024,
+        valid_until=kwargs.pop("valid_until", datetime.now(UTC)+timedelta(hours=1)), **kwargs)

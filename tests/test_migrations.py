@@ -90,7 +90,11 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
                     now()+interval '1 hour','SEND_INTENT',12,'speech_characters')"""))
         await connection.execute(text("""UPDATE runtime_operations SET state='EXECUTING',
             active_attempt='old-speech-attempt',attempts=1 WHERE operation_id='speech'"""))
-    await migrate()
+    await migrate("0006")
+    # Recreate the rc17 column constraint before the additive rc18 upgrade.
+    async with store.engine.begin() as connection:
+        await connection.execute(text(
+            "ALTER TABLE runtime_pools ALTER COLUMN valid_until SET NOT NULL"))
     await store.configure_pool(pool("direct-after-upgrade", target=1), 4)
     direct_request = DirectRequest(
         request_id="upgrade-preserved", tenant_id="t", payload_digest="a" * 64,
@@ -114,7 +118,9 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
         "limit": 12, "reserved": 12, "spent": 0,
     }
     async with store.engine.connect() as connection:
-        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0006"
+        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0007"
+        assert (await connection.execute(text("""SELECT is_nullable FROM information_schema.columns
+            WHERE table_name='runtime_pools' AND column_name='valid_until'"""))).scalar_one() == "YES"
         assert (await connection.execute(text("SELECT count(*) FROM runtime_buffer_items"))).scalar_one() == 0
         assert (await connection.execute(text("SELECT budget_unit FROM runtime_attempts WHERE attempt_id='old-attempt'"))).scalar_one() == "tokens"
         assert (await connection.execute(text("""SELECT count(*) FROM runtime_inflight_attempts
@@ -131,3 +137,4 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
     assert (await store.drain_status())["compute_held"] == 1
     await store.confirm_epoch_stopped("direct-after-upgrade", "e1", "test direct engine stopped")
     assert (await store.drain_status())["unsettled_attempts"] == 0
+    await store.configure_pool(pool("without-review-date", valid_until=None), 1)

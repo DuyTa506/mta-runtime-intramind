@@ -72,8 +72,10 @@ normal direct requests issue no PostgreSQL statements. Executors reserve their
 durable operation, acquire an HTTP permit with the existing service token,
 write `SEND_INTENT`, then send to the engine. On restart, runtime-api restores
 only sent or UNKNOWN durable attempts as held capacity; RESERVED attempts must
-acquire a fresh permit. A competing runtime-api owner is fenced. No migration
-or new client SDK is required; rollback is the rc17 image.
+acquire a fresh permit. A competing runtime-api owner is fenced. Migration
+`0007` makes the pool review date nullable; no client SDK change is required.
+Rollback to rc17 remains possible while every pool config supplies a future
+`valid_until` value.
 
 `RESERVED` identifies a durable waiter but holds neither compute nor budget and
 does not increase operation/root attempt counters. The `mark_send` transaction
@@ -83,12 +85,28 @@ attempt; unique ledger attempt numbers remain separate from the number of sent
 attempts. This keeps the existing permit identity/recovery protocol intact and
 avoids holding budget throughout a capacity wait.
 
+Durable permit waiters retain their operation's `created_at` position if an
+unsent reservation expires and the executor reserves again. A later request in
+the same priority class cannot jump ahead simply because the retry has a new
+attempt ID. The executor's retry backoff uses the number of attempts actually
+sent, not the ledger reservation number. A budget change between reservation
+and `SEND_INTENT` yields `send_attempts_exhausted` or `send_budget_unavailable`
+and retries without sending engine traffic.
+
+`valid_until` is an optional review date in rc18, not a capacity cutoff. Once
+past, runtime-api logs at most one warning per pool per hour and exports
+`intramind_runtime_pool_valid_until_seconds{pool}` as signed seconds remaining.
+An unset date has no gauge sample. Deployments that may roll back to rc17 must
+still supply a future date, because rc17 treats it as a dispatch cutoff.
+Legacy terminal direct attempts older than one day and no longer holding
+compute are pruned during reconciliation; unsettled attempts remain available
+for recovery.
+
 An unclean runtime-api exit marks each pool dirty until the former owner's
 lease expires plus its `restart_drain_seconds`. The field is optional per pool
 in `pools.json` and defaults to that pool's `attempt_timeout_seconds` (or
 1,800 seconds). It changes recovery gating, not durable attempt deadlines.
-Stage uses 30 seconds for embedding, 45 for rerank and 600 for speech; LLM
-pools can clear sooner on two idle `/slots` probes. A blocked pool exports
+LLM pools can clear sooner on two idle `/slots` probes. A blocked pool exports
 `intramind_runtime_dirty_recovery_blocked` and logs a warning. Native compute
 can outlive an HTTP disconnect, so these finite windows should be reviewed
 against serving latency measurements as load changes.
