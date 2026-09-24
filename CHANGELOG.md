@@ -9,6 +9,11 @@
   defaults are configurable; callers can only shorten them through a trusted
   header. Deadline responses carry the stable `deadline_exceeded` reason, while
   unconfirmed sent compute remains held for fenced recovery.
+- In eight paired 100 QA/s mock-serving runs with 1,000 background waiters,
+  dispatch p95 medians were 834.13 ms (rc16) and 903.26 ms (rc17): +8.3%,
+  within the accepted 15% release guard. The p95 50 ms/p99 200 ms dispatch
+  target remains open for separate coordinator architecture work; all individual
+  paired p95 values are recorded in README.
 
 ## 0.2.0rc16 — unreleased
 

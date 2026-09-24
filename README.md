@@ -82,13 +82,20 @@ through the SDK. Stream timeouts end in an `intramind.error` with
 timeouts return HTTP 504 JSON with the same reason. A timeout after send does
 not prove engine termination: its UNKNOWN attempt keeps compute held until the
 existing fenced recovery path confirms the old engine stopped. No schema
-migration is needed beyond rc15's additive migration `0006`. Paired disposable
-mock-serving runs of 100 QA requests at 100/s across four endpoints and 1,000
-background waiters completed every request without starvation in both rc16
-and rc17. Their enqueue-commit to send-intent p95 varied substantially between
-runs (roughly 0.7–0.94 seconds); rc17 did not establish a repeatable slowdown or
-meet the planned 50 ms/200 ms dispatch gate. This is not a stage load
-qualification.
+migration is needed beyond rc15's additive migration `0006`. Eight paired
+disposable mock-serving runs, each with 100 QA requests at 100/s across four
+endpoints and 1,000 background waiters, completed every request without
+starvation. Enqueue-commit to send-intent p95 values in pair order (ms) were:
+
+| Version | Paired p95 samples (ms) | Median |
+| --- | --- | ---: |
+| rc16 | 854.62, 821.86, 825.56, 935.17, 842.69, 842.93, 719.85, 812.45 | 834.13 |
+| rc17 | 833.37, 774.84, 921.42, 918.36, 924.13, 888.15, 868.21, 938.18 | 903.26 |
+
+The rc17 median is 8.3% above rc16 on this test, within the accepted 15%
+release guard; individual pairs varied more. The planned p95 50 ms/p99 200 ms
+dispatch target remains open and requires separate coordinator architecture
+work. These synthetic runs are not stage load qualification.
 
 Version `0.2.0rc16` fixes a dispatcher ordering race exposed by concurrent
 enqueue: PostgreSQL's waiter `created_at` may precede the order in which
