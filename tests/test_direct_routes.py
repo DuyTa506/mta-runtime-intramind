@@ -45,7 +45,8 @@ async def test_direct_route_preserves_payload_and_uses_qualified_context_bound(d
         body["max_tokens"] = limit
     result = await client.post("/v1/direct/test/chat/completions", json=body)
     assert result.status_code == 200
-    proxy.open.assert_awaited_once_with("owner", body, request_bound=bound)
+    proxy.open.assert_awaited_once_with("owner", body, request_bound=bound,
+                                        workload_class="background", logical_request_id=None)
 
 
 @pytest.mark.parametrize("extra", [{"n": True}, {"n": 2}, {"model": "other"}, {"stream": "true"},

@@ -125,3 +125,44 @@ def test_binding_refuses_absolute_foreign_url_before_send():
     with httpx.Client(**binding().client_kwargs(), transport=httpx.MockTransport(unexpected)) as client:
         with inference_scope("user:one"), pytest.raises(ValueError, match="outside"):
             client.post("http://engine/chat/completions")
+
+
+async def test_managed_stream_preserves_ordered_controls_and_request_class():
+    seen = []
+    stream = (b'event: intramind.control\ndata: {"type":"waiting","reason":"inference_capacity"}\n\n'
+        b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        b'event: intramind.control\ndata: {"type":"generation_reset","generation":1}\n\n'
+        b'data: {"choices":[{"delta":{"content":"final"}}]}\n\n'
+        b'data: [DONE]\n\n')
+
+    def respond(request):
+        seen.append(request)
+        return httpx.Response(200, content=stream, headers={"Content-Type": "text/event-stream"})
+
+    async with httpx.AsyncClient(**binding().client_kwargs(),
+                                 transport=httpx.MockTransport(respond)) as client:
+        with inference_scope("user:one", workload_class="qa", logical_request_id="query-123"):
+            events = [event async for event in binding().stream_events({"stream": True}, client=client)]
+    assert [(event.kind, event.text, event.generation) for event in events] == [
+        ("waiting", "", 0), ("token", "partial", 0),
+        ("generation_reset", "", 1), ("token", "final", 1),
+    ]
+    assert seen[0].headers["X-Intramind-Workload-Class"] == "qa"
+    assert seen[0].headers["X-Intramind-Logical-Request-ID"] == "query-123"
+
+
+@pytest.mark.parametrize("stream", [
+    b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+    b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\ndata: [DO',
+])
+async def test_managed_stream_requires_explicit_done_after_partial(stream):
+    async with httpx.AsyncClient(**binding().client_kwargs(), transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=stream,
+                                       headers={"Content-Type": "text/event-stream"})
+    )) as client:
+        with inference_scope("user:one"):
+            received = []
+            with pytest.raises(RuntimeError, match="before \\[DONE\\]"):
+                async for event in binding().stream_events({"stream": True}, client=client):
+                    received.append(event.text)
+    assert received == ["partial"]

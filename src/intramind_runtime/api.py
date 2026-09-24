@@ -18,6 +18,7 @@ from .preparation import PrepareRequest
 from .speech import SpeechPrepareRequest
 from .store import Store, row
 from .uploads import ArtifactUploads
+from .workload import workload_for_task
 
 
 class Submission(Contract):
@@ -201,7 +202,7 @@ def create_app(
             deadline=deadline,
             budget_limit=definition["budget_limit"],
             resource_budgets=definition.get("resource_budgets", {}),
-            priority=definition.get("priority", "background"),
+            priority=workload_for_task(request.task_type, definition),
         )
         # Stable submit intent excludes wall-clock deadline; retries attach to
         # the original root and cannot extend its lifetime.

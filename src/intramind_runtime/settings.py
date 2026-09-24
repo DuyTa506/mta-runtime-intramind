@@ -19,6 +19,6 @@ class Settings(BaseSettings):
     temporal_namespace: str = "intramind"
     temporal_queue: str = "intramind-control"
     lease_seconds: int = Field(default=60, ge=10)
-    executor_count: int = Field(default=1, ge=1, le=128)
+    executor_count: int = Field(default=8, ge=1, le=128)
     pool_config: str = "config/pools.json"
     log_level: str = "INFO"

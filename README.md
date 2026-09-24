@@ -65,6 +65,39 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
+Version `0.2.0rc15` adds migration `0006` and endpoint-scoped llama.cpp
+backpressure. Apply `python -m alembic upgrade head` before starting rc15 API,
+executor and reconciler processes; build the pinned wheel with `uv build` or
+`make build`. Keep old worker images for Temporal histories pinned to earlier
+build IDs. The schema is additive and old attempt owners retain their lease path.
+
+For llama.cpp, `admission.target` is an endpoint enable/drain setting, while
+`transport_limit` bounds all accepted HTTP inference and
+`background_transport_limit` bounds **combined** non-QA direct and durable
+inference. The engine's own parallel slots and FIFO remain its serving authority.
+For a measured answer/tool setup of 2/8 non-QA slots, set respectively
+`target=hard_ceiling=background_transport_limit=2` and `=8`, with
+`transport_limit=64` on each endpoint to leave QA headroom. The GPU group ceiling
+does not serialize LLM endpoints; native speech/embedding/rerank group limits
+remain. Set engine `--parallel` independently to 2/8 only after serving
+qualification. The default executor count is 8 and each LLM pool starts at most
+its lower-class cap in workers. These values are safety bounds, not a 4:1
+scheduling ratio or a measured production capacity claim.
+
+Authenticated application adapters bind `inference_scope` to a trusted workload
+class (`qa`, `user_task`, `background`, `maintenance`). QA classification follows
+the request through summary/tool subcalls. `DirectBinding.stream_events` exposes
+ordered `waiting`, `resumed`, `recovering`, `generation_reset` and token events;
+a stream is successful only after `[DONE]`. Waiting streams emit SSE heartbeats
+at most 15 seconds apart. No client retries uncertain inference. The host
+watchdog first calls `quiesce-engine --pool ... --epoch ... --token ...`, then
+`inspect-engine --pool ...`; only independently verified old container/child
+termination permits `confirm-epoch-stopped --pool ... --epoch ... --evidence
+'{...}' --recover`. After updating the engine epoch and running `configure`,
+runtime may retry a bounded leaf generation. A still-live engine may be resumed
+only by the same token via `resume-engine --pool ... --epoch ... --token ...` after
+unsettled compute reaches zero. Timeout alone never grants recovery.
+
 Version `0.2.0rc10` adds `DirectBinding`, `DirectRouting` and `inference_scope` for
 application callers. The binding supplies a scoped HTTP auth adapter and a direct
 profile URL; it never submits a workflow, changes payloads or retries inference.

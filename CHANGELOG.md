@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0rc15 — unreleased
+
+- Migration `0006` adds process owner leases, endpoint-scoped admission and bounded
+  direct waiters without a global lock on every inference grant.
+- Trusted QA/workload routing, shared lower-class transport caps and SSE
+  wait/recovery controls let chat wait its turn without silent inference retry.
+- Token-fenced host quiesce and structured stopped-epoch proof authorize bounded
+  generation recovery; unknown compute remains held until proof.
+
 ## 0.2.0rc6 — unreleased
 
 - `TaskContext.embedding_outcome` exposes only confirmed terminal backend failures

@@ -1,6 +1,7 @@
 """Foreground HTTP contracts stay separate from durable workflow submission."""
 
 import json
+import re
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -25,6 +26,15 @@ async def _payload(request):
 
 
 def register(app, tenant, proxies, preparers):
+    def workload(request: Request):
+        value = request.headers.get("x-intramind-workload-class", "background")
+        if value not in {"qa", "user_task", "background", "maintenance"}:
+            raise HTTPException(400, "invalid trusted inference workload")
+        logical = request.headers.get("x-intramind-logical-request-id")
+        if logical is not None and (len(logical) > 200 or not re.fullmatch(r"[A-Za-z0-9._:-]+", logical)):
+            raise HTTPException(400, "invalid logical request identity")
+        return value, logical
+
     @app.post("/v1/direct/{model_profile}/chat/completions")
     async def completion(model_profile: str, request: Request, tenant_id=Depends(tenant)):
         proxy = proxies.get(model_profile)
@@ -57,7 +67,9 @@ def register(app, tenant, proxies, preparers):
             raise HTTPException(422, "request is outside the qualified prompt contract") from None
         # An omitted output limit retains engine semantics and reserves a full context slot.
         bound = sized["input_tokens_bound"] + limit if limit else preparer.context_limit
-        return await proxy.open(tenant_id, payload, request_bound=bound)
+        workload_class, logical_request_id = workload(request)
+        return await proxy.open(tenant_id, payload, request_bound=bound,
+                                workload_class=workload_class, logical_request_id=logical_request_id)
 
     @app.post("/v1/direct/{model_profile}/api/v1/embed")
     @app.post("/v1/direct/{model_profile}/api/v1/rerank")
@@ -78,5 +90,7 @@ def register(app, tenant, proxies, preparers):
             bound, batch = proxy.profile.requirement(validated)
             if not batch:
                 return JSONResponse({"results": []})
+        workload_class, logical_request_id = workload(request)
         return await proxy.open(tenant_id, payload, request_bound=max(1, bound),
-                                path=f"api/v1/{path}", batch_size=batch)
+                                path=f"api/v1/{path}", batch_size=batch,
+                                workload_class=workload_class, logical_request_id=logical_request_id)

@@ -1,29 +1,55 @@
 """HTTP caller binding; it does not submit workflows or retry inference."""
 
+import json
 import re
+from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _tenant: ContextVar[str | None] = ContextVar("direct_inference_tenant", default=None)
+_workload: ContextVar[str] = ContextVar("direct_inference_workload", default="background")
+_logical_request: ContextVar[str | None] = ContextVar("direct_inference_request", default=None)
+WORKLOAD_CLASSES = frozenset({"qa", "user_task", "background", "maintenance"})
 
 
 @contextmanager
-def inference_scope(tenant_id: str | None):
+def inference_scope(tenant_id: str | None, *, workload_class: str = "background",
+                    logical_request_id: str | None = None):
     """Bind an identity verified by the application, including across asyncio.to_thread."""
     if tenant_id is not None and (
         not tenant_id or len(tenant_id) > 240 or not tenant_id.isascii()
         or any(ord(character) <= 32 or ord(character) == 127 for character in tenant_id)
     ):
         raise ValueError("invalid inference identity")
+    if workload_class not in WORKLOAD_CLASSES:
+        raise ValueError("invalid inference workload")
+    if logical_request_id is not None and (
+        not logical_request_id or len(logical_request_id) > 200
+        or not re.fullmatch(r"[A-Za-z0-9._:-]+", logical_request_id)
+    ):
+        raise ValueError("invalid logical inference request")
     token = _tenant.set(tenant_id)
+    workload_token = _workload.set(workload_class)
+    request_token = _logical_request.set(logical_request_id)
     try:
         yield
     finally:
+        _logical_request.reset(request_token)
+        _workload.reset(workload_token)
         _tenant.reset(token)
+
+
+@dataclass(frozen=True)
+class DirectStreamEvent:
+    kind: Literal["token", "waiting", "resumed", "recovering", "generation_reset"]
+    text: str = ""
+    generation: int = 0
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +71,63 @@ class DirectBinding:
         return {"base_url": url, "auth": _IdentityAuth(url, self.service_token),
                 "follow_redirects": False}
 
+    async def stream_events(self, payload: dict, *, client: httpx.AsyncClient | None = None
+                            ) -> AsyncIterator[DirectStreamEvent]:
+        """Read ordered managed stream events without hiding controls in OpenAI SDK chunks.
+
+        A caller may share a long-lived authenticated client. The temporary-client
+        branch exists for small callers and tests; inference services should pool.
+        """
+        if payload.get("stream") is not True:
+            raise ValueError("stream_events requires stream=true")
+        if client is None:
+            async with httpx.AsyncClient(**self.client_kwargs(),
+                timeout=httpx.Timeout(None, connect=10),
+                transport=httpx.AsyncHTTPTransport(retries=0)) as owned:
+                async for event in self.stream_events(payload, client=owned):
+                    yield event
+            return
+        async with client.stream("POST", "chat/completions", json=payload) as response:
+            response.raise_for_status()
+            event_name = "message"
+            data = []
+            generation = 0
+            async for line in response.aiter_lines():
+                if not line:
+                    if not data:
+                        event_name = "message"
+                        continue
+                    raw = "\n".join(data)
+                    data = []
+                    if raw == "[DONE]":
+                        return
+                    frame = json.loads(raw)
+                    if event_name == "intramind.error":
+                        raise RuntimeError(str(frame.get("message") or "managed inference failed"))
+                    if event_name == "intramind.control":
+                        kind = frame.get("type")
+                        if kind not in {"waiting", "resumed", "recovering", "generation_reset"}:
+                            raise ValueError("invalid direct stream control event")
+                        if kind == "generation_reset":
+                            generation = int(frame.get("generation", generation + 1))
+                        yield DirectStreamEvent(kind=kind,
+                            generation=int(frame.get("generation", generation)),
+                            reason=frame.get("reason"))
+                    else:
+                        for choice in frame.get("choices", []):
+                            token = choice.get("delta", {}).get("content")
+                            if token:
+                                yield DirectStreamEvent(kind="token", text=token,
+                                    generation=int(frame.get("intramind_generation", generation)))
+                    event_name = "message"
+                elif line.startswith("event:"):
+                    event_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    data.append(line[5:].lstrip())
+            # HTTP 200 and a closed socket are not successful inference. llama.cpp
+            # completion streams terminate only at an explicit [DONE] frame.
+            raise RuntimeError("managed inference stream ended before [DONE]")
+
 
 class _IdentityAuth(httpx.Auth):
     def __init__(self, base_url: str, service_token: str):
@@ -62,6 +145,10 @@ class _IdentityAuth(httpx.Auth):
             raise ValueError("verified inference identity is required")
         request.headers["Authorization"] = "Bearer " + self.service_token
         request.headers["X-Tenant-ID"] = identity
+        request.headers["X-Intramind-Workload-Class"] = _workload.get()
+        logical_request = _logical_request.get()
+        if logical_request is not None:
+            request.headers["X-Intramind-Logical-Request-ID"] = logical_request
         yield request
 
 

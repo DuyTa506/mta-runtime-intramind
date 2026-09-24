@@ -28,10 +28,42 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
         output, _ = await asyncio.wait_for(process.communicate(), timeout=30)
         assert process.returncode == 0, output.decode()
 
+    async def legacy_insert_operation(spec):
+        # Seed old schemas with their own wire shape. The current Store must not
+        # depend on new admission tables before migration 0006 is installed.
+        async with store.engine.begin() as connection:
+            await connection.execute(text("""INSERT INTO runtime_operations
+                (operation_id,root_id,tenant_id,spec)
+                VALUES (:id,:root,:tenant,CAST(:spec AS jsonb))"""), {
+                "id": spec.operation_id, "root": spec.root_id,
+                "tenant": spec.tenant_id, "spec": spec.model_dump_json(),
+            })
+            await connection.execute(text("""UPDATE runtime_roots
+                SET operation_count=operation_count+1 WHERE root_id=:root"""),
+                {"root": spec.root_id})
+
+    async def legacy_configure_pool(spec, group_ceiling):
+        async with store.engine.begin() as connection:
+            await connection.execute(text("""INSERT INTO runtime_groups(group_id,hard_ceiling)
+                VALUES (:group,:ceiling) ON CONFLICT(group_id) DO UPDATE
+                SET hard_ceiling=EXCLUDED.hard_ceiling"""), {
+                "group": spec.group_id, "ceiling": group_ceiling,
+            })
+            await connection.execute(text("""INSERT INTO runtime_pools
+                (pool_id,group_id,spec,engine_epoch,target,hard_ceiling,context_limit,
+                 model_profile,valid_until)
+                VALUES (:id,:group,CAST(:spec AS jsonb),:epoch,:target,:ceiling,:context,
+                    :model,:until)"""), {
+                "id": spec.pool_id, "group": spec.group_id, "spec": spec.model_dump_json(),
+                "epoch": spec.engine_epoch, "target": spec.target,
+                "ceiling": spec.hard_ceiling, "context": getattr(spec, "context_limit", 0),
+                "model": spec.model_profile, "until": spec.valid_until,
+            })
+
     await migrate("0001")
     await store.create_root(root("migration-preserved"))
-    await store.configure_pool(pool(target=1), 1)
-    await store.submit_operation(operation("legacy", "migration-preserved"))
+    await legacy_configure_pool(pool(target=1), 1)
+    await legacy_insert_operation(operation("legacy", "migration-preserved"))
     async with store.engine.begin() as connection:
         await connection.execute(text("""UPDATE runtime_roots SET reserved=30,attempts=1,
             spec=spec-'resource_budgets' WHERE root_id='migration-preserved'"""))
@@ -44,8 +76,8 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
             active_attempt='old-attempt',attempts=1 WHERE operation_id='legacy'"""))
     await migrate("0003")
     await store.create_root(root("speech-preserved", resource_budgets={"speech_characters": 12}))
-    await store.configure_pool(speech_pool(), 4)
-    await store.submit_operation(speech().model_copy(update={"root_id": "speech-preserved"}))
+    await legacy_configure_pool(speech_pool(), 4)
+    await legacy_insert_operation(speech().model_copy(update={"root_id": "speech-preserved"}))
     async with store.engine.begin() as connection:
         await connection.execute(text("""UPDATE runtime_roots SET attempts=1
             WHERE root_id='speech-preserved'"""))
@@ -61,11 +93,13 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
     await migrate()
     await store.configure_pool(pool("direct-after-upgrade", target=1), 4)
     direct = DirectAdmissions(store)
-    reservation = await direct.reserve(DirectRequest(
+    direct_request = DirectRequest(
         request_id="upgrade-preserved", tenant_id="t", payload_digest="a" * 64,
         model_profile="test", capacity_profile_id="test-v1", request_bound=30,
         deadline=root().deadline,
-    ), "direct-after-upgrade", "direct-owner")
+    )
+    await direct.enqueue(direct_request, "direct-after-upgrade", "direct-owner")
+    reservation = await direct.reserve(direct_request, "direct-after-upgrade", "direct-owner")
     await direct.mark_send(reservation)
     await direct.unknown(reservation, "fixture_response_lost")
     await migrate()
@@ -76,7 +110,7 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
         "limit": 12, "reserved": 12, "spent": 0,
     }
     async with store.engine.connect() as connection:
-        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0005"
+        assert (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one() == "0006"
         assert (await connection.execute(text("SELECT count(*) FROM runtime_buffer_items"))).scalar_one() == 0
         assert (await connection.execute(text("SELECT budget_unit FROM runtime_attempts WHERE attempt_id='old-attempt'"))).scalar_one() == "tokens"
         assert (await connection.execute(text("""SELECT count(*) FROM runtime_inflight_attempts

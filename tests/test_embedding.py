@@ -183,7 +183,7 @@ async def test_transport_retry_requires_not_sent_or_confirmed_termination(phase)
 
 
 @pytest.mark.integration
-async def test_embedding_budget_reservation_is_atomic_and_shares_group_capacity(store):
+async def test_embedding_budget_reservation_is_atomic_while_llm_transport_is_independent(store):
     await store.create_root(root(resource_budgets={"embedding_characters": 4}))
     await store.configure_pool(pool(), 1)
     await store.configure_pool(embedding_pool(), 1)
@@ -192,17 +192,18 @@ async def test_embedding_budget_reservation_is_atomic_and_shares_group_capacity(
     await store.submit_operation(operation())
     attempts = await asyncio.gather(*(store.reserve_next("embedding", str(i)) for i in range(8)))
     winners = [a for a in attempts if a]
-    assert len(winners) == 1 and await store.reserve_next("p", "llm") is None
+    assert len(winners) == 1
+    assert await store.reserve_next("p", "llm") is not None
     attempt = winners[0]
     await store.mark_send(attempt)
     await store.compute_finished(attempt)
     for _ in range(2):
         await store.commit_result(attempt, attempt.operation.payload, 4)
     state = await store.run("r", "t")
-    assert state["reserved"] == state["spent"] == 0
+    assert state["reserved"] == 30 and state["spent"] == 0
     assert state["resource_budgets"]["embedding_characters"] == {"limit": 4, "reserved": 0, "spent": 4}
     assert await store.reserve_next("embedding", "next") is None
-    assert await store.reserve_next("p", "llm") is not None
+    assert await store.reserve_next("p", "llm") is None
 
 
 @pytest.mark.integration

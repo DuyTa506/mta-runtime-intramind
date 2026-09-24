@@ -81,6 +81,8 @@ async def test_idempotency_and_conflicting_input(store):
 
 async def test_unknown_retains_budget_and_compute_after_lease(store):
     await setup(store, target=1)
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
     r = await store.reserve_next("p", "a")
     await store.mark_send(r)
     async with store.engine.begin() as c:
@@ -132,18 +134,18 @@ async def test_cancel_does_not_refund_or_publish_late_result(store):
     assert (await store.run("r", "t"))["spent"] == 30
 
 
-async def test_two_pools_share_physical_capacity(store):
+async def test_two_llm_pools_keep_independent_transport_capacity(store):
     await setup(store, group_ceiling=1)
     await store.configure_pool(pool("p2"), 1)
     results = await asyncio.gather(store.reserve_next("p", "a"), store.reserve_next("p2", "b"))
-    assert len([r for r in results if r]) == 1
+    assert len([r for r in results if r]) == 2
 
 
 async def test_target_drop_drains_and_rejects_stale_envelope(store):
     await setup(store)
     await store.reserve_next("p", "a")
     await store.reserve_next("p", "b")
-    await store.update_target("p", 1, 1, "test_congestion")
+    await store.update_target("p", 0, 1, "test_congestion")
     assert await store.reserve_next("p", "c") is None
     with pytest.raises(RuntimeConflict):
         await store.update_target("p", 2, 1, "stale")

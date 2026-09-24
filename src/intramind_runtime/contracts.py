@@ -54,7 +54,8 @@ class RootSpec(Contract):
     max_operations: int = Field(default=10_000, gt=0, le=100_000)
     max_pending: int = Field(default=64, gt=0, le=1024)
     max_attempts: int = Field(default=30_000, gt=0)
-    priority: Literal["interactive", "background"] = "background"
+    # ``interactive`` is retained for workflow histories accepted by older workers.
+    priority: Literal["qa", "user_task", "background", "maintenance", "interactive"] = "background"
 
     @field_validator("deadline")
     @classmethod
@@ -154,6 +155,10 @@ class _PoolSpec(Contract):
     model_revision: str = Field(min_length=1)
     hard_ceiling: int = Field(gt=0)
     target: int = Field(ge=0)
+    # Endpoint transport protection. Native pools continue to use their
+    # qualified target/group envelope until their own proof contract changes.
+    transport_limit: int = Field(default=64, ge=1, le=4096)
+    background_transport_limit: int = Field(default=8, ge=1, le=4096)
     valid_until: datetime
     capabilities: frozenset[str] = frozenset()
 
@@ -165,6 +170,8 @@ class _PoolSpec(Contract):
     def check(self):
         if self.target > self.hard_ceiling:
             raise ValueError("target exceeds hard ceiling")
+        if self.background_transport_limit > self.transport_limit:
+            raise ValueError("background transport limit exceeds endpoint transport limit")
         if self.valid_until.tzinfo is None:
             raise ValueError("valid_until must include timezone")
         return self

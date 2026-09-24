@@ -13,6 +13,7 @@ from pydantic import Field
 
 from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
 from .store import encode, execute, row, rows
+from .workload import workload_for_task
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ class BufferedSubmissions:
 
     async def append(self, tenant_id: str, request: BufferedSubmission, definition: dict) -> str:
         async with self.store.transaction() as c:
+            # Buffered acceptance has a global hard backlog quota. It is rare
+            # relative to inference grants, and serializing only this path
+            # makes both duplicate keys and the quota atomic.
+            authority = await row(c, "SELECT max_pending FROM runtime_authority WHERE id=1 FOR UPDATE")
             old = await row(c, """SELECT * FROM runtime_buffer_items
                 WHERE tenant_id=:tenant AND submission_key=:key""",
                 tenant=tenant_id, key=request.submission_key)
@@ -62,7 +67,6 @@ class BufferedSubmissions:
                 WHERE i.batch_id IS NULL OR b.state='PREPARING'
                     OR (b.state='SUBMITTED' AND r.state='RUNNING')""",
                 tenant=tenant_id, task=request.task_type, partition=request.partition_key)
-            authority = await row(c, "SELECT max_pending FROM runtime_authority WHERE id=1")
             if (pending["total"] >= authority["max_pending"]
                 or pending["tenant"] >= limits["max_pending_per_tenant"]
                 or pending["partition"] >= limits["max_pending_per_partition"]):
@@ -100,6 +104,9 @@ class BufferedSubmissions:
         if not 1 <= limit <= 32:
             raise ValueError("buffer pump limit must be between 1 and 32")
         async with self.store.transaction() as c:
+            # Batch boundaries depend on the global order of accepted items;
+            # this path is not part of per-inference admission.
+            await execute(c, "SELECT id FROM runtime_authority WHERE id=1 FOR UPDATE")
             batches = [dict(b) for b in await rows(c, """SELECT * FROM runtime_buffer_batches
                 WHERE state='PREPARING' AND retry_at<=clock_timestamp()
                 ORDER BY retry_at,batch_id LIMIT :limit""", limit=limit)]
@@ -158,7 +165,7 @@ class BufferedSubmissions:
         definition = batch["definition"]
         root = RootSpec(root_id=batch["batch_id"], tenant_id=batch["tenant_id"],
                         deadline=batch["deadline"], budget_limit=definition["budget_limit"],
-                        priority=definition.get("priority", "background"))
+                        priority=workload_for_task(batch["task_type"], definition))
         spec = {"workflow_type": batch["task_type"], "task_queue": definition["task_queue"],
                 "input": {"root_id": root.root_id, "tenant_id": root.tenant_id,
                           "control_queue": definition["control_queue"], "input": ref.model_dump(mode="json"),

@@ -103,14 +103,16 @@ async def worker_health(client, workers, *, max_poller_age=120, now=None):
     return {"namespace": client.namespace, "status": status, "workers": observations}
 
 
-async def confirm_epoch_stopped(store, pool_id: str, engine_epoch: str, evidence: str) -> dict:
+async def confirm_epoch_stopped(store, pool_id: str, engine_epoch: str, evidence: str,
+                                *, recover: bool = False) -> dict:
     """Settle UNKNOWN work for one stopped engine epoch. Does not edit pool config."""
-    settled = await store.confirm_epoch_stopped(pool_id, engine_epoch, evidence)
-    return {"pool_id": pool_id, "engine_epoch": engine_epoch, "settled": settled}
+    settled = await store.confirm_epoch_stopped(pool_id, engine_epoch, evidence, recover=recover)
+    return {"pool_id": pool_id, "engine_epoch": engine_epoch, "settled": settled,
+            "recovery_requested": recover}
 
 
 async def execute(args):
-    if args.command == "confirm-epoch-stopped":
+    if args.command in {"confirm-epoch-stopped", "quiesce-engine", "resume-engine", "inspect-engine"}:
         from .settings import Settings
         from .store import Store
 
@@ -119,7 +121,17 @@ async def execute(args):
             settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds
         )
         try:
-            report = await confirm_epoch_stopped(store, args.pool, args.epoch, args.evidence)
+            if args.command == "confirm-epoch-stopped":
+                report = await confirm_epoch_stopped(store, args.pool, args.epoch,
+                                                     args.evidence, recover=args.recover)
+            elif args.command == "quiesce-engine":
+                await store.quiesce_engine(args.pool, args.epoch, args.token)
+                report = await store.inspect_engine(args.pool)
+            elif args.command == "resume-engine":
+                await store.resume_engine(args.pool, args.epoch, args.token)
+                report = await store.inspect_engine(args.pool)
+            else:
+                report = await store.inspect_engine(args.pool)
         finally:
             await store.close()
         print(json.dumps(report, sort_keys=True))
@@ -190,6 +202,17 @@ def main():
     stopped.add_argument("--pool", required=True)
     stopped.add_argument("--epoch", required=True)
     stopped.add_argument("--evidence", required=True)
+    stopped.add_argument("--recover", action="store_true")
+    quiesce = commands.add_parser("quiesce-engine")
+    quiesce.add_argument("--pool", required=True)
+    quiesce.add_argument("--epoch", required=True)
+    quiesce.add_argument("--token", required=True)
+    resume = commands.add_parser("resume-engine")
+    resume.add_argument("--pool", required=True)
+    resume.add_argument("--epoch", required=True)
+    resume.add_argument("--token", required=True)
+    inspect = commands.add_parser("inspect-engine")
+    inspect.add_argument("--pool", required=True)
     args = parser.parse_args()
     if args.command == "confirm-epoch-stopped" and not args.evidence.strip():
         parser.error("termination evidence is required")

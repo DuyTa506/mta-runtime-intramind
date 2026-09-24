@@ -1,10 +1,10 @@
 """PostgreSQL authority for admission and settlement.
 
-The first deployment serializes short ledger mutations on one authority row.
-No lock is held during inference, artifact I/O or Temporal RPCs. This deliberately
-favors auditable accounting over sharding before the measured workload needs it.
+Inference admission locks one endpoint; budgets lock one root. Long-running
+inference, transport waiting and progress never hold a database transaction.
 """
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -51,6 +51,21 @@ async def execute(c: AsyncConnection, sql: str, **params):
     return await c.execute(text(sql), params)
 
 
+async def endpoint_usage(c: AsyncConnection, pool_id: str):
+    """Count accepted transport and the shared non-QA safety buffer."""
+    return await row(c, """SELECT
+        (SELECT count(*) FROM runtime_inflight_attempts
+            WHERE pool_id=:pool AND compute_held) AS total,
+        (SELECT count(*) FROM runtime_attempts a
+            JOIN runtime_operations o USING(operation_id)
+            JOIN runtime_roots r USING(root_id)
+            WHERE a.pool_id=:pool AND a.compute_held AND r.priority<>'qa')
+        + (SELECT count(*) FROM runtime_direct_attempts d
+            WHERE d.pool_id=:pool AND d.compute_held
+                AND d.spec->>'workload_class' IS DISTINCT FROM 'qa') AS lower_class""",
+        pool=pool_id)
+
+
 class Store:
     def __init__(self, url: str, *, lease_seconds: int = 60):
         if not url.startswith("postgresql+asyncpg://"):
@@ -58,8 +73,22 @@ class Store:
         self.engine = create_async_engine(url, pool_size=5, max_overflow=5, pool_pre_ping=True,
                                           hide_parameters=True)
         self.lease_seconds = lease_seconds
+        self.database_url = url
+        self._wakeup = None
+        self._wakeup_lock = asyncio.Lock()
+
+    async def direct_wakeup(self):
+        """One LISTEN connection per API process, shared by every endpoint."""
+        async with self._wakeup_lock:
+            if self._wakeup is None:
+                from .wakeup import Wakeup
+                self._wakeup = Wakeup(self.database_url)
+                await self._wakeup.start()
+            return self._wakeup
 
     async def close(self):
+        if self._wakeup is not None:
+            await self._wakeup.close()
         await self.engine.dispose()
 
     async def drain_status(self) -> dict[str, int]:
@@ -83,17 +112,49 @@ class Store:
     @asynccontextmanager
     async def transaction(self):
         async with self.engine.begin() as c:
-            await execute(c, "SELECT id FROM runtime_authority WHERE id=1 FOR UPDATE")
             yield c
 
+    async def register_owner(self, owner_id: str, boot_generation: str):
+        """One owner per process or endpoint, never one heartbeat per attempt."""
+        async with self.transaction() as c:
+            changed = await execute(c, """INSERT INTO runtime_owners
+                (owner_id,boot_generation,lease_expires_at)
+                VALUES (:id,:boot,now()+(:lease * interval '1 second'))
+                ON CONFLICT(owner_id) DO UPDATE SET
+                lease_expires_at=EXCLUDED.lease_expires_at,updated_at=now()
+                WHERE runtime_owners.boot_generation=EXCLUDED.boot_generation""",
+                id=owner_id, boot=boot_generation, lease=self.lease_seconds)
+            if changed.rowcount != 1:
+                raise RuntimeConflict("owner identity belongs to another process")
+
+    async def heartbeat_owner(self, owner_id: str, boot_generation: str):
+        async with self.transaction() as c:
+            changed = await execute(c, """UPDATE runtime_owners
+                SET lease_expires_at=now()+(:lease * interval '1 second'),updated_at=now()
+                WHERE owner_id=:id AND boot_generation=:boot""",
+                id=owner_id, boot=boot_generation, lease=self.lease_seconds)
+            if changed.rowcount != 1:
+                raise RuntimeConflict("owner identity was fenced")
+
+    async def owner_alive(self, c, owner_id: str) -> bool:
+        return bool(await row(c, """SELECT 1 FROM runtime_owners
+            WHERE owner_id=:id AND lease_expires_at>clock_timestamp()""", id=owner_id))
+
     async def _root(self, c, spec: RootSpec):
-        existing = await row(c, "SELECT * FROM runtime_roots WHERE root_id=:id", id=spec.root_id)
+        existing = await row(c, "SELECT * FROM runtime_roots WHERE root_id=:id FOR UPDATE", id=spec.root_id)
         data = spec.model_dump(mode="json")
         if existing:
             if RootSpec.model_validate(existing["spec"]) != spec:
                 raise RuntimeConflict("root identity/input conflict")
             return
-        limits = await row(c, "SELECT * FROM runtime_authority WHERE id=1")
+        # Global root admission is rare compared with inference grants. Keep its
+        # hard quota atomic without putting this lock on every hot ledger write.
+        limits = await row(c, "SELECT * FROM runtime_authority WHERE id=1 FOR UPDATE")
+        existing = await row(c, "SELECT * FROM runtime_roots WHERE root_id=:id FOR UPDATE", id=spec.root_id)
+        if existing:
+            if RootSpec.model_validate(existing["spec"]) != spec:
+                raise RuntimeConflict("root identity/input conflict")
+            return
         count = await row(c, "SELECT count(*) AS n FROM runtime_roots WHERE state='RUNNING'")
         if count["n"] >= limits["max_roots"]:
             raise AdmissionDenied("root backlog full", retryable=True)
@@ -114,6 +175,8 @@ class Store:
 
     async def submit_run(self, root: RootSpec, key: str, input_digest: str, spec: dict):
         async with self.transaction() as c:
+            await execute(c, "SELECT pg_advisory_xact_lock(hashtextextended(:identity, 3471))",
+                          identity=root.tenant_id + ":" + key)
             old = await row(c, """SELECT * FROM runtime_submissions
                 WHERE tenant_id=:tenant AND submission_key=:key""", tenant=root.tenant_id, key=key)
             if old:
@@ -134,15 +197,15 @@ class Store:
         if group_ceiling <= 0:
             raise ValueError("group ceiling must be positive")
         async with self.transaction() as c:
-            old = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id", id=spec.pool_id)
+            await execute(c, """INSERT INTO runtime_groups(group_id,hard_ceiling) VALUES (:g,:n)
+                ON CONFLICT(group_id) DO UPDATE SET hard_ceiling=EXCLUDED.hard_ceiling""",
+                g=spec.group_id, n=group_ceiling)
+            old = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=spec.pool_id)
             if old and (old["engine_epoch"] != spec.engine_epoch or old["spec"] != spec.model_dump(mode="json")):
                 active = await row(c, """SELECT count(*) AS n FROM runtime_inflight_attempts
                     WHERE pool_id=:id AND (compute_held OR budget_held)""", id=spec.pool_id)
                 if active["n"]:
                     raise RuntimeConflict("drain/reconcile existing attempts before reconfiguration")
-            await execute(c, """INSERT INTO runtime_groups(group_id,hard_ceiling) VALUES (:g,:n)
-                ON CONFLICT(group_id) DO UPDATE SET hard_ceiling=EXCLUDED.hard_ceiling""",
-                g=spec.group_id, n=group_ceiling)
             await execute(c, """INSERT INTO runtime_pools
                 (pool_id,group_id,spec,engine_epoch,target,hard_ceiling,context_limit,model_profile,valid_until)
                 VALUES (:id,:g,CAST(:spec AS jsonb),:epoch,:target,:ceiling,:context,:model,:until)
@@ -152,6 +215,8 @@ class Store:
                 model_profile=EXCLUDED.model_profile, valid_until=EXCLUDED.valid_until,
                 health=CASE WHEN runtime_pools.engine_epoch!=EXCLUDED.engine_epoch THEN 'HEALTHY'
                             ELSE runtime_pools.health END,
+                quiesce_token=CASE WHEN runtime_pools.engine_epoch!=EXCLUDED.engine_epoch
+                    THEN NULL ELSE runtime_pools.quiesce_token END,
                 group_id=EXCLUDED.group_id, envelope_version=runtime_pools.envelope_version+1""",
                 id=spec.pool_id, g=spec.group_id, spec=spec.model_dump_json(), epoch=spec.engine_epoch,
                 target=spec.target, ceiling=spec.hard_ceiling,
@@ -164,6 +229,8 @@ class Store:
         if not spec.payload.key.startswith(tenant_prefix(spec.tenant_id)):
             raise NotFound("payload")
         async with self.transaction() as c:
+            await execute(c, "SELECT pg_advisory_xact_lock(hashtextextended(:identity, 3472))",
+                          identity=spec.operation_id)
             old = await row(c, "SELECT spec FROM runtime_operations WHERE operation_id=:id",
                             id=spec.operation_id)
             if old:
@@ -171,7 +238,7 @@ class Store:
                     raise RuntimeConflict("operation identity/input conflict")
                 return spec.operation_id
             root = await row(c, """SELECT *,clock_timestamp() AS observed_at FROM runtime_roots
-                WHERE root_id=:id AND tenant_id=:tenant""",
+                WHERE root_id=:id AND tenant_id=:tenant FOR UPDATE""",
                              id=spec.root_id, tenant=spec.tenant_id)
             if not root:
                 raise NotFound("root")
@@ -180,15 +247,25 @@ class Store:
             if (spec.budget_unit != "tokens"
                 and spec.budget_unit not in root["spec"].get("resource_budgets", {})):
                 raise AdmissionDenied(f"root has no accepted {spec.budget_unit} budget")
-            count = await row(c, """SELECT count(*) FILTER(WHERE root_id=:root) AS root_pending,
-                count(*) AS total FROM runtime_operations
-                WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')""", root=spec.root_id)
-            limits = await row(c, "SELECT * FROM runtime_authority WHERE id=1")
+            # A model row serializes only submissions to that endpoint. This
+            # protects its backlog quota while unrelated models remain free.
+            await execute(c, """INSERT INTO runtime_admission_models(model_profile)
+                VALUES (:model) ON CONFLICT DO NOTHING""", model=spec.model_profile)
+            await execute(c, """SELECT model_profile FROM runtime_admission_models
+                WHERE model_profile=:model FOR UPDATE""", model=spec.model_profile)
+            count = await row(c, """SELECT
+                count(*) FILTER(WHERE root_id=:root) AS root_pending,
+                count(*) FILTER(WHERE spec->>'model_profile'=:model) AS model_pending
+                FROM runtime_operations
+                WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')
+                AND (root_id=:root OR spec->>'model_profile'=:model)""",
+                root=spec.root_id, model=spec.model_profile)
+            limits = await row(c, "SELECT max_pending FROM runtime_authority WHERE id=1")
             if root["operation_count"] >= root["spec"]["max_operations"]:
                 raise AdmissionDenied("lifetime operation limit reached")
             expired = spec.deadline is not None and spec.deadline <= root["observed_at"]
             if not expired and (count["root_pending"] >= root["spec"]["max_pending"]
-                or count["total"] >= limits["max_pending"]):
+                or count["model_pending"] >= limits["max_pending"]):
                 raise AdmissionDenied("materialization limit reached", retryable=True)
             inserted = await row(c, """INSERT INTO runtime_operations(operation_id,root_id,tenant_id,spec)
                 VALUES (:id,:root,:tenant,CAST(:spec AS jsonb)) RETURNING clock_timestamp() AS observed_at""",
@@ -245,20 +322,42 @@ class Store:
     async def reserve_next(self, pool_id: str, owner_id: str) -> Reservation | None:
         """Called only by an idle executor; no downstream worker queue."""
         async with self.transaction() as c:
-            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id", id=pool_id)
-            if not pool or pool["health"] != "HEALTHY" or pool["valid_until"] <= datetime.now(UTC):
+            initial = await row(c, "SELECT group_id,spec FROM runtime_pools WHERE pool_id=:id", id=pool_id)
+            if not initial:
+                return None
+            if parse_pool(initial["spec"]).kind != "llm":
+                await execute(c, "SELECT group_id FROM runtime_groups WHERE group_id=:id FOR UPDATE",
+                              id=initial["group_id"])
+            # This short lock makes the endpoint transport bound atomic across
+            # direct API and executor replicas. It is never held during HTTP.
+            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
+            if (not pool or pool["health"] != "HEALTHY" or pool["target"] == 0
+                or pool["valid_until"] <= datetime.now(UTC)):
                 return None
             profile = parse_pool(pool["spec"])
+            if pool["group_id"] != initial["group_id"] or profile.kind != parse_pool(initial["spec"]).kind:
+                return None
             group = await row(c, "SELECT * FROM runtime_groups WHERE group_id=:id", id=pool["group_id"])
             used = await row(c, """SELECT count(*) AS group_used,
                 count(*) FILTER(WHERE a.pool_id=:pool) AS pool_used FROM runtime_inflight_attempts a
-                JOIN runtime_pools p USING(pool_id) WHERE a.compute_held AND p.group_id=:g""",
-                pool=pool_id, g=pool["group_id"])
-            if (group["health"] != "HEALTHY" or used["group_used"] >= group["hard_ceiling"]
-                or used["pool_used"] >= min(pool["target"], pool["hard_ceiling"])):
+                JOIN runtime_pools p USING(pool_id) WHERE a.compute_held AND p.group_id=:g
+                AND (:llm OR COALESCE(p.spec->>'kind','llm')<>'llm')""",
+                pool=pool_id, g=pool["group_id"], llm=profile.kind == "llm")
+            endpoint_limit = profile.transport_limit if profile.kind == "llm" else min(
+                pool["target"], pool["hard_ceiling"])
+            lower_usage = (await endpoint_usage(c, pool_id))["lower_class"] if profile.kind == "llm" else 0
+            if (group["health"] != "HEALTHY"
+                or (profile.kind != "llm" and used["group_used"] >= group["hard_ceiling"])
+                or used["pool_used"] >= endpoint_limit
+                or (profile.kind == "llm" and lower_usage >= profile.background_transport_limit)):
                 return None
-            authority = await row(c, "SELECT dispatch_clock FROM runtime_authority WHERE id=1")
-            preferred = "background" if authority["dispatch_clock"] % 5 == 4 else "interactive"
+            # QA waiting for this endpoint gets the next safe transport opening.
+            # No global GPU turn clock or model-count-derived capacity is used.
+            foreground_waiting = await row(c, """SELECT 1 FROM runtime_direct_waiters
+                WHERE pool_id=:pool AND workload_class IN ('qa','user_task') AND deadline>now()
+                ORDER BY created_at LIMIT 1""", pool=pool_id)
+            if foreground_waiting:
+                return None
             # Tenant service history is aggregated first, so splitting a job
             # into many roots does not gain priority over another tenant.
             candidates = await rows(c, """SELECT o.*,r.spec AS root_spec,r.reserved,r.spent,
@@ -276,15 +375,54 @@ class Store:
                 AND (:kind<>'embedding' OR (o.spec->>'texts_count')::bigint<=:batch_limit)
                 AND (:kind<>'embedding' OR o.spec->>'model_revision'=:model_revision)
                 AND CAST(:capabilities AS jsonb) @> (o.spec->'required_capabilities')
-                ORDER BY (r.priority=:preferred) DESC,
+                ORDER BY CASE
+                    WHEN r.priority='qa' THEN 0
+                    WHEN r.priority IN ('interactive','user_task')
+                         AND clock_timestamp()-GREATEST(o.created_at,
+                             to_timestamp(r.last_served::double precision/1000000)) >= interval '60 seconds' THEN 0
+                    WHEN r.priority IN ('interactive','user_task') THEN 1
+                    WHEN r.priority='background'
+                         AND clock_timestamp()-GREATEST(o.created_at,
+                             to_timestamp(r.last_served::double precision/1000000)) >= interval '120 seconds' THEN 0
+                    WHEN r.priority='background' THEN 2
+                    WHEN clock_timestamp()-GREATEST(o.created_at,
+                             to_timestamp(r.last_served::double precision/1000000)) >= interval '300 seconds' THEN 0
+                    ELSE 3 END,
                 (SELECT COALESCE(max(r2.last_served),0) FROM runtime_roots r2
                  WHERE r2.tenant_id=r.tenant_id),r.last_served,o.created_at,o.operation_id LIMIT 64""",
-                model=pool["model_profile"], preferred=preferred, profile=pool["spec"]["profile_id"],
+                model=pool["model_profile"], profile=pool["spec"]["profile_id"],
                 kind=profile.kind, request_limit=profile.request_limit,
                 batch_limit=getattr(profile, "max_batch_size", 0),
                 model_revision=profile.model_revision,
                 capabilities=encode(pool["spec"]["capabilities"]))
             for candidate in candidates:
+                # Pools with the same model can select the same operation or
+                # different operations on one root. Lock the root first (the
+                # order used by cancellation/settlement), then claim one
+                # operation without waiting on another executor. Re-read the
+                # budget under that lock; the candidate scan is only a hint.
+                current_root = await row(c, """SELECT state,cancel_requested,deadline,
+                    budget_limit,reserved,spent,attempts,spec FROM runtime_roots
+                    WHERE root_id=:id FOR UPDATE""", id=candidate["root_id"])
+                if (not current_root or current_root["state"] != "RUNNING"
+                    or current_root["cancel_requested"]
+                    or current_root["deadline"] <= datetime.now(UTC)):
+                    continue
+                current_op = await row(c, """SELECT state,attempts,retry_at FROM runtime_operations
+                    WHERE operation_id=:id FOR UPDATE SKIP LOCKED""", id=candidate["operation_id"])
+                if (not current_op or current_op["state"] not in {"READY", "RETRY_WAIT"}
+                    or (current_op["retry_at"] is not None
+                        and current_op["retry_at"] > datetime.now(UTC))):
+                    continue
+                candidate = dict(candidate) | {
+                    "attempts": current_op["attempts"],
+                    "root_attempts": current_root["attempts"],
+                    "root_spec": current_root["spec"],
+                    "root_deadline": current_root["deadline"],
+                    "reserved": current_root["reserved"],
+                    "spent": current_root["spent"],
+                    "budget_limit": current_root["budget_limit"],
+                }
                 spec = parse_operation(candidate["spec"])
                 if await self._expire_operation(c, spec, candidate["observed_at"]):
                     continue
@@ -328,8 +466,7 @@ class Store:
                 await execute(c, """UPDATE runtime_operations SET state='EXECUTING',attempts=:n,
                     active_attempt=:attempt,wait_reason=NULL WHERE operation_id=:id""",
                     n=number, attempt=attempt_id, id=spec.operation_id)
-                clock = authority["dispatch_clock"] + 1
-                await execute(c, "UPDATE runtime_authority SET dispatch_clock=:n WHERE id=1", n=clock)
+                clock = int(datetime.now(UTC).timestamp() * 1_000_000)
                 await execute(c, """UPDATE runtime_roots SET reserved=reserved+:bound,
                     attempts=attempts+1,last_served=:clock WHERE root_id=:id""",
                     bound=spec.budget_bound if spec.budget_unit == "tokens" else 0,
@@ -350,7 +487,7 @@ class Store:
             o.state AS operation_state,o.spec AS operation_spec,r.cancel_requested,
             r.state AS root_state,r.deadline,clock_timestamp() AS observed_at FROM runtime_attempts a
             JOIN runtime_operations o USING(operation_id) JOIN runtime_roots r USING(root_id)
-            WHERE a.attempt_id=:id""", id=reservation.attempt_id)
+            WHERE a.attempt_id=:id FOR UPDATE OF a""", id=reservation.attempt_id)
         if (not attempt or attempt["owner_id"] != reservation.owner_id
             or attempt["lease_epoch"] != reservation.lease_epoch
             or attempt["active_attempt"] != reservation.attempt_id):
@@ -364,7 +501,8 @@ class Store:
             deadline = min(a["deadline"], spec.deadline or a["deadline"],
                 a["created_at"] + timedelta(seconds=spec.attempt_timeout_seconds))
             if (a["state"] != "RESERVED" or a["operation_state"] != "EXECUTING"
-                or a["lease_expires_at"] <= a["observed_at"]
+                or (a["lease_expires_at"] <= a["observed_at"]
+                    and not await self.owner_alive(c, reservation.owner_id))
                 or a["cancel_requested"] or a["root_state"] != "RUNNING" or deadline <= a["observed_at"]):
                 raise RuntimeConflict("attempt cannot send")
             await execute(c, """UPDATE runtime_attempts SET state='SEND_INTENT',send_intent_at=now()
@@ -375,8 +513,10 @@ class Store:
             a = await self._owned(c, reservation)
             if a["state"] not in ("RESERVED", "SEND_INTENT", "ACTIVE", "BACKEND_FINISHED"):
                 return False
-            await execute(c, "UPDATE runtime_attempts SET lease_expires_at=:until WHERE attempt_id=:id",
-                until=datetime.now(UTC)+timedelta(seconds=self.lease_seconds), id=reservation.attempt_id)
+            if not await self.owner_alive(c, reservation.owner_id):
+                # Older pinned workers retain their attempt lease contract.
+                await execute(c, "UPDATE runtime_attempts SET lease_expires_at=:until WHERE attempt_id=:id",
+                    until=datetime.now(UTC)+timedelta(seconds=self.lease_seconds), id=reservation.attempt_id)
             return (not a["cancel_requested"] and a["root_state"] == "RUNNING"
                     and a["operation_state"] not in ("SUCCEEDED", "FAILED", "CANCELLED"))
 
@@ -679,14 +819,23 @@ class Store:
                 unknown_at=CASE WHEN state='RESERVED' THEN NULL ELSE COALESCE(unknown_at,now()) END,
                 error_class=CASE WHEN state='RESERVED' THEN 'lease_expired_before_send' ELSE 'lease_expired_after_send' END
                 WHERE state IN ('RESERVED','SEND_INTENT')
-                    AND LEAST(lease_expires_at,deadline)<=clock_timestamp()""")
+                    AND (deadline<=clock_timestamp() OR
+                        (lease_expires_at<=clock_timestamp() AND NOT EXISTS (
+                            SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=runtime_direct_attempts.owner_id
+                                AND ow.lease_expires_at>clock_timestamp())))""")
+            await execute(c, """DELETE FROM runtime_direct_waiters w
+                WHERE deadline<=clock_timestamp() OR NOT EXISTS (
+                    SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=w.owner_id
+                        AND ow.lease_expires_at>clock_timestamp())""")
             expired_operations = await rows(c, """SELECT operation_id FROM runtime_operations
                 WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')
                 AND (spec->>'deadline')::timestamptz<=clock_timestamp()""")
             for op in expired_operations:
                 await self._terminal(c, op["operation_id"], "FAILED", "operation_deadline_exceeded")
             attempts = await rows(c, """SELECT a.*,o.root_id FROM runtime_attempts a
-                JOIN runtime_operations o USING(operation_id) WHERE (lease_expires_at<now()
+                JOIN runtime_operations o USING(operation_id) WHERE ((lease_expires_at<now()
+                    AND NOT EXISTS (SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=a.owner_id
+                        AND ow.lease_expires_at>now()))
                     OR (a.state='RESERVED' AND o.state IN ('SUCCEEDED','FAILED','CANCELLED')))
                 AND a.state IN ('RESERVED','SEND_INTENT','ACTIVE','BACKEND_FINISHED')""")
             for a in attempts:
@@ -744,7 +893,74 @@ class Store:
                 await self._wake(c)
             return len(attempts) + direct.rowcount
 
-    async def confirm_epoch_stopped(self, pool_id: str, engine_epoch: str, evidence: str):
+    async def inspect_engine(self, pool_id: str):
+        """Bounded metadata only; never expose prompt or response payloads."""
+        async with self.engine.connect() as c:
+            pool = await row(c, """SELECT pool_id,engine_epoch,health,target,
+                quiesce_token IS NOT NULL AS quiesce_owned
+                FROM runtime_pools WHERE pool_id=:id""",
+                             id=pool_id)
+            if not pool:
+                raise NotFound("pool")
+            counts = await row(c, """SELECT count(*) FILTER (WHERE state<>'UNKNOWN' AND compute_held)
+                    AS known_inflight,
+                count(*) FILTER (WHERE state='UNKNOWN' AND compute_held) AS unknown_inflight,
+                count(*) FILTER (WHERE compute_held OR budget_held) AS unsettled_inflight
+                FROM runtime_inflight_attempts WHERE pool_id=:id""", id=pool_id)
+            attempts = await rows(c, """SELECT attempt_id,engine_epoch,owner_id,state,compute_held,
+                    budget_held,kind FROM (
+                    SELECT attempt_id,engine_epoch,owner_id,state,compute_held,budget_held,
+                        'durable'::text AS kind FROM runtime_attempts WHERE pool_id=:id
+                    UNION ALL
+                    SELECT attempt_id,engine_epoch,owner_id,state,compute_held,false,
+                        'direct'::text AS kind FROM runtime_direct_attempts WHERE pool_id=:id
+                ) a WHERE compute_held OR budget_held ORDER BY attempt_id LIMIT 200""", id=pool_id)
+            return dict(pool) | dict(counts) | {"attempts": [dict(a) for a in attempts],
+                "attempts_truncated": counts["unsettled_inflight"] > len(attempts)}
+
+    async def quiesce_engine(self, pool_id: str, engine_epoch: str, token: str):
+        """Stop new admissions to exactly one still-live endpoint before host action."""
+        if not token or len(token) > 200:
+            raise ValueError("quiesce owner token required")
+        async with self.transaction() as c:
+            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
+            if not pool or pool["engine_epoch"] != engine_epoch:
+                raise RuntimeConflict("engine epoch does not match")
+            if pool["quiesce_token"] is not None and pool["quiesce_token"] != token:
+                raise RuntimeConflict("engine is quiesced by a different owner")
+            if pool["health"] in {"DEGRADED", "UNAVAILABLE"} and pool["quiesce_token"] == token:
+                return
+            if pool["health"] != "HEALTHY":
+                raise RuntimeConflict("engine is not available to quiesce")
+            await execute(c, """UPDATE runtime_pools SET target=0,health='DEGRADED',
+                quiesce_token=:token WHERE pool_id=:id AND engine_epoch=:epoch""",
+                id=pool_id, epoch=engine_epoch, token=token)
+            await self._wake(c)
+
+    async def resume_engine(self, pool_id: str, engine_epoch: str, token: str):
+        """Undo only this owner's temporary quiesce of an unchanged live epoch."""
+        if not token or len(token) > 200:
+            raise ValueError("quiesce owner token required")
+        async with self.transaction() as c:
+            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
+            if not pool or pool["engine_epoch"] != engine_epoch:
+                raise RuntimeConflict("engine epoch does not match")
+            if pool["health"] == "HEALTHY" and pool["quiesce_token"] is None:
+                return
+            if pool["health"] != "DEGRADED" or pool["quiesce_token"] != token:
+                raise RuntimeConflict("quiesce owner or engine state changed")
+            held = await row(c, """SELECT count(*) AS n FROM runtime_inflight_attempts
+                WHERE pool_id=:id AND compute_held""", id=pool_id)
+            if held["n"]:
+                raise RuntimeConflict("unsettled compute must be reconciled before resume")
+            await execute(c, """UPDATE runtime_pools
+                SET target=:target,health='HEALTHY',quiesce_token=NULL
+                WHERE pool_id=:id AND engine_epoch=:epoch""",
+                id=pool_id, epoch=engine_epoch, target=pool["spec"]["target"])
+            await self._wake(c)
+
+    async def confirm_epoch_stopped(self, pool_id: str, engine_epoch: str, evidence: str,
+                                    *, recover: bool = False):
         """Operator action after independent confirmation of instance termination.
 
         This records evidence, settles unknown usage conservatively and fails
@@ -752,31 +968,99 @@ class Store:
         """
         if not evidence.strip():
             raise ValueError("termination evidence is required")
+        if recover:
+            try:
+                proof = json.loads(evidence)
+                if (not isinstance(proof, dict) or proof.get("pool_id") != pool_id
+                    or proof.get("engine_epoch") != engine_epoch
+                    or proof.get("verification") not in {
+                        "container_and_child_absent", "container_stopped_or_replaced"}):
+                    raise ValueError("exact stopped process evidence required")
+                if proof["verification"] == "container_and_child_absent":
+                    if (not isinstance(proof.get("container_id"), str) or not proof["container_id"]
+                        or type(proof.get("model_pid")) is not int or proof["model_pid"] <= 0):
+                        raise ValueError("container and model child identity required")
+                    started_at = proof["process_started_at"]
+                    stopped_at = proof["verified_stopped_at"]
+                else:
+                    if (proof.get("model_pid") is not None
+                        or (proof.get("old_container_id") is not None
+                            and (not isinstance(proof["old_container_id"], str)
+                                or not proof["old_container_id"]))
+                        or not isinstance(proof.get("observed_container_id"), str)
+                        or not proof["observed_container_id"]):
+                        raise ValueError("replacement container evidence required")
+                    started_at = proof["old_started_at"]
+                    stopped_at = proof["observed_started_at"]
+                started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                stopped = datetime.fromisoformat(stopped_at.replace("Z", "+00:00"))
+                verified = datetime.fromisoformat(proof["verified_stopped_at"].replace("Z", "+00:00"))
+                if started.tzinfo is None or stopped.tzinfo is None or stopped <= started:
+                    raise ValueError("invalid stopped process times")
+                if verified.tzinfo is None or verified < stopped:
+                    raise ValueError("invalid stopped process verification")
+            except (TypeError, AttributeError, json.JSONDecodeError, KeyError) as exc:
+                raise ValueError("exact stopped process evidence required") from exc
         async with self.transaction() as c:
-            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id", id=pool_id)
+            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
             if not pool or pool["engine_epoch"] != engine_epoch:
                 raise RuntimeConflict("engine epoch does not match")
+            if recover and pool["health"] not in {"DEGRADED", "UNAVAILABLE"}:
+                raise RuntimeConflict("quiesce the exact engine epoch before recovery")
             await execute(c, "UPDATE runtime_pools SET target=0,health='UNAVAILABLE' WHERE pool_id=:id",
                           id=pool_id)
-            direct = await execute(c, """UPDATE runtime_direct_attempts SET state='FAILED',compute_held=false,
+            direct = await execute(c, """UPDATE runtime_direct_attempts SET state=:direct_state,compute_held=false,
                 backend_finished_at=COALESCE(backend_finished_at,now()),error_class='engine_epoch_stopped'
-                WHERE pool_id=:pool AND engine_epoch=:epoch AND compute_held""", pool=pool_id, epoch=engine_epoch)
-            attempts = await rows(c, """SELECT a.*,o.root_id,o.state AS operation_state
+                WHERE pool_id=:pool AND engine_epoch=:epoch AND compute_held""",
+                pool=pool_id, epoch=engine_epoch,
+                direct_state="FAILED_RECOVERABLE" if recover else "FAILED")
+            attempts = await rows(c, """SELECT a.*,o.root_id,o.state AS operation_state,
+                o.spec AS operation_spec,r.spec AS root_spec,r.state AS root_state,
+                r.cancel_requested,r.deadline AS root_deadline
                 FROM runtime_attempts a JOIN runtime_operations o USING(operation_id)
-                WHERE a.pool_id=:pool AND a.engine_epoch=:epoch AND (a.compute_held OR a.budget_held)""",
+                JOIN runtime_roots r USING(root_id)
+                WHERE a.pool_id=:pool AND a.engine_epoch=:epoch AND (a.compute_held OR a.budget_held)
+                ORDER BY a.created_at FOR UPDATE OF a""",
                 pool=pool_id, epoch=engine_epoch)
+            settled_attempts = 0
             for a in attempts:
+                if recover and a["state"] == "BACKEND_FINISHED" and not a["compute_held"]:
+                    # Inference already ended. The old executor may still hold
+                    # the result bytes and must finish persistence, never infer again.
+                    continue
+                settled_attempts += 1
                 await self._settle(c, a, 0 if a["state"] == "RESERVED" else None)
                 await execute(c, """UPDATE runtime_attempts SET state='FAILED',compute_held=false,
                     backend_finished_at=COALESCE(backend_finished_at,now()),error_class='engine_epoch_stopped'
                     WHERE attempt_id=:id""", id=a["attempt_id"])
-                if a["operation_state"] != "CANCELLED":
+                if a["operation_state"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                    continue
+                spec = parse_operation(a["operation_spec"])
+                root = await row(c, """SELECT state,cancel_requested,deadline,spent,reserved,budget_limit,
+                    attempts FROM runtime_roots WHERE root_id=:id FOR UPDATE""", id=a["root_id"])
+                budget = root if spec.budget_unit == "tokens" else await row(c,
+                    """SELECT spent,reserved,budget_limit FROM runtime_resource_budgets
+                    WHERE root_id=:id AND unit=:unit FOR UPDATE""",
+                    id=a["root_id"], unit=spec.budget_unit)
+                can_retry = (recover and root["state"] == "RUNNING" and not root["cancel_requested"]
+                    and root["deadline"] > datetime.now(UTC)
+                    and (spec.deadline is None or spec.deadline > datetime.now(UTC))
+                    and a["attempt_number"] < spec.max_attempts
+                    and root["attempts"] < a["root_spec"]["max_attempts"]
+                    and budget is not None
+                    and budget["spent"] + budget["reserved"] + spec.budget_bound <= budget["budget_limit"])
+                if can_retry:
+                    await execute(c, """UPDATE runtime_operations SET state='RETRY_WAIT',
+                        active_attempt=NULL,wait_reason='engine_recovery',retry_at=now()
+                        WHERE operation_id=:id AND active_attempt=:old""",
+                        id=a["operation_id"], old=a["attempt_id"])
+                else:
                     await self._terminal(c, a["operation_id"], "FAILED", "engine_epoch_stopped")
             await execute(c, """INSERT INTO runtime_controller_updates(pool_id,envelope_version,target,reason)
                 VALUES (:id,:version,0,:reason)""", id=pool_id, version=pool["envelope_version"],
                 reason=f"epoch_stopped:{engine_epoch}:{evidence}")
             await self._wake(c)
-            return len(attempts) + direct.rowcount
+            return settled_attempts + direct.rowcount
 
     async def update_target(self, pool_id: str, target: int, version: int, reason: str):
         async with self.transaction() as c:

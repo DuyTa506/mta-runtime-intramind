@@ -30,6 +30,8 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
         commit_result=AsyncMock(),
         unknown=AsyncMock(),
         fail=AsyncMock(),
+        register_owner=AsyncMock(),
+        heartbeat_owner=AsyncMock(),
         close=AsyncMock(),
     )
     blobs = MemoryArtifacts()

@@ -1,13 +1,13 @@
 """Foreground inference shares pool authority without workflow or artifact I/O."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import uuid4
 
 from pydantic import Field, field_validator
 
 from .contracts import AdmissionDenied, Contract, RuntimeConflict, parse_pool
-from .store import Store, execute, row
+from .store import Store, endpoint_usage, execute, row, rows
 
 
 class DirectRequest(Contract):
@@ -15,11 +15,15 @@ class DirectRequest(Contract):
     tenant_id: str = Field(min_length=1, max_length=200)
     payload_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     model_profile: str = Field(min_length=1, max_length=120)
+    model_revision: str | None = Field(default=None, min_length=1)
+    expected_engine_epoch: str | None = Field(default=None, min_length=1)
     capacity_profile_id: str = Field(min_length=1, max_length=200)
     kind: Literal["llm", "embedding", "speech", "rerank"] = "llm"
     request_bound: int = Field(gt=0, strict=True)
     batch_size: int = Field(default=1, gt=0, le=256, strict=True)
     deadline: datetime
+    workload_class: Literal["qa", "user_task", "background", "maintenance"] = "qa"
+    logical_request_id: str | None = Field(default=None, max_length=200)
 
     @field_validator("deadline")
     @classmethod
@@ -35,35 +39,7 @@ class DirectReservation(Contract):
     pool_id: str
     engine_epoch: str
     owner_id: str
-
-
-async def _background_ready(c, group_id):
-    """Reserve a turn only for a compatible background operation that can dispatch."""
-    return await row(c, """SELECT 1 FROM runtime_operations o
-        JOIN runtime_roots r USING(root_id)
-        JOIN runtime_pools p ON p.model_profile=o.spec->>'model_profile'
-        LEFT JOIN runtime_resource_budgets b ON b.root_id=r.root_id
-            AND b.unit=CASE o.spec->>'kind' WHEN 'speech' THEN 'speech_characters'
-                WHEN 'embedding' THEN 'embedding_characters' ELSE 'tokens' END
-        WHERE p.group_id=:group AND p.health='HEALTHY' AND p.valid_until>clock_timestamp()
-        AND o.state IN ('READY','RETRY_WAIT') AND (o.retry_at IS NULL OR o.retry_at<=now())
-        AND r.state='RUNNING' AND NOT r.cancel_requested AND r.deadline>clock_timestamp()
-        AND (o.spec->>'deadline' IS NULL OR (o.spec->>'deadline')::timestamptz>clock_timestamp())
-        AND COALESCE(o.spec->>'kind','llm')=COALESCE(p.spec->>'kind','llm')
-        AND (o.spec->>'capacity_profile_id' IS NULL OR o.spec->>'capacity_profile_id'=p.spec->>'profile_id')
-        AND (p.spec->'capabilities') @> (o.spec->'required_capabilities')
-        AND o.attempts<(o.spec->>'max_attempts')::integer
-        AND r.attempts<(r.spec->>'max_attempts')::integer
-        AND (SELECT count(*) FROM runtime_inflight_attempts a WHERE a.pool_id=p.pool_id AND a.compute_held)
-            <LEAST(p.target,p.hard_ceiling)
-        AND CASE WHEN COALESCE(o.spec->>'kind','llm')='llm' THEN
-            (o.spec->>'input_tokens_bound')::bigint+(o.spec->>'max_output_tokens')::bigint
-                <=LEAST(p.context_limit,r.budget_limit-r.spent-r.reserved)
-            ELSE b.root_id IS NOT NULL AND GREATEST(1,(o.spec->>'characters_bound')::bigint)
-                <=LEAST((p.spec->>'character_limit')::bigint,b.budget_limit-b.spent-b.reserved) END
-        AND (COALESCE(o.spec->>'kind','llm')<>'embedding' OR
-            ((o.spec->>'texts_count')::integer<=(p.spec->>'max_batch_size')::integer
-                AND o.spec->>'model_revision'=p.spec->>'model_revision')) LIMIT 1""", group=group_id)
+    generation: int = 0
 
 
 class DirectAdmissions:
@@ -72,13 +48,131 @@ class DirectAdmissions:
     def __init__(self, store: Store):
         self.store = store
 
+    async def enqueue(self, request: DirectRequest, pool_id: str, owner_id: str,
+                      *, endpoint_limit: int = 1024, tenant_limit: int = 256):
+        """A pending connection writes once, regardless of how long it waits."""
+        async with self.store.transaction() as c:
+            pool = await row(c, "SELECT pool_id FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
+            if not pool:
+                raise AdmissionDenied("qualified inference endpoint unavailable", retryable=True)
+            existing = await row(c, "SELECT * FROM runtime_direct_waiters WHERE request_id=:id",
+                                 id=request.request_id)
+            if existing:
+                if (existing["tenant_id"] != request.tenant_id or existing["pool_id"] != pool_id
+                    or existing["owner_id"] != owner_id or existing["workload_class"] != request.workload_class):
+                    raise RuntimeConflict("direct waiting identity conflict")
+                return
+            counts = await row(c, """SELECT count(*) AS endpoint,
+                count(*) FILTER(WHERE tenant_id=:tenant) AS tenant
+                FROM runtime_direct_waiters WHERE pool_id=:pool AND deadline>now()""",
+                tenant=request.tenant_id, pool=pool_id)
+            if counts["endpoint"] >= endpoint_limit or counts["tenant"] >= tenant_limit:
+                raise AdmissionDenied("inference waiting buffer full", retryable=True)
+            await execute(c, """INSERT INTO runtime_direct_waiters
+                (request_id,tenant_id,pool_id,owner_id,workload_class,deadline)
+                VALUES (:id,:tenant,:pool,:owner,:workload,:deadline)""",
+                id=request.request_id, tenant=request.tenant_id, pool=pool_id,
+                owner=owner_id, workload=request.workload_class, deadline=request.deadline)
+            await self.store._wake(c)
+
+    async def leave(self, request_id: str, owner_id: str):
+        async with self.store.transaction() as c:
+            changed = await execute(c, """DELETE FROM runtime_direct_waiters
+                WHERE request_id=:id AND owner_id=:owner""", id=request_id, owner=owner_id)
+            if changed.rowcount:
+                await self.store._wake(c)
+
+    async def recovery_statuses(self, attempt_ids: list[str]):
+        if not attempt_ids:
+            return {}
+        async with self.store.engine.connect() as c:
+            found = await rows(c, """SELECT a.attempt_id,a.state,a.engine_epoch,
+                p.engine_epoch AS current_epoch,p.health,p.target
+                FROM runtime_direct_attempts a JOIN runtime_pools p USING(pool_id)
+                WHERE a.attempt_id=ANY(CAST(:ids AS text[]))""", ids=attempt_ids[:1000])
+            return {a["attempt_id"]: dict(a) for a in found}
+
+    async def retry_confirmed(self, request: DirectRequest, pool_id: str, owner_id: str,
+                              previous_attempt_id: str):
+        """Only an unsent attempt or host-confirmed stopped epoch can be resent."""
+        async with self.store.transaction() as c:
+            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
+            previous = await row(c, """SELECT * FROM runtime_direct_attempts
+                WHERE attempt_id=:id FOR UPDATE""", id=previous_attempt_id)
+            if (not previous or previous["spec"] != request.model_dump(mode="json")
+                or previous["owner_id"] != owner_id or previous["pool_id"] != pool_id):
+                raise RuntimeConflict("recovery identity conflict")
+            if previous["state"] not in {"FAILED_NOT_SENT", "FAILED_RECOVERABLE"}:
+                raise RuntimeConflict("inference termination is not proven")
+            if previous["generation"] >= 2:
+                raise AdmissionDenied("inference recovery limit reached")
+            if (not pool or pool["health"] != "HEALTHY" or pool["target"] == 0
+                or pool["valid_until"] <= datetime.now(UTC)):
+                return None
+            profile = parse_pool(pool["spec"])
+            if (previous["state"] == "FAILED_RECOVERABLE"
+                and previous["engine_epoch"] == pool["engine_epoch"]):
+                return None
+            if (profile.kind != request.kind or profile.profile_id != request.capacity_profile_id
+                or profile.model_profile != request.model_profile
+                or (request.model_revision is not None
+                    and profile.model_revision != request.model_revision)):
+                raise RuntimeConflict("qualified inference profile changed during recovery")
+            used = await row(c, """SELECT count(*) AS n FROM runtime_inflight_attempts
+                WHERE pool_id=:pool AND compute_held""", pool=pool_id)
+            limit = profile.transport_limit if profile.kind == "llm" else min(
+                pool["target"], pool["hard_ceiling"])
+            if used["n"] >= limit:
+                return None
+            if profile.kind == "llm" and request.workload_class != "qa":
+                usage = await endpoint_usage(c, pool_id)
+                if usage["lower_class"] >= profile.background_transport_limit:
+                    return None
+            first = await row(c, """SELECT request_id FROM runtime_direct_waiters
+                WHERE pool_id=:pool AND deadline>now()
+                ORDER BY CASE workload_class WHEN 'qa' THEN 0 WHEN 'user_task' THEN 1
+                    WHEN 'background' THEN 2 ELSE 3 END,created_at,request_id LIMIT 1""",
+                pool=pool_id)
+            if first and first["request_id"] != request.request_id:
+                return None
+            claimed = await row(c, """DELETE FROM runtime_direct_waiters
+                WHERE request_id=:id AND owner_id=:owner RETURNING 1""",
+                id=request.request_id, owner=owner_id)
+            if not claimed:
+                return None
+            latest = await row(c, """SELECT attempt_id FROM runtime_direct_attempts
+                WHERE tenant_id=:tenant AND request_id=:request ORDER BY generation DESC LIMIT 1""",
+                tenant=request.tenant_id, request=request.request_id)
+            if latest["attempt_id"] != previous_attempt_id:
+                raise RuntimeConflict("newer inference generation already owns request")
+            result = DirectReservation(attempt_id=str(uuid4()), request=request, pool_id=pool_id,
+                engine_epoch=pool["engine_epoch"], owner_id=owner_id,
+                generation=previous["generation"]+1)
+            await execute(c, """INSERT INTO runtime_direct_attempts
+                (attempt_id,request_id,tenant_id,spec,pool_id,engine_epoch,owner_id,
+                 lease_expires_at,deadline,generation)
+                VALUES (:id,:request,:tenant,CAST(:spec AS jsonb),:pool,:epoch,:owner,
+                    now()+(:lease * interval '1 second'),:deadline,:generation)""",
+                id=result.attempt_id, request=request.request_id, tenant=request.tenant_id,
+                spec=request.model_dump_json(), pool=pool_id, epoch=result.engine_epoch,
+                owner=owner_id, lease=self.store.lease_seconds, deadline=request.deadline,
+                generation=result.generation)
+            await self.store._wake(c)
+            return result
+
     async def reserve(self, request: DirectRequest, pool_id: str, owner_id: str):
         if not owner_id:
             raise ValueError("executor identity is required")
         async with self.store.transaction() as c:
             observed = (await row(c, "SELECT clock_timestamp() AS now"))["now"]
+            initial = await row(c, "SELECT group_id,spec FROM runtime_pools WHERE pool_id=:id", id=pool_id)
+            if initial and parse_pool(initial["spec"]).kind != "llm":
+                await execute(c, "SELECT group_id FROM runtime_groups WHERE group_id=:id FOR UPDATE",
+                              id=initial["group_id"])
+            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
             previous = await row(c, """SELECT * FROM runtime_direct_attempts
-                WHERE tenant_id=:tenant AND request_id=:request""",
+                WHERE tenant_id=:tenant AND request_id=:request
+                ORDER BY generation DESC LIMIT 1""",
                 tenant=request.tenant_id, request=request.request_id)
             if previous:
                 if (previous["spec"] != request.model_dump(mode="json") or previous["owner_id"] != owner_id
@@ -86,14 +180,27 @@ class DirectAdmissions:
                     raise RuntimeConflict("direct request identity already has different ownership or content")
                 if previous["state"] != "RESERVED" or min(previous["deadline"], previous["lease_expires_at"]) <= observed:
                     return None
+                claimed = await row(c, """DELETE FROM runtime_direct_waiters
+                    WHERE request_id=:id AND owner_id=:owner RETURNING 1""",
+                    id=request.request_id, owner=owner_id)
+                if not claimed:
+                    return None
                 return DirectReservation(attempt_id=previous["attempt_id"], request=request,
-                    pool_id=pool_id, engine_epoch=previous["engine_epoch"], owner_id=owner_id)
-            pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id", id=pool_id)
+                    pool_id=pool_id, engine_epoch=previous["engine_epoch"], owner_id=owner_id,
+                    generation=previous["generation"])
             if (not pool or pool["health"] != "HEALTHY" or pool["valid_until"] <= observed
-                or request.deadline <= observed):
+                or request.deadline <= observed or pool["target"] == 0):
                 return None
+            if (request.expected_engine_epoch is not None
+                and request.expected_engine_epoch != pool["engine_epoch"]):
+                raise RuntimeConflict("proxy has an older engine epoch")
             profile = parse_pool(pool["spec"])
+            if initial and (pool["group_id"] != initial["group_id"]
+                or profile.kind != parse_pool(initial["spec"]).kind):
+                return None
             if (request.kind != profile.kind or request.model_profile != profile.model_profile
+                or (request.model_revision is not None
+                    and request.model_revision != profile.model_revision)
                 or request.capacity_profile_id != profile.profile_id
                 or request.request_bound > profile.request_limit
                 or request.batch_size > getattr(profile, "max_batch_size", 1)):
@@ -101,13 +208,30 @@ class DirectAdmissions:
             group = await row(c, "SELECT * FROM runtime_groups WHERE group_id=:id", id=pool["group_id"])
             used = await row(c, """SELECT count(*) AS group_used,
                 count(*) FILTER (WHERE a.pool_id=:pool) AS pool_used FROM runtime_inflight_attempts a
-                JOIN runtime_pools p USING(pool_id) WHERE a.compute_held AND p.group_id=:group""",
-                pool=pool_id, group=pool["group_id"])
-            if (group["health"] != "HEALTHY" or used["group_used"] >= group["hard_ceiling"]
-                or used["pool_used"] >= min(pool["target"], pool["hard_ceiling"])):
+                JOIN runtime_pools p USING(pool_id) WHERE a.compute_held AND p.group_id=:group
+                AND (:llm OR COALESCE(p.spec->>'kind','llm')<>'llm')""",
+                pool=pool_id, group=pool["group_id"], llm=profile.kind == "llm")
+            endpoint_limit = profile.transport_limit if profile.kind == "llm" else min(
+                pool["target"], pool["hard_ceiling"])
+            if (group["health"] != "HEALTHY"
+                or (profile.kind != "llm" and used["group_used"] >= group["hard_ceiling"])
+                or used["pool_used"] >= endpoint_limit):
                 return None
-            clock = (await row(c, "SELECT dispatch_clock FROM runtime_authority WHERE id=1"))["dispatch_clock"]
-            if clock % 5 == 4 and await _background_ready(c, pool["group_id"]):
+            if profile.kind == "llm" and request.workload_class != "qa":
+                usage = await endpoint_usage(c, pool_id)
+                if usage["lower_class"] >= profile.background_transport_limit:
+                    return None
+            first = await row(c, """SELECT request_id FROM runtime_direct_waiters
+                WHERE pool_id=:pool AND deadline>now()
+                ORDER BY CASE workload_class WHEN 'qa' THEN 0 WHEN 'user_task' THEN 1
+                    WHEN 'background' THEN 2 ELSE 3 END,created_at,request_id LIMIT 1""",
+                pool=pool_id)
+            if first and first["request_id"] != request.request_id:
+                return None
+            claimed = await row(c, """DELETE FROM runtime_direct_waiters
+                WHERE request_id=:id AND owner_id=:owner RETURNING 1""",
+                id=request.request_id, owner=owner_id)
+            if not claimed:
                 return None
             result = DirectReservation(attempt_id=str(uuid4()), request=request, pool_id=pool_id,
                                        engine_epoch=pool["engine_epoch"], owner_id=owner_id)
@@ -117,11 +241,11 @@ class DirectAdmissions:
                 id=result.attempt_id, request=request.request_id, tenant=request.tenant_id,
                 spec=request.model_dump_json(), pool=pool_id, epoch=result.engine_epoch, owner=owner_id,
                 lease=observed+timedelta(seconds=self.store.lease_seconds), deadline=request.deadline)
-            await execute(c, "UPDATE runtime_authority SET dispatch_clock=dispatch_clock+1 WHERE id=1")
+            await self.store._wake(c)
             return result
 
     async def _owned(self, c, reservation):
-        attempt = await row(c, "SELECT *,clock_timestamp() AS now FROM runtime_direct_attempts WHERE attempt_id=:id",
+        attempt = await row(c, "SELECT *,clock_timestamp() AS now FROM runtime_direct_attempts WHERE attempt_id=:id FOR UPDATE",
                             id=reservation.attempt_id)
         if (not attempt or attempt["owner_id"] != reservation.owner_id
             or attempt["spec"] != reservation.request.model_dump(mode="json")
@@ -132,7 +256,9 @@ class DirectAdmissions:
     async def mark_send(self, reservation):
         async with self.store.transaction() as c:
             a = await self._owned(c, reservation)
-            if a["state"] != "RESERVED" or min(a["deadline"], a["lease_expires_at"]) <= a["now"]:
+            if (a["state"] != "RESERVED" or a["deadline"] <= a["now"]
+                or (a["lease_expires_at"] <= a["now"]
+                    and not await self.store.owner_alive(c, reservation.owner_id))):
                 raise RuntimeConflict("direct attempt cannot send")
             await execute(c, """UPDATE runtime_direct_attempts SET state='SEND_INTENT',send_intent_at=now()
                 WHERE attempt_id=:id""", id=reservation.attempt_id)
@@ -140,10 +266,16 @@ class DirectAdmissions:
     async def heartbeat(self, reservation):
         async with self.store.transaction() as c:
             a = await self._owned(c, reservation)
-            if a["state"] not in {"RESERVED", "SEND_INTENT"} or min(a["deadline"], a["lease_expires_at"]) <= a["now"]:
+            owner_alive = await self.store.owner_alive(c, reservation.owner_id)
+            if (a["state"] not in {"RESERVED", "SEND_INTENT"}
+                or a["deadline"] <= a["now"]
+                or (not owner_alive and a["lease_expires_at"] <= a["now"])):
                 return False
-            await execute(c, "UPDATE runtime_direct_attempts SET lease_expires_at=:until WHERE attempt_id=:id",
-                until=min(a["deadline"], a["now"]+timedelta(seconds=self.store.lease_seconds)), id=reservation.attempt_id)
+            if not owner_alive:
+                # Legacy owner without process-level lease; old workers stay
+                # compatible until their live requests have drained.
+                await execute(c, "UPDATE runtime_direct_attempts SET lease_expires_at=:until WHERE attempt_id=:id",
+                    until=min(a["deadline"], a["now"]+timedelta(seconds=self.store.lease_seconds)), id=reservation.attempt_id)
             return True
 
     async def finish(self, reservation, evidence="completed_response"):

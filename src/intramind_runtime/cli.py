@@ -253,6 +253,17 @@ async def services(command, settings, config):
             except TimeoutError:
                 pass
 
+    async def heartbeat_owner(owner_id, boot_generation):
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=max(1, settings.lease_seconds / 3))
+            except TimeoutError:
+                try:
+                    await store.heartbeat_owner(owner_id, boot_generation)
+                except Exception:
+                    logging.exception("executor owner lease lost; stopping new dispatch")
+                    stop.set()
+
     try:
         if command in ("executor", "outbox"):
             await wakeup.start()
@@ -263,6 +274,9 @@ async def services(command, settings, config):
                 )
             return
         if command == "executor":
+            owner_id, boot_generation = "executor-" + str(uuid4()), str(uuid4())
+            await store.register_owner(owner_id, boot_generation)
+            tasks.append(asyncio.create_task(heartbeat_owner(owner_id, boot_generation)))
             blobs = artifacts(settings)
             await blobs.ready()
             speech = speech_profiles(config)
@@ -270,11 +284,14 @@ async def services(command, settings, config):
             for pool in config["pools"]:
                 if pool["admission"].get("kind") == "rerank":
                     continue
+                spec = parse_pool(pool["admission"])
                 driver = engine_driver(pool, speech, embeddings)
                 drivers.append(driver)
-                for _ in range(settings.executor_count):
+                workers = min(settings.executor_count,
+                    spec.background_transport_limit if spec.kind == "llm" else max(1, spec.target))
+                for _ in range(workers):
                     worker = Executor(
-                        store, blobs, driver, pool["admission"]["pool_id"], str(uuid4())
+                        store, blobs, driver, pool["admission"]["pool_id"], owner_id
                     )
                     tasks.append(asyncio.create_task(repeat(worker.tick, 5, on_events=True)))
         elif command == "reconciler":
