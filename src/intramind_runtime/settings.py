@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RUNTIME_", extra="ignore")
     database_url: SecretStr
     service_token: SecretStr = Field(min_length=32)
+    api_url: str = "http://runtime-api:8070"
     minio_endpoint: str
     minio_access_key: SecretStr
     minio_secret_key: SecretStr
@@ -19,6 +20,6 @@ class Settings(BaseSettings):
     temporal_namespace: str = "intramind"
     temporal_queue: str = "intramind-control"
     lease_seconds: int = Field(default=60, ge=10)
-    executor_count: int = Field(default=1, ge=1, le=128)
+    executor_count: int = Field(default=8, ge=1, le=128)
     pool_config: str = "config/pools.json"
     log_level: str = "INFO"

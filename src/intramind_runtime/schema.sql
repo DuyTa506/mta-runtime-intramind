@@ -41,7 +41,7 @@ CREATE TABLE runtime_pools (
     context_limit integer NOT NULL,
     model_profile text NOT NULL,
     health text NOT NULL DEFAULT 'HEALTHY',
-    valid_until timestamptz NOT NULL
+    valid_until timestamptz
 );
 CREATE TABLE runtime_operations (
     operation_id text PRIMARY KEY,

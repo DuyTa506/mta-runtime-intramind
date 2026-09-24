@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from conftest import operation, pool, root
-from fakes import MemoryArtifacts
+from fakes import MemoryArtifacts, TestPermits
 
 from intramind_runtime.api import create_app
 from intramind_runtime.client import RuntimeClient
@@ -15,6 +15,7 @@ from intramind_runtime.contracts import (
     EmbeddingOperationSpec,
     EmbeddingPoolSpec,
     Reservation,
+    RuntimeConflict,
     parse_operation,
     parse_pool,
 )
@@ -183,7 +184,7 @@ async def test_transport_retry_requires_not_sent_or_confirmed_termination(phase)
 
 
 @pytest.mark.integration
-async def test_embedding_budget_reservation_is_atomic_and_shares_group_capacity(store):
+async def test_embedding_budget_reservation_is_atomic_while_llm_transport_is_independent(store):
     await store.create_root(root(resource_budgets={"embedding_characters": 4}))
     await store.configure_pool(pool(), 1)
     await store.configure_pool(embedding_pool(), 1)
@@ -192,17 +193,24 @@ async def test_embedding_budget_reservation_is_atomic_and_shares_group_capacity(
     await store.submit_operation(operation())
     attempts = await asyncio.gather(*(store.reserve_next("embedding", str(i)) for i in range(8)))
     winners = [a for a in attempts if a]
-    assert len(winners) == 1 and await store.reserve_next("p", "llm") is None
+    assert len(winners) == 3
+    llm = await store.reserve_next("p", "llm")
+    assert llm is not None
+    await store.mark_send(llm)
     attempt = winners[0]
     await store.mark_send(attempt)
+    for waiting in winners[1:]:
+        with pytest.raises(RuntimeConflict, match="budget unavailable"):
+            await store.mark_send(waiting)
+        await store.fail(waiting, "budget_wait", not_sent=True)
     await store.compute_finished(attempt)
     for _ in range(2):
         await store.commit_result(attempt, attempt.operation.payload, 4)
     state = await store.run("r", "t")
-    assert state["reserved"] == state["spent"] == 0
+    assert state["reserved"] == 30 and state["spent"] == 0
     assert state["resource_budgets"]["embedding_characters"] == {"limit": 4, "reserved": 0, "spent": 4}
     assert await store.reserve_next("embedding", "next") is None
-    assert await store.reserve_next("p", "llm") is not None
+    assert await store.reserve_next("p", "llm") is None
 
 
 @pytest.mark.integration
@@ -272,7 +280,7 @@ async def test_embedding_result_persistence_failure_does_not_repeat_compute(stor
     monkeypatch.setattr(blobs, "put", flaky)
     async with httpx.AsyncClient(base_url="http://serving/", transport=httpx.MockTransport(backend)) as client:
         driver = ServingEmbeddingDriver("http://serving", profile(), client=client)
-        await asyncio.wait_for(Executor(store, blobs, driver, "embedding", "worker").tick(), 6)
+        await asyncio.wait_for(Executor(store, blobs, driver, "embedding", "worker", TestPermits()).tick(), 6)
     op = await store.operation("embedding", "t")
     body = json.loads(await blobs.get(Artifact.model_validate(op["result"])))
     assert op["state"] == "SUCCEEDED" and body["body"] == vectors() and len(calls) == 1

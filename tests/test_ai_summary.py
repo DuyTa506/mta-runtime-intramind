@@ -9,7 +9,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from conftest import pool, temporal_test_client
-from fakes import MemoryArtifacts
+from fakes import MemoryArtifacts, TestPermits
 from feature_harness import ai_language_activities, peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
@@ -129,7 +129,7 @@ async def test_summary_children_retry_publication_without_repeating_inference(
             )
 
     engine = Engine()
-    executor = Executor(store, blobs, engine, "p", "summary-executor-" + uid)
+    executor = Executor(store, blobs, engine, "p", "summary-executor-" + uid, TestPermits())
     publisher = OutboxPublisher(store, client, "summary-publisher-" + uid)
     broker = BrokerActivities(store, blobs)
     features = SummaryActivities(runtime_client, model_profile="test", tool_factory=lambda: tool)

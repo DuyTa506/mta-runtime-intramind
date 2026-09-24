@@ -38,6 +38,7 @@ neither replaces storage nor migrates buckets.
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `embedding` | Pinned document/query batches, vector validation and independent input accounting |
 | `direct` / `direct_proxy` | Shared compute reservations and direct HTTP streaming without Temporal |
+| `memory_scheduler` / `permits` | Runtime-api endpoint owner, RAM direct queue and service-token permits for durable executors |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
 | `uploads` | Bounded temporary files and concurrency for artifact ingestion |
 | `admin` | Namespace and pinned worker deployment administration |
@@ -64,6 +65,145 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc18` makes runtime-api the single capacity owner for direct and
+durable inference. Direct request identity, waiters and attempts stay in RAM;
+normal direct requests issue no PostgreSQL statements. Executors reserve their
+durable operation, acquire an HTTP permit with the existing service token,
+write `SEND_INTENT`, then send to the engine. On restart, runtime-api restores
+only sent or UNKNOWN durable attempts as held capacity; RESERVED attempts must
+acquire a fresh permit. A competing runtime-api owner is fenced. Migration
+`0007` makes the pool review date nullable; no client SDK change is required.
+Rollback to rc17 remains possible while every pool config supplies a future
+`valid_until` value.
+
+`RESERVED` identifies a durable waiter but holds neither compute nor budget and
+does not increase operation/root attempt counters. The `mark_send` transaction
+rechecks those limits and atomically charges the attempt and budget when the
+permit is available. A permit wait timeout retries immediately without using an
+attempt; unique ledger attempt numbers remain separate from the number of sent
+attempts. This keeps the existing permit identity/recovery protocol intact and
+avoids holding budget throughout a capacity wait.
+
+Durable permit waiters retain their operation's `created_at` position if an
+unsent reservation expires and the executor reserves again. A later request in
+the same priority class cannot jump ahead simply because the retry has a new
+attempt ID. The executor's retry backoff uses the number of attempts actually
+sent, not the ledger reservation number. A budget change between reservation
+and `SEND_INTENT` yields `send_attempts_exhausted` or `send_budget_unavailable`
+and retries without sending engine traffic.
+
+`valid_until` is an optional review date in rc18, not a capacity cutoff. Once
+past, runtime-api logs at most one warning per pool per hour and exports
+`intramind_runtime_pool_valid_until_seconds{pool}` as signed seconds remaining.
+An unset date has no gauge sample. Deployments that may roll back to rc17 must
+still supply a future date, because rc17 treats it as a dispatch cutoff.
+Legacy terminal direct attempts older than one day and no longer holding
+compute are pruned during reconciliation; unsettled attempts remain available
+for recovery.
+
+An unclean runtime-api exit marks each pool dirty until the former owner's
+lease expires plus its `restart_drain_seconds`. The field is optional per pool
+in `pools.json` and defaults to that pool's `attempt_timeout_seconds` (or
+1,800 seconds). It changes recovery gating, not durable attempt deadlines.
+LLM pools can clear sooner on two idle `/slots` probes. A blocked pool exports
+`intramind_runtime_dirty_recovery_blocked` and logs a warning. Native compute
+can outlive an HTTP disconnect, so these finite windows should be reviewed
+against serving latency measurements as load changes.
+
+In three warmed mock-serving runs per backlog, 100 QA requests arrived at
+100/s across four endpoints; every run completed 100/100. Median results were:
+
+| Background backlog | Dispatch p95 | Dispatch p99 | Process CPU |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.77 ms | 3.58 ms | 29.38% |
+| 1,000 | 0.74 ms | 0.83 ms | 24.15% |
+| 10,000 | 0.68 ms | 0.81 ms | 23.75% |
+
+The benchmark runs against the disposable PostgreSQL database on port 55440;
+the timed direct request path does not use it. Mock serving and a local
+single-process scheduler do not substitute for the stage soak and crash gate.
+
+Version `0.2.0rc17` removes a direct waiter if caller cancellation interrupts
+the return from an already-committed enqueue, before a producer exists to own
+cleanup. Each direct request now has one deadline beginning at the authenticated
+route entry and covering body read, prompt sizing, proxy startup, capacity wait,
+transport, retry wait and confirmed-engine recovery. Defaults are 600 seconds
+for `qa`, 1,800 for `user_task`, and the pool's `attempt_timeout_seconds`
+(default 1,800) for `background` and `maintenance`. A pool entry may override
+these with `workload_deadline_seconds`, for example
+`{"qa": 600, "user_task": 1800, "background": 900, "maintenance": 300}`;
+values must be positive and no greater than 86,400 seconds. Authenticated
+callers may supply `X-Intramind-Deadline-Seconds` to shorten, never extend,
+their class limit. `inference_scope(..., deadline_seconds=N)` sets this header
+through the SDK. Stream timeouts end in an `intramind.error` with
+`reason=deadline_exceeded`, exposed on `DirectStreamError.reason`; non-stream
+timeouts return HTTP 504 JSON with the same reason. A timeout after send does
+not prove engine termination: its UNKNOWN attempt keeps compute held until the
+existing fenced recovery path confirms the old engine stopped. No schema
+migration is needed beyond rc15's additive migration `0006`. Eight paired
+disposable mock-serving runs, each with 100 QA requests at 100/s across four
+endpoints and 1,000 background waiters, completed every request without
+starvation. Enqueue-commit to send-intent p95 values in pair order (ms) were:
+
+| Version | Paired p95 samples (ms) | Median |
+| --- | --- | ---: |
+| rc16 | 854.62, 821.86, 825.56, 935.17, 842.69, 842.93, 719.85, 812.45 | 834.13 |
+| rc17 | 833.37, 774.84, 921.42, 918.36, 924.13, 888.15, 868.21, 938.18 | 903.26 |
+
+The rc17 median is 8.3% above rc16 on this test, within the accepted 15%
+release guard; individual pairs varied more. The planned p95 50 ms/p99 200 ms
+dispatch target remains open and requires separate coordinator architecture
+work. These synthetic runs are not stage load qualification.
+
+Version `0.2.0rc16` fixes a dispatcher ordering race exposed by concurrent
+enqueue: PostgreSQL's waiter `created_at` may precede the order in which
+transactions return to Python. Direct proxies now sort by the committed waiter
+timestamp and request ID, exactly matching the ledger's selection order. Without
+this, one endpoint could keep retrying a later request while an earlier waiter
+remained queued. The optional synthetic load harness is
+`tests/benchmarks/bench_dispatch.py`; run it explicitly against the guarded
+disposable `runtime_test` database. It uses mock serving, not LLM jobs. Its
+end-to-end latency includes database admission/settlement and must be measured
+again on stage hardware before declaring a throughput target met. On the
+disposable PostgreSQL database, 100 QA requests at 100/s across four endpoints
+with 1,000 background waiters all completed against mock serving, but
+enqueue-commit to send-intent was p95 730 ms/p99 747 ms, above the planned
+50 ms/200 ms dispatch target. The 10,000-waiter and 30-minute soak gates remain
+unverified; do not count this synthetic run as a load acceptance pass.
+
+Version `0.2.0rc15` adds migration `0006` and endpoint-scoped llama.cpp
+backpressure. Apply `python -m alembic upgrade head` before starting rc15 API,
+executor and reconciler processes; build the pinned wheel with `uv build` or
+`make build`. Keep old worker images for Temporal histories pinned to earlier
+build IDs. The schema is additive and old attempt owners retain their lease path.
+
+For llama.cpp, `admission.target` is an endpoint enable/drain setting, while
+`transport_limit` bounds all accepted HTTP inference and
+`background_transport_limit` bounds **combined** non-QA direct and durable
+inference. The engine's own parallel slots and FIFO remain its serving authority.
+For a measured answer/tool setup of 2/8 non-QA slots, set respectively
+`target=hard_ceiling=background_transport_limit=2` and `=8`, with
+`transport_limit=64` on each endpoint to leave QA headroom. The GPU group ceiling
+does not serialize LLM endpoints; native speech/embedding/rerank group limits
+remain. Set engine `--parallel` independently to 2/8 only after serving
+qualification. The default executor count is 8 and each LLM pool starts at most
+its lower-class cap in workers. These values are safety bounds, not a 4:1
+scheduling ratio or a measured production capacity claim.
+
+Authenticated application adapters bind `inference_scope` to a trusted workload
+class (`qa`, `user_task`, `background`, `maintenance`). QA classification follows
+the request through summary/tool subcalls. `DirectBinding.stream_events` exposes
+ordered `waiting`, `resumed`, `recovering`, `generation_reset` and token events;
+a stream is successful only after `[DONE]`. Waiting streams emit SSE heartbeats
+at most 15 seconds apart. No client retries uncertain inference. The host
+watchdog first calls `quiesce-engine --pool ... --epoch ... --token ...`, then
+`inspect-engine --pool ...`; only independently verified old container/child
+termination permits `confirm-epoch-stopped --pool ... --epoch ... --evidence
+'{...}' --recover`. After updating the engine epoch and running `configure`,
+runtime may retry a bounded leaf generation. A still-live engine may be resumed
+only by the same token via `resume-engine --pool ... --epoch ... --token ...` after
+unsettled compute reaches zero. Timeout alone never grants recovery.
 
 Version `0.2.0rc10` adds `DirectBinding`, `DirectRouting` and `inference_scope` for
 application callers. The binding supplies a scoped HTTP auth adapter and a direct

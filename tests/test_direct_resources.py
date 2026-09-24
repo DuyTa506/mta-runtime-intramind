@@ -2,7 +2,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import httpx
 import pytest
@@ -14,8 +14,8 @@ from test_embedding import embedding_pool, profile
 from intramind_runtime.api import create_app
 from intramind_runtime.cli import direct_proxies
 from intramind_runtime.contracts import RerankPoolSpec, parse_pool
-from intramind_runtime.direct import DirectAdmissions
 from intramind_runtime.direct_proxy import DirectProxy
+from intramind_runtime.memory_scheduler import MemoryScheduler
 from intramind_runtime.rerank import RerankProfile
 
 
@@ -49,7 +49,9 @@ async def test_direct_resource_route_forwards_native_payload_without_artifact_or
         assert result.status_code == 200
         bound = 8 if kind == "embedding" else 5
         proxy.open.assert_awaited_once_with("owner", payload, request_bound=bound,
-                                            path=f"api/v1/{path}", batch_size=2)
+                                            path=f"api/v1/{path}", batch_size=2,
+                                            workload_class="background", logical_request_id=None,
+                                            deadline_seconds=None, started_at_monotonic=ANY)
         proxy.open.reset_mock()
         invalid = {"texts": ["x" * 25]} if kind == "embedding" else payload | {"query": "x" * 101}
         assert (await client.post(f"/v1/direct/{spec.model_profile}/api/v1/{path}", json=invalid)).status_code == 422
@@ -88,8 +90,10 @@ async def test_direct_resource_configuration_pins_proof_profile_and_response_lim
 
 
 @pytest.mark.parametrize("kind,valid", [(kind, valid) for kind in ("embedding", "rerank") for valid in (True, False)])
-async def test_direct_proxy_rejects_invalid_native_output_before_publishing(kind, valid):
+@pytest.mark.integration
+async def test_direct_proxy_rejects_invalid_native_output_before_publishing(store, kind, valid):
     spec = embedding_pool() if kind == "embedding" else rerank_pool()
+    await store.configure_pool(spec, 2)
     qualification = profile() if kind == "embedding" else rerank_profile()
     payload = {"texts": ["a"]} if kind == "embedding" else {"query": "q", "documents": ["a"]}
     body = ({"embeddings": [[0.1, 0.2]] if valid else [[0.1]], "dimension": 2, "model": "native"}
@@ -101,11 +105,8 @@ async def test_direct_proxy_rejects_invalid_native_output_before_publishing(kind
             f"X-Intramind-{kind.title()}-Contract": "termination-v1",
             "X-Intramind-Compute-State": "terminated", "X-Intramind-Model-Revision": spec.model_revision})
 
-    proxy = DirectProxy(SimpleNamespace(lease_seconds=30), pool=spec, profile=qualification,
+    proxy = DirectProxy(store, pool=spec, profile=qualification,
         client=httpx.AsyncClient(base_url="http://native/", transport=httpx.MockTransport(upstream)))
-    proxy.admission = SimpleNamespace(reserve=AsyncMock(return_value=SimpleNamespace(
-        attempt_id="attempt-1", engine_epoch=spec.engine_epoch)), mark_send=AsyncMock(),
-        heartbeat=AsyncMock(return_value=True), finish=AsyncMock(), unknown=AsyncMock())
     try:
         response = await proxy.open("t", payload, request_bound=2)
         returned = json.loads(b"".join([chunk async for chunk in response.body_iterator]))
@@ -114,23 +115,28 @@ async def test_direct_proxy_rejects_invalid_native_output_before_publishing(kind
             assert returned == body
         else:
             assert "error" in returned
-        proxy.admission.finish.assert_awaited_once()
-        proxy.admission.unknown.assert_not_awaited()
+        assert (await store.drain_status())["compute_held"] == 0
     finally:
         await proxy.close()
 
 
 @pytest.mark.integration
-async def test_rerank_direct_and_background_share_the_same_resource_group(store):
+async def test_rerank_direct_does_not_serialize_llm_transport(store):
     from test_direct_admission import request
 
     await store.configure_pool(pool(), 1)
     await store.configure_pool(rerank_pool(), 1)
     await store.create_root(root())
     await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
-    held = await direct.reserve(request(kind="rerank", batch_size=2), "rerank", "owner")
+    direct = MemoryScheduler(store)
+    await direct.start()
+    direct_request = request(kind="rerank", batch_size=2)
+    await direct.enqueue(direct_request, "rerank", "owner")
+    held = await direct.reserve(direct_request, "rerank", "owner")
     assert held is not None
-    assert await store.reserve_next("p", "background") is None
+    reservation = await store.reserve_next("p", "background")
+    assert reservation is not None
+    await store.mark_send(reservation)
     await direct.finish(held, evidence="not_sent")
-    assert await store.reserve_next("p", "background") is not None
+    assert (await store.drain_status())["compute_held"] == 1
+    await direct.close()

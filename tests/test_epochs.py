@@ -56,10 +56,11 @@ async def test_confirm_epoch_stopped_command_reports_the_settled_count():
     report = await confirm_epoch_stopped(store, "tool", "2026-09-22T05:44:39Z", "process exited")
 
     store.confirm_epoch_stopped.assert_awaited_once_with(
-        "tool", "2026-09-22T05:44:39Z", "process exited"
+        "tool", "2026-09-22T05:44:39Z", "process exited", recover=False
     )
     assert report == {
         "pool_id": "tool",
         "engine_epoch": "2026-09-22T05:44:39Z",
         "settled": 2,
+        "recovery_requested": False,
     }

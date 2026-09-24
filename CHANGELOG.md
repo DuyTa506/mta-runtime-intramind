@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.2.0rc18 — unreleased
+
+- Move direct request identities, waiters and permits to one runtime-api memory
+  scheduler per endpoint. Direct enqueue, grant, send and settle do not query
+  PostgreSQL. Durable executors obtain service-token HTTP permits from the same
+  owner before sending and retain UNKNOWN capacity until termination evidence.
+- Recover sent durable attempts on API restart, fence competing owners, and
+  bound native dirty-pool recovery by per-pool `restart_drain_seconds` (default:
+  the pool attempt timeout). Durable attempt timeouts are unchanged.
+- Charge durable operation/root attempts and reserve budget atomically at
+  `SEND_INTENT`, after a permit is acquired. A timed-out permit wait consumes
+  neither an attempt nor budget and is eligible to run as soon as capacity
+  returns; already-charged RESERVED rows from older images are not charged twice.
+- Keep durable retries in their original operation queue position, distinguish
+  send-budget rejection from worker fencing, and base backoff on sent attempts.
+  Migration `0007` makes `valid_until` an optional review date with warning and
+  signed-seconds metric rather than a dispatch cutoff. Reconciliation prunes
+  settled legacy direct attempts older than one day without touching held work.
+- Three 100 QA/s mock-serving runs at each backlog completed 100/100. Median
+  dispatch p95/p99/CPU were 1.77/3.58 ms/29.38% (0),
+  0.74/0.83 ms/24.15% (1,000), and 0.68/0.81 ms/23.75% (10,000).
+
+## 0.2.0rc17 — unreleased
+
+- Remove a direct waiter if its enqueue committed but the caller was cancelled
+  before a producer could take ownership of cleanup.
+- Bound each direct logical request across prompt sizing, owner startup,
+  capacity waiting, transport, retry and confirmed-engine recovery. Per-workload
+  defaults are configurable; callers can only shorten them through a trusted
+  header. Deadline responses carry the stable `deadline_exceeded` reason, while
+  unconfirmed sent compute remains held for fenced recovery.
+- In eight paired 100 QA/s mock-serving runs with 1,000 background waiters,
+  dispatch p95 medians were 834.13 ms (rc16) and 903.26 ms (rc17): +8.3%,
+  within the accepted 15% release guard. The p95 50 ms/p99 200 ms dispatch
+  target remains open for separate coordinator architecture work; all individual
+  paired p95 values are recorded in README.
+
+## 0.2.0rc16 — unreleased
+
+- Use PostgreSQL's committed waiter timestamp to prevent direct endpoint
+  dispatch starvation when concurrent enqueues return out of order.
+- Add an explicit mock-serving benchmark for concurrent QA with a bounded
+  background queue; it is separate from default tests.
+
+## 0.2.0rc15 — unreleased
+
+- Migration `0006` adds process owner leases, endpoint-scoped admission and bounded
+  direct waiters without a global lock on every inference grant.
+- Trusted QA/workload routing, shared lower-class transport caps and SSE
+  wait/recovery controls let chat wait its turn without silent inference retry.
+- Token-fenced host quiesce and structured stopped-epoch proof authorize bounded
+  generation recovery; unknown compute remains held until proof.
+
 ## 0.2.0rc6 — unreleased
 
 - `TaskContext.embedding_outcome` exposes only confirmed terminal backend failures

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from conftest import operation, pool, root
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 from pydantic import SecretStr
 
 from intramind_runtime import cli
@@ -30,6 +30,8 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
         commit_result=AsyncMock(),
         unknown=AsyncMock(),
         fail=AsyncMock(),
+        register_owner=AsyncMock(),
+        heartbeat_owner=AsyncMock(),
         close=AsyncMock(),
     )
     blobs = MemoryArtifacts()
@@ -57,6 +59,9 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
     monkeypatch.setattr(cli, "Store", lambda *args, **kwargs: store)
     monkeypatch.setattr(cli, "artifacts", lambda _settings: blobs)
     monkeypatch.setattr(cli, "OpenAICompletionDriver", lambda *args: engine)
+    permits = TestPermits()
+    permits.close = AsyncMock()
+    monkeypatch.setattr(cli, "PermitClient", lambda *_args: permits)
     wakeup = SimpleNamespace(generation=0, start=AsyncMock(), close=AsyncMock())
     monkeypatch.setattr(cli, "Wakeup", lambda _url: wakeup)
     callbacks = {}
@@ -67,6 +72,7 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
     monkeypatch.setenv("SHUTDOWN_TEST_KEY", "local-fake-key")
     settings = SimpleNamespace(
         database_url=SecretStr("unused"), lease_seconds=60, executor_count=1,
+        api_url="http://runtime-api:8070", service_token=SecretStr("s" * 32),
     )
     config = {"pools": [{
         "base_url": "http://unused.invalid", "api_key_env": "SHUTDOWN_TEST_KEY",
@@ -101,3 +107,4 @@ async def test_sigterm_waits_for_pending_output_and_does_not_dispatch_again(monk
     store.fail.assert_not_awaited()
     store.close.assert_awaited_once()
     engine.close.assert_awaited_once()
+    permits.close.assert_awaited_once()

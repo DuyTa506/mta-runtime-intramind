@@ -18,6 +18,7 @@ from .preparation import PrepareRequest
 from .speech import SpeechPrepareRequest
 from .store import Store, row
 from .uploads import ArtifactUploads
+from .workload import workload_for_task
 
 
 class Submission(Contract):
@@ -29,6 +30,20 @@ class Submission(Contract):
 
 class RunSnapshotRequest(Contract):
     run_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(min_length=1, max_length=100)
+
+
+class PermitRequest(Contract):
+    attempt_id: str = Field(min_length=1, max_length=200)
+    pool_id: str = Field(min_length=1, max_length=200)
+    owner_id: str = Field(min_length=1, max_length=200)
+    engine_epoch: str = Field(min_length=1, max_length=200)
+    workload_class: str
+    deadline: datetime
+
+
+class PermitIdentity(Contract):
+    attempt_id: str = Field(min_length=1, max_length=200)
+    owner_id: str = Field(min_length=1, max_length=200)
 
 
 def create_app(
@@ -45,6 +60,7 @@ def create_app(
     artifact_max_bytes=MAX_ARTIFACT_BYTES,
     artifact_upload_concurrency=2,
     direct_proxies=None,
+    scheduler=None,
 ) -> FastAPI:
     if len(service_token) < 32:
         raise ValueError("service token must contain at least 32 characters")
@@ -54,10 +70,16 @@ def create_app(
         try:
             if manage_lifecycle:
                 await artifacts.ready()
+            if scheduler is not None:
+                await scheduler.start()
+                for proxy in (direct_proxies or {}).values():
+                    await proxy.start()
             yield
         finally:
             for proxy in (direct_proxies or {}).values():
                 await proxy.close()
+            if scheduler is not None:
+                await scheduler.close()
             if manage_lifecycle:
                 for preparer in (preparers or {}).values():
                     await preparer.client.aclose()
@@ -76,6 +98,35 @@ def create_app(
         if not identity or len(identity) > 200:
             raise HTTPException(400, "verified tenant identity required")
         return identity
+
+    async def service(request: Request):
+        provided = request.headers.get("authorization", "")
+        if not hmac.compare_digest(provided.encode(), f"Bearer {service_token}".encode()):
+            raise HTTPException(401, "trusted service authentication required")
+        return True
+
+    if scheduler is not None:
+        @app.post("/internal/permits/acquire")
+        async def acquire_permit(body: PermitRequest, trusted=Depends(service)):
+            try:
+                permit = await scheduler.durable(body.attempt_id, body.pool_id,
+                    body.owner_id, body.engine_epoch, body.workload_class, body.deadline)
+            except TimeoutError as exc:
+                raise HTTPException(504, str(exc)) from exc
+            return {"attempt_id": permit.attempt_id, "pool_id": permit.pool_id,
+                "engine_epoch": permit.engine_epoch,
+                "lease_seconds": store.lease_seconds,
+                "boot_generation": scheduler.boot_generation}
+
+        @app.post("/internal/permits/heartbeat")
+        async def heartbeat_permit(body: PermitIdentity, trusted=Depends(service)):
+            scheduler.durable_heartbeat(body.attempt_id, body.owner_id)
+            return {"ok": True, "boot_generation": scheduler.boot_generation}
+
+        @app.post("/internal/permits/release")
+        async def release_permit(body: PermitIdentity, trusted=Depends(service)):
+            await scheduler.durable_release(body.attempt_id, body.owner_id)
+            return {"ok": True}
 
     from .direct_routes import register
 
@@ -169,7 +220,7 @@ def create_app(
     async def metrics():
         from .metrics import snapshot
 
-        return Response(await snapshot(store), media_type="text/plain; version=0.0.4")
+        return Response(await snapshot(store, scheduler), media_type="text/plain; version=0.0.4")
 
     @app.post("/v1/artifacts", response_model=Artifact)
     async def upload(request: Request, tenant_id=Depends(tenant)):
@@ -201,7 +252,7 @@ def create_app(
             deadline=deadline,
             budget_limit=definition["budget_limit"],
             resource_budgets=definition.get("resource_budgets", {}),
-            priority=definition.get("priority", "background"),
+            priority=workload_for_task(request.task_type, definition),
         )
         # Stable submit intent excludes wall-clock deadline; retries attach to
         # the original root and cannot extend its lifetime.

@@ -5,6 +5,7 @@ from conftest import operation, pool, root
 from sqlalchemy import text
 
 from intramind_runtime.contracts import AdmissionDenied, RuntimeConflict
+from intramind_runtime.memory_scheduler import MemoryScheduler
 
 pytestmark = pytest.mark.integration
 
@@ -63,11 +64,20 @@ async def setup(store, *, target=2, group_ceiling=2, budget=10000, count=3):
         await store.submit_operation(operation(f"o{i}"))
 
 
-async def test_last_permit_and_budget_are_atomic(store):
+async def test_last_budget_is_charged_atomically_at_send(store):
     await setup(store, target=4, group_ceiling=4, budget=30)
     reservations = await asyncio.gather(*(store.reserve_next("p", str(i)) for i in range(12)))
-    assert len([r for r in reservations if r]) == 1
+    pending = [r for r in reservations if r]
+    assert len(pending) == 3
+    assert (await store.run("r", "t"))["reserved"] == 0
+    await store.mark_send(pending[0])
+    for waiting in pending[1:]:
+        with pytest.raises(RuntimeConflict, match="budget unavailable"):
+            await store.mark_send(waiting)
+        await store.fail(waiting, "budget_wait", not_sent=True)
     assert (await store.run("r", "t"))["reserved"] == 30
+    async with store.engine.connect() as c:
+        assert (await c.execute(text("SELECT attempts FROM runtime_roots WHERE root_id='r'"))).scalar_one() == 1
 
 
 async def test_idempotency_and_conflicting_input(store):
@@ -81,14 +91,36 @@ async def test_idempotency_and_conflicting_input(store):
 
 async def test_unknown_retains_budget_and_compute_after_lease(store):
     await setup(store, target=1)
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
     r = await store.reserve_next("p", "a")
     await store.mark_send(r)
     async with store.engine.begin() as c:
         await c.execute(text("UPDATE runtime_attempts SET lease_expires_at=now()-interval '1 second'"))
     await store.reconcile_expired()
-    assert await store.reserve_next("p", "b") is None
+    assert (await store.run("r", "t"))["reserved"] == 30
+    # reserve_next now selects durable work; only runtime-api grants capacity.
+    queued = await store.reserve_next("p", "b")
+    assert queued is not None
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    pending = asyncio.create_task(scheduler.durable(
+        queued.attempt_id, queued.pool_id, queued.owner_id,
+        queued.engine_epoch, queued.workload_class, queued.attempt_deadline))
+    try:
+        await asyncio.sleep(0.05)
+        assert not pending.done()
+        assert set(scheduler.permits) == {r.attempt_id}
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await scheduler.close()
     assert (await store.operation("o0", "t"))["state"] == "RECONCILING"
     assert (await store.run("r", "t"))["reserved"] == 30
+    async with store.engine.connect() as c:
+        waiting = (await c.execute(text("SELECT compute_held,budget_held FROM runtime_attempts WHERE attempt_id=:id"),
+                                  {"id": queued.attempt_id})).one()
+        assert waiting == (False, False)
 
 
 async def test_expired_before_send_refunds_once_and_fences_worker(store):
@@ -110,11 +142,11 @@ async def test_compute_release_separate_from_idempotent_result_settle(store):
     await store.mark_send(r)
     await store.compute_finished(r)
     assert await store.reserve_next("p", "b")
-    assert (await store.run("r", "t"))["reserved"] == 60
+    assert (await store.run("r", "t"))["reserved"] == 30
     await store.commit_result(r, r.operation.payload, 12)
     await store.commit_result(r, r.operation.payload, 12)
     ledger = await store.run("r", "t")
-    assert (ledger["reserved"], ledger["spent"]) == (30, 12)
+    assert (ledger["reserved"], ledger["spent"]) == (0, 12)
     assert (await store.operation("o0", "t"))["state"] == "SUCCEEDED"
 
 
@@ -132,18 +164,18 @@ async def test_cancel_does_not_refund_or_publish_late_result(store):
     assert (await store.run("r", "t"))["spent"] == 30
 
 
-async def test_two_pools_share_physical_capacity(store):
+async def test_two_llm_pools_keep_independent_transport_capacity(store):
     await setup(store, group_ceiling=1)
     await store.configure_pool(pool("p2"), 1)
     results = await asyncio.gather(store.reserve_next("p", "a"), store.reserve_next("p2", "b"))
-    assert len([r for r in results if r]) == 1
+    assert len([r for r in results if r]) == 2
 
 
 async def test_target_drop_drains_and_rejects_stale_envelope(store):
     await setup(store)
     await store.reserve_next("p", "a")
     await store.reserve_next("p", "b")
-    await store.update_target("p", 1, 1, "test_congestion")
+    await store.update_target("p", 0, 1, "test_congestion")
     assert await store.reserve_next("p", "c") is None
     with pytest.raises(RuntimeConflict):
         await store.update_target("p", 2, 1, "stale")
