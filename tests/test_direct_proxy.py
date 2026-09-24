@@ -415,6 +415,36 @@ async def test_dispatcher_uses_committed_waiter_order_when_enqueue_returns_out_o
         await proxy.close()
 
 
+async def test_cancel_after_enqueue_commit_removes_waiter_without_producer(store):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1)
+    await store.configure_pool(spec, 1)
+    proxy = DirectProxy(store, pool=spec, client=httpx.AsyncClient(
+        base_url="http://engine/v1/", transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"data: [DONE]\n\n"))))
+    original_enqueue = proxy.admission.enqueue
+    committed = asyncio.Event()
+
+    async def paused_enqueue(*args, **kwargs):
+        result = await original_enqueue(*args, **kwargs)
+        committed.set()
+        await asyncio.Event().wait()
+        return result
+
+    proxy.admission.enqueue = paused_enqueue
+    try:
+        opening = asyncio.create_task(proxy.open("tenant", PAYLOAD,
+            request_bound=30, workload_class="qa"))
+        await asyncio.wait_for(committed.wait(), 5)
+        opening.cancel()
+        await asyncio.gather(opening, return_exceptions=True)
+        async with store.engine.connect() as connection:
+            assert (await connection.execute(text(
+                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one() == 0
+        assert not proxy._pending
+    finally:
+        await proxy.close()
+
+
 async def test_stale_proxy_epoch_does_not_send_to_the_reconfigured_pool(store):
     spec = pool(target=1)
     await store.configure_pool(spec, 1)

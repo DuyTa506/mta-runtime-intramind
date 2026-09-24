@@ -65,6 +65,10 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
+Version `0.2.0rc17` removes a direct waiter if caller cancellation interrupts
+the return from an already-committed enqueue, before a producer exists to own
+cleanup. It retains the rc16 admission and wire contracts.
+
 Version `0.2.0rc16` fixes a dispatcher ordering race exposed by concurrent
 enqueue: PostgreSQL's waiter `created_at` may precede the order in which
 transactions return to Python. Direct proxies now sort by the committed waiter
