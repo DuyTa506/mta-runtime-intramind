@@ -168,7 +168,7 @@ class DirectProxy:
                 logger.exception("Direct recovery observation failed pool=%s", self.pool.pool_id)
         pending = sorted(self._pending.values(), key=lambda item: (
             {"qa": 0, "user_task": 1, "background": 2, "maintenance": 3}[item[0].workload_class],
-            item[2]))
+            item[2], item[0].request_id))
         dispatched = 0
         for request, future, _, previous_attempt_id in pending[:8]:
             if future.done():
@@ -247,9 +247,9 @@ class DirectProxy:
             request_bound=request_bound, batch_size=batch_size,
             workload_class=workload_class, logical_request_id=logical_request_id,
             deadline=datetime(3000, 1, 1, tzinfo=UTC))
-        await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
         future = asyncio.get_running_loop().create_future()
-        self._pending[request.request_id] = (request, future, datetime.now(UTC), None)
+        self._pending[request.request_id] = (request, future, queued_at, None)
         self._pending_signal.set()
         channel = _Channel()
         headers = asyncio.get_running_loop().create_future()
@@ -418,10 +418,10 @@ class DirectProxy:
 
     async def _queue_retry(self, reservation, channel, streaming):
         request = reservation.request
-        await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
         future = asyncio.get_running_loop().create_future()
         replacement = None
-        self._pending[request.request_id] = (request, future, datetime.now(UTC), reservation.attempt_id)
+        self._pending[request.request_id] = (request, future, queued_at, reservation.attempt_id)
         self._pending_signal.set()
         try:
             if streaming:

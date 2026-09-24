@@ -61,19 +61,21 @@ class DirectAdmissions:
                 if (existing["tenant_id"] != request.tenant_id or existing["pool_id"] != pool_id
                     or existing["owner_id"] != owner_id or existing["workload_class"] != request.workload_class):
                     raise RuntimeConflict("direct waiting identity conflict")
-                return
+                return existing["created_at"]
             counts = await row(c, """SELECT count(*) AS endpoint,
                 count(*) FILTER(WHERE tenant_id=:tenant) AS tenant
                 FROM runtime_direct_waiters WHERE pool_id=:pool AND deadline>now()""",
                 tenant=request.tenant_id, pool=pool_id)
             if counts["endpoint"] >= endpoint_limit or counts["tenant"] >= tenant_limit:
                 raise AdmissionDenied("inference waiting buffer full", retryable=True)
-            await execute(c, """INSERT INTO runtime_direct_waiters
+            inserted = await row(c, """INSERT INTO runtime_direct_waiters
                 (request_id,tenant_id,pool_id,owner_id,workload_class,deadline)
-                VALUES (:id,:tenant,:pool,:owner,:workload,:deadline)""",
+                VALUES (:id,:tenant,:pool,:owner,:workload,:deadline)
+                RETURNING created_at""",
                 id=request.request_id, tenant=request.tenant_id, pool=pool_id,
                 owner=owner_id, workload=request.workload_class, deadline=request.deadline)
             await self.store._wake(c)
+            return inserted["created_at"]
 
     async def leave(self, request_id: str, owner_id: str):
         async with self.store.transaction() as c:

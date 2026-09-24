@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0rc16 — unreleased
+
+- Use PostgreSQL's committed waiter timestamp to prevent direct endpoint
+  dispatch starvation when concurrent enqueues return out of order.
+- Add an explicit mock-serving benchmark for concurrent QA with a bounded
+  background queue; it is separate from default tests.
+
 ## 0.2.0rc15 — unreleased
 
 - Migration `0006` adds process owner leases, endpoint-scoped admission and bounded

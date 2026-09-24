@@ -65,6 +65,22 @@ client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
 
+Version `0.2.0rc16` fixes a dispatcher ordering race exposed by concurrent
+enqueue: PostgreSQL's waiter `created_at` may precede the order in which
+transactions return to Python. Direct proxies now sort by the committed waiter
+timestamp and request ID, exactly matching the ledger's selection order. Without
+this, one endpoint could keep retrying a later request while an earlier waiter
+remained queued. The optional synthetic load harness is
+`tests/benchmarks/bench_dispatch.py`; run it explicitly against the guarded
+disposable `runtime_test` database. It uses mock serving, not LLM jobs. Its
+end-to-end latency includes database admission/settlement and must be measured
+again on stage hardware before declaring a throughput target met. On the
+disposable PostgreSQL database, 100 QA requests at 100/s across four endpoints
+with 1,000 background waiters all completed against mock serving, but
+enqueue-commit to send-intent was p95 730 ms/p99 747 ms, above the planned
+50 ms/200 ms dispatch target. The 10,000-waiter and 30-minute soak gates remain
+unverified; do not count this synthetic run as a load acceptance pass.
+
 Version `0.2.0rc15` adds migration `0006` and endpoint-scoped llama.cpp
 backpressure. Apply `python -m alembic upgrade head` before starting rc15 API,
 executor and reconciler processes; build the pinned wheel with `uv build` or

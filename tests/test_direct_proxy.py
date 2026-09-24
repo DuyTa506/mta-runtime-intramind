@@ -298,6 +298,55 @@ async def test_dispatcher_recovers_after_wakeup_exception(store, monkeypatch):
         await proxy.close()
 
 
+async def test_dispatcher_uses_committed_waiter_order_when_enqueue_returns_out_of_order(store):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1)
+    await store.configure_pool(spec, 1)
+    calls = []
+
+    async def backend(request):
+        calls.append(request)
+        return httpx.Response(200, content=b"data: [DONE]\n\n",
+                              headers={"Content-Type": "text/event-stream"})
+
+    proxy = DirectProxy(store, pool=spec, client=httpx.AsyncClient(
+        base_url="http://engine/v1/", transport=httpx.MockTransport(backend)))
+    original_enqueue = proxy.admission.enqueue
+    first_committed = asyncio.Event()
+    release_first = asyncio.Event()
+    enqueues = 0
+
+    async def reordered_enqueue(*args, **kwargs):
+        nonlocal enqueues
+        enqueues += 1
+        order = enqueues
+        created_at = await original_enqueue(*args, **kwargs)
+        if order == 1:
+            first_committed.set()
+            await release_first.wait()
+        return created_at
+
+    proxy.admission.enqueue = reordered_enqueue
+    first = asyncio.create_task(proxy.open("tenant", PAYLOAD, request_bound=30,
+        workload_class="qa"))
+    try:
+        await asyncio.wait_for(first_committed.wait(), 5)
+        second_response = await asyncio.wait_for(proxy.open("tenant", PAYLOAD,
+            request_bound=30, workload_class="qa"), 5)
+        release_first.set()
+        first_response = await asyncio.wait_for(first, 5)
+        completed = await asyncio.wait_for(asyncio.gather(
+            consume(first_response), consume(second_response)), 8)
+        assert all(b"[DONE]" in body for body in completed)
+        assert len(calls) == 2
+        assert (await store.drain_status())["compute_held"] == 0
+    finally:
+        release_first.set()
+        if not first.done():
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+        await proxy.close()
+
+
 async def test_stale_proxy_epoch_does_not_send_to_the_reconfigured_pool(store):
     spec = pool(target=1)
     await store.configure_pool(spec, 1)
