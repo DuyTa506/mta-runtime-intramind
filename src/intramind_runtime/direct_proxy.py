@@ -197,12 +197,12 @@ class DirectProxy:
                 continue
             if reservation.engine_epoch != self.pool.engine_epoch:
                 if previous_attempt_id is None:
-                    await self._settle(reservation, "not_sent")
                     pending_entry = self._pending.get(request.request_id)
                     if pending_entry is not None and pending_entry[1] is future:
                         self._pending.pop(request.request_id, None)
                     if not future.done():
                         future.set_exception(RuntimeConflict("proxy has an older engine epoch"))
+                    await self._settle(reservation, "not_sent")
                     continue
                 self.pool = self.pool.model_copy(update={"engine_epoch": reservation.engine_epoch})
             self._pending.pop(request.request_id, None)

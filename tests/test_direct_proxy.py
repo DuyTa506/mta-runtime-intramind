@@ -298,6 +298,74 @@ async def test_dispatcher_recovers_after_wakeup_exception(store, monkeypatch):
         await proxy.close()
 
 
+async def test_dispatch_done_callback_logs_unexpected_termination(caplog):
+    proxy = DirectProxy(None, pool=pool(), client=None)
+
+    async def broken_dispatch():
+        raise OSError("unexpected dispatcher exit")
+
+    task = asyncio.create_task(broken_dispatch())
+    task.add_done_callback(proxy._dispatch_done)
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert "Direct endpoint dispatcher stopped" in caplog.text
+    assert "unexpected dispatcher exit" in caplog.text
+
+
+async def test_epoch_mismatch_finish_failure_does_not_strand_waiter(store):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1)
+    await store.configure_pool(spec, 1)
+    backend_calls = []
+
+    async def backend(request):
+        backend_calls.append(request)
+        return httpx.Response(200, content=b"data: [DONE]\n\n",
+                              headers={"Content-Type": "text/event-stream"})
+
+    proxy = DirectProxy(store, pool=spec, client=httpx.AsyncClient(
+        base_url="http://engine/v1/", transport=httpx.MockTransport(backend)))
+    original_reserve = proxy.admission.reserve
+    original_finish = proxy.admission.finish
+    finish_calls = 0
+    changed = False
+
+    async def change_proxy_epoch(*args, **kwargs):
+        nonlocal changed
+        reservation = await original_reserve(*args, **kwargs)
+        if reservation is not None and not changed:
+            changed = True
+            proxy.pool = spec.model_copy(update={"engine_epoch": "local-replacement"})
+        return reservation
+
+    async def fail_first_finish(reservation, *, evidence):
+        nonlocal finish_calls
+        finish_calls += 1
+        if finish_calls == 1:
+            raise OSError("transient settlement failure")
+        return await original_finish(reservation, evidence=evidence)
+
+    proxy.admission.reserve = change_proxy_epoch
+    proxy.admission.finish = fail_first_finish
+    try:
+        response = await proxy.open("tenant", PAYLOAD, request_bound=30, workload_class="qa")
+        body = await asyncio.wait_for(consume(response), 5)
+        assert b"admission_error" in body and b"older engine epoch" in body
+        async with asyncio.timeout(5):
+            while (await store.drain_status())["compute_held"] or proxy._settlements:
+                await asyncio.sleep(0.01)
+        assert finish_calls >= 2 and backend_calls == []
+        assert not proxy._dispatch_task.done()
+        async with store.engine.connect() as connection:
+            assert (await connection.execute(text(
+                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one() == 0
+        proxy.pool = spec
+        response = await proxy.open("tenant", PAYLOAD, request_bound=30, workload_class="qa")
+        assert b"[DONE]" in await asyncio.wait_for(consume(response), 5)
+        assert len(backend_calls) == 1
+    finally:
+        await proxy.close()
+
+
 async def test_dispatcher_uses_committed_waiter_order_when_enqueue_returns_out_of_order(store):
     spec = pool(target=1, transport_limit=1, background_transport_limit=1)
     await store.configure_pool(spec, 1)
