@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0rc17 — unreleased
+
+- Remove a direct waiter if its enqueue committed but the caller was cancelled
+  before a producer could take ownership of cleanup.
+
 ## 0.2.0rc16 — unreleased
 
 - Use PostgreSQL's committed waiter timestamp to prevent direct endpoint

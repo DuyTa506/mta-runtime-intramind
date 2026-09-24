@@ -247,7 +247,16 @@ class DirectProxy:
             request_bound=request_bound, batch_size=batch_size,
             workload_class=workload_class, logical_request_id=logical_request_id,
             deadline=datetime(3000, 1, 1, tzinfo=UTC))
-        queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        try:
+            queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        except BaseException:
+            # Enqueue can commit before caller cancellation is observed. No
+            # producer exists yet to remove the resulting waiter.
+            try:
+                await asyncio.shield(self.admission.leave(request.request_id, self.owner_id))
+            except Exception:
+                logger.exception("Direct enqueue cleanup failed request=%s", request.request_id)
+            raise
         future = asyncio.get_running_loop().create_future()
         self._pending[request.request_id] = (request, future, queued_at, None)
         self._pending_signal.set()
