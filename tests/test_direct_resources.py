@@ -14,8 +14,8 @@ from test_embedding import embedding_pool, profile
 from intramind_runtime.api import create_app
 from intramind_runtime.cli import direct_proxies
 from intramind_runtime.contracts import RerankPoolSpec, parse_pool
-from intramind_runtime.direct import DirectAdmissions
 from intramind_runtime.direct_proxy import DirectProxy
+from intramind_runtime.memory_scheduler import MemoryScheduler
 from intramind_runtime.rerank import RerankProfile
 
 
@@ -128,11 +128,15 @@ async def test_rerank_direct_does_not_serialize_llm_transport(store):
     await store.configure_pool(rerank_pool(), 1)
     await store.create_root(root())
     await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
+    direct = MemoryScheduler(store)
+    await direct.start()
     direct_request = request(kind="rerank", batch_size=2)
     await direct.enqueue(direct_request, "rerank", "owner")
     held = await direct.reserve(direct_request, "rerank", "owner")
     assert held is not None
-    assert await store.reserve_next("p", "background") is not None
+    reservation = await store.reserve_next("p", "background")
+    assert reservation is not None
+    await store.mark_send(reservation)
     await direct.finish(held, evidence="not_sent")
     assert (await store.drain_status())["compute_held"] == 1
+    await direct.close()

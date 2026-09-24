@@ -53,10 +53,19 @@ async def serve(app):
         listener.close()
 
 
-async def attempt(store, attempt_id):
-    async with store.engine.connect() as connection:
-        return (await connection.execute(text("""SELECT state,compute_held FROM runtime_direct_attempts
-            WHERE attempt_id=:id"""), {"id": attempt_id})).mappings().one()
+def attempt(proxy, attempt_id):
+    entry = proxy.admission.direct_attempts[attempt_id]
+    return {"state": entry.state,
+            "compute_held": attempt_id in proxy.admission.permits}
+
+
+def direct_held(proxy):
+    return sum(p.kind == "direct" for p in proxy.admission.permits.values())
+
+
+def direct_unknown(proxy):
+    return sum(p.kind == "direct" and p.state == "UNKNOWN"
+               for p in proxy.admission.permits.values())
 
 
 async def consume(response):
@@ -79,6 +88,7 @@ async def test_stream_is_delivered_before_completion_and_disconnect_drains_backe
         backend_calls.append(await request.json())
         assert request.headers.get("X-Intramind-Attempt-ID")
         assert request.headers["X-Intramind-Expected-Revision"] == "model-1"
+        assert "X-Conversation-Id" not in request.headers
 
         async def chunks():
             try:
@@ -121,14 +131,20 @@ async def test_stream_is_delivered_before_completion_and_disconnect_drains_backe
                         assert not upstream_closed.is_set()
                     await asyncio.wait_for(downstream_closed.wait(), timeout=5)
                     assert not upstream_closed.is_set()
-                    assert (await store.drain_status())["compute_held"] == 1
-                    assert await store.reserve_next("p", "background-owner") is None
+                    assert direct_held(proxy) == 1
+                    durable_reservation = await store.reserve_next("p", "background-owner")
+                    durable_task = asyncio.create_task(proxy.admission.durable(
+                        durable_reservation.attempt_id, "p", "background-owner",
+                        durable_reservation.engine_epoch, durable_reservation.workload_class,
+                        durable_reservation.attempt_deadline))
+                    await asyncio.sleep(0)
+                    assert not durable_task.done()
                     finish.set()
                     await asyncio.wait_for(upstream_closed.wait(), timeout=5)
                     async with asyncio.timeout(5):
-                        while (await store.drain_status())["compute_held"]:
+                        while direct_held(proxy):
                             await asyncio.sleep(0.01)
-                    assert await store.reserve_next("p", "background-owner") is not None
+                    assert (await asyncio.wait_for(durable_task, 5)).attempt_id == durable_reservation.attempt_id
                     assert backend_calls == [PAYLOAD]
             async with store.engine.connect() as connection:
                 assert (await connection.execute(text("SELECT count(*) FROM runtime_outbox"))).scalar_one() == 0
@@ -151,9 +167,9 @@ async def test_refused_connection_releases_only_the_unsent_attempt(store):
             response = await proxy.open("tenant", PAYLOAD | {"stream": False}, request_bound=30)
             assert response.status_code == 502
             assert json.loads(await consume(response))["error"]
-            state = await attempt(store, response.headers["X-Intramind-Attempt-ID"])
+            state = attempt(proxy, response.headers["X-Intramind-Attempt-ID"])
             assert state == {"state": "FAILED_NOT_SENT", "compute_held": False}
-            assert (await store.drain_status())["unsettled_attempts"] == 0
+            assert direct_held(proxy) == 0
         finally:
             await proxy.close()
 
@@ -203,14 +219,11 @@ async def test_detach_during_reservation_cannot_leak_a_permit(store, detach_phas
         release.set()
         release_control.set()
         async with asyncio.timeout(5):
-            while (await store.drain_status())["compute_held"]:
+            while direct_held(proxy):
                 await asyncio.sleep(0.01)
-        async with store.engine.connect() as connection:
-            state = (await connection.execute(text(
-                "SELECT state,compute_held FROM runtime_direct_attempts"))).mappings().one()
-            waiters = (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one()
-        assert state == {"state": "FAILED_NOT_SENT", "compute_held": False}
+        state = next(iter(proxy.admission.direct_attempts.values()))
+        waiters = len(proxy.admission.waiters)
+        assert state.state == "FAILED_NOT_SENT" and state.attempt_id not in proxy.admission.permits
         assert waiters == 0 and backend_calls == []
     finally:
         release.set()
@@ -257,7 +270,7 @@ async def test_transient_orphan_settlement_failure_does_not_stop_next_request(st
         assert b"[DONE]" in streamed and len(backend_calls) == 1
         assert calls >= 2 and not proxy._settlements
         assert not proxy._dispatch_task.done()
-        assert (await store.drain_status())["compute_held"] == 0
+        assert direct_held(proxy) == 0
     finally:
         await proxy.close()
 
@@ -266,34 +279,29 @@ async def test_dispatcher_recovers_after_wakeup_exception(store, monkeypatch):
     spec = pool(target=1, transport_limit=1, background_transport_limit=1)
     await store.configure_pool(spec, 1)
 
-    class FlakyWakeup:
-        generation = 0
-        calls = 0
-
-        async def wait(self, generation, timeout):
-            self.calls += 1
-            if self.calls == 1:
-                raise OSError("wakeup connection reset")
-            await asyncio.sleep(0.05)
-
-    wakeup = FlakyWakeup()
-
-    async def direct_wakeup():
-        return wakeup
-
-    monkeypatch.setattr(store, "direct_wakeup", direct_wakeup)
     upstream = httpx.AsyncClient(base_url="http://engine/v1/", transport=httpx.MockTransport(
         lambda request: httpx.Response(200, content=b"data: [DONE]\n\n",
             headers={"Content-Type": "text/event-stream"})))
     proxy = DirectProxy(store, client=upstream, pool=spec)
+    original_wait = proxy._pending_signal.wait
+    calls = 0
+
+    async def flaky_wait():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("in-memory wakeup failed")
+        await original_wait()
+
+    monkeypatch.setattr(proxy._pending_signal, "wait", flaky_wait)
     try:
         await proxy.start()
         async with asyncio.timeout(5):
-            while not wakeup.calls:
+            while not calls:
                 await asyncio.sleep(0.01)
         response = await proxy.open("tenant", PAYLOAD, request_bound=30)
         assert b"[DONE]" in await asyncio.wait_for(consume(response), 8)
-        assert wakeup.calls >= 1 and not proxy._dispatch_task.done()
+        assert calls >= 1 and not proxy._dispatch_task.done()
     finally:
         await proxy.close()
 
@@ -351,13 +359,11 @@ async def test_epoch_mismatch_finish_failure_does_not_strand_waiter(store):
         body = await asyncio.wait_for(consume(response), 5)
         assert b"admission_error" in body and b"older engine epoch" in body
         async with asyncio.timeout(5):
-            while (await store.drain_status())["compute_held"] or proxy._settlements:
+            while direct_held(proxy) or proxy._settlements:
                 await asyncio.sleep(0.01)
         assert finish_calls >= 2 and backend_calls == []
         assert not proxy._dispatch_task.done()
-        async with store.engine.connect() as connection:
-            assert (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one() == 0
+        assert not proxy.admission.waiters
         proxy.pool = spec
         response = await proxy.open("tenant", PAYLOAD, request_bound=30, workload_class="qa")
         assert b"[DONE]" in await asyncio.wait_for(consume(response), 5)
@@ -406,7 +412,7 @@ async def test_dispatcher_uses_committed_waiter_order_when_enqueue_returns_out_o
             consume(first_response), consume(second_response)), 8)
         assert all(b"[DONE]" in body for body in completed)
         assert len(calls) == 2
-        assert (await store.drain_status())["compute_held"] == 0
+        assert direct_held(proxy) == 0
     finally:
         release_first.set()
         if not first.done():
@@ -437,9 +443,7 @@ async def test_cancel_after_enqueue_commit_removes_waiter_without_producer(store
         await asyncio.wait_for(committed.wait(), 5)
         opening.cancel()
         await asyncio.gather(opening, return_exceptions=True)
-        async with store.engine.connect() as connection:
-            assert (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one() == 0
+        assert not proxy.admission.waiters
         assert not proxy._pending
     finally:
         await proxy.close()
@@ -462,9 +466,7 @@ async def test_stale_proxy_epoch_does_not_send_to_the_reconfigured_pool(store):
         assert response.status_code == 503
         assert json.loads(await consume(response))["error"]
         assert calls == []
-        async with store.engine.connect() as connection:
-            assert (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_attempts"))).scalar_one() == 0
+        assert proxy.admission.direct_attempts == {}
     finally:
         await proxy.close()
 
@@ -495,10 +497,10 @@ async def test_incomplete_stream_waits_for_proof_then_resets_generation(store, f
         response = await proxy.open("tenant", PAYLOAD, request_bound=30)
         consuming = asyncio.create_task(consume(response))
         async with asyncio.timeout(5):
-            while (await store.drain_status())["unknown_attempts"] == 0:
+            while direct_unknown(proxy) == 0:
                 await asyncio.sleep(0.01)
         assert backend_calls and len(backend_calls) == 1
-        assert (await store.drain_status())["compute_held"] == 1
+        assert direct_held(proxy) == 1
         await asyncio.sleep(0.1)
         assert not consuming.done(), "timeout or EOF alone must never retry inference"
         token = "watchdog-test-owner"
@@ -509,13 +511,13 @@ async def test_incomplete_stream_waits_for_proof_then_resets_generation(store, f
             "process_started_at": "2026-09-24T01:00:00Z",
             "verified_stopped_at": "2026-09-24T01:01:00Z",
         })
-        assert await store.confirm_epoch_stopped("p", "e1", proof, recover=True) == 1
+        assert await store.confirm_epoch_stopped("p", "e1", proof, recover=True) == 0
         await store.configure_pool(spec.model_copy(update={"engine_epoch": "e2"}), 1)
         streamed = await asyncio.wait_for(consuming, timeout=10)
         assert b"hello" in streamed and b"recovered" in streamed
         assert streamed.index(b"generation_reset") < streamed.index(b"recovered")
         assert len(backend_calls) == 2
-        assert (await store.drain_status())["compute_held"] == 0
+        assert direct_held(proxy) == 0
     finally:
         await proxy.close()
 
@@ -563,7 +565,7 @@ async def test_embedding_proof_headers_are_preserved_and_invalid_proof_blocks_ve
         else:
             assert response.status_code == 502
             assert "embeddings" not in json.loads(await consume(response))
-        assert (await store.drain_status())["compute_held"] == (
+        assert direct_held(proxy) == (
             1 if response_kind in {"missing_proof", "foreign_proof"} else 0
         )
     finally:

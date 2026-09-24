@@ -58,14 +58,19 @@ async def test_character_budget_is_reserved_atomically_and_does_not_charge_llm_t
         await store.submit_operation(speech(str(index)))
     results = await asyncio.gather(*(store.reserve_next("voice", str(i)) for i in range(8)))
     reserved = [result for result in results if result]
-    assert len(reserved) == 1
+    assert len(reserved) == 3
     state = await store.run("r", "t")
     assert (state["reserved"], state["spent"]) == (0, 0)
     assert state["resource_budgets"]["speech_characters"] == {
-        "limit": 12, "reserved": 12, "spent": 0,
+        "limit": 12, "reserved": 0, "spent": 0,
     }
     attempt = reserved[0]
     await store.mark_send(attempt)
+    for waiting in reserved[1:]:
+        with pytest.raises(contracts.RuntimeConflict, match="budget unavailable"):
+            await store.mark_send(waiting)
+        await store.fail(waiting, "budget_wait", not_sent=True)
+    assert (await store.run("r", "t"))["resource_budgets"]["speech_characters"]["reserved"] == 12
     await store.compute_finished(attempt)
     await store.commit_result(attempt, attempt.operation.payload, 12)
     await store.commit_result(attempt, attempt.operation.payload, 12)
@@ -86,7 +91,12 @@ async def test_speech_and_completion_share_group_capacity_and_root_attempt_limit
     await store.submit_operation(speech())
     await store.submit_operation(operation())
     attempt = await store.reserve_next("voice", "speech-worker")
-    assert await store.reserve_next("p", "llm-worker") is None
+    waiting = await store.reserve_next("p", "llm-worker")
+    assert waiting is not None
+    await store.mark_send(attempt)
+    with pytest.raises(contracts.RuntimeConflict, match="attempt budget"):
+        await store.mark_send(waiting)
+    await store.fail(waiting, "root_attempt_budget", not_sent=True, retry=True)
     await store.fail(attempt, "connect_failed", not_sent=True)
     assert await store.reserve_next("p", "llm-worker") is None
     assert (await store.operation("o", "t"))["wait_reason"] == "root_attempt_budget"

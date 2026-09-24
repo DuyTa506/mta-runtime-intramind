@@ -38,6 +38,7 @@ neither replaces storage nor migrates buckets.
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `embedding` | Pinned document/query batches, vector validation and independent input accounting |
 | `direct` / `direct_proxy` | Shared compute reservations and direct HTTP streaming without Temporal |
+| `memory_scheduler` / `permits` | Runtime-api endpoint owner, RAM direct queue and service-token permits for durable executors |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
 | `uploads` | Bounded temporary files and concurrency for artifact ingestion |
 | `admin` | Namespace and pinned worker deployment administration |
@@ -64,6 +65,64 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc18` makes runtime-api the single capacity owner for direct and
+durable inference. Direct request identity, waiters and attempts stay in RAM;
+normal direct requests issue no PostgreSQL statements. Executors reserve their
+durable operation, acquire an HTTP permit with the existing service token,
+write `SEND_INTENT`, then send to the engine. On restart, runtime-api restores
+only sent or UNKNOWN durable attempts as held capacity; RESERVED attempts must
+acquire a fresh permit. A competing runtime-api owner is fenced. Migration
+`0007` makes the pool review date nullable; no client SDK change is required.
+Rollback to rc17 remains possible while every pool config supplies a future
+`valid_until` value.
+
+`RESERVED` identifies a durable waiter but holds neither compute nor budget and
+does not increase operation/root attempt counters. The `mark_send` transaction
+rechecks those limits and atomically charges the attempt and budget when the
+permit is available. A permit wait timeout retries immediately without using an
+attempt; unique ledger attempt numbers remain separate from the number of sent
+attempts. This keeps the existing permit identity/recovery protocol intact and
+avoids holding budget throughout a capacity wait.
+
+Durable permit waiters retain their operation's `created_at` position if an
+unsent reservation expires and the executor reserves again. A later request in
+the same priority class cannot jump ahead simply because the retry has a new
+attempt ID. The executor's retry backoff uses the number of attempts actually
+sent, not the ledger reservation number. A budget change between reservation
+and `SEND_INTENT` yields `send_attempts_exhausted` or `send_budget_unavailable`
+and retries without sending engine traffic.
+
+`valid_until` is an optional review date in rc18, not a capacity cutoff. Once
+past, runtime-api logs at most one warning per pool per hour and exports
+`intramind_runtime_pool_valid_until_seconds{pool}` as signed seconds remaining.
+An unset date has no gauge sample. Deployments that may roll back to rc17 must
+still supply a future date, because rc17 treats it as a dispatch cutoff.
+Legacy terminal direct attempts older than one day and no longer holding
+compute are pruned during reconciliation; unsettled attempts remain available
+for recovery.
+
+An unclean runtime-api exit marks each pool dirty until the former owner's
+lease expires plus its `restart_drain_seconds`. The field is optional per pool
+in `pools.json` and defaults to that pool's `attempt_timeout_seconds` (or
+1,800 seconds). It changes recovery gating, not durable attempt deadlines.
+LLM pools can clear sooner on two idle `/slots` probes. A blocked pool exports
+`intramind_runtime_dirty_recovery_blocked` and logs a warning. Native compute
+can outlive an HTTP disconnect, so these finite windows should be reviewed
+against serving latency measurements as load changes.
+
+In three warmed mock-serving runs per backlog, 100 QA requests arrived at
+100/s across four endpoints; every run completed 100/100. Median results were:
+
+| Background backlog | Dispatch p95 | Dispatch p99 | Process CPU |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.77 ms | 3.58 ms | 29.38% |
+| 1,000 | 0.74 ms | 0.83 ms | 24.15% |
+| 10,000 | 0.68 ms | 0.81 ms | 23.75% |
+
+The benchmark runs against the disposable PostgreSQL database on port 55440;
+the timed direct request path does not use it. Mock serving and a local
+single-process scheduler do not substitute for the stage soak and crash gate.
 
 Version `0.2.0rc17` removes a direct waiter if caller cancellation interrupts
 the return from an already-committed enqueue, before a producer exists to own

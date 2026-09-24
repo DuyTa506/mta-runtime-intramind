@@ -159,7 +159,7 @@ class _PoolSpec(Contract):
     # qualified target/group envelope until their own proof contract changes.
     transport_limit: int = Field(default=64, ge=1, le=4096)
     background_transport_limit: int = Field(default=8, ge=1, le=4096)
-    valid_until: datetime
+    valid_until: datetime | None = None
     capabilities: frozenset[str] = frozenset()
 
     @field_serializer("capabilities")
@@ -172,7 +172,7 @@ class _PoolSpec(Contract):
             raise ValueError("target exceeds hard ceiling")
         if self.background_transport_limit > self.transport_limit:
             raise ValueError("background transport limit exceeds endpoint transport limit")
-        if self.valid_until.tzinfo is None:
+        if self.valid_until is not None and self.valid_until.tzinfo is None:
             raise ValueError("valid_until must include timezone")
         return self
 
@@ -236,7 +236,9 @@ class Reservation(Contract):
     model_revision: str
     owner_id: str
     lease_epoch: int
+    sent_attempts: int = 0
     attempt_deadline: datetime
+    workload_class: Literal["qa", "user_task", "background", "maintenance"] = "background"
 
     @field_validator("attempt_deadline")
     @classmethod
@@ -272,6 +274,16 @@ class CancelOutcome(StrEnum):
 
 class RuntimeConflict(Exception):
     """A stable identity was reused with different content or ownership."""
+
+
+class SendBudgetUnavailable(RuntimeConflict):
+    """The reserved attempt cannot be sent under the current root limits."""
+
+    def __init__(self, reason: Literal["send_attempts_exhausted", "send_budget_unavailable"]):
+        self.reason = reason
+        detail = ("attempt budget exhausted before send" if reason == "send_attempts_exhausted"
+                  else "resource budget unavailable before send")
+        super().__init__(f"{reason}: {detail}")
 
 
 class AdmissionDenied(Exception):

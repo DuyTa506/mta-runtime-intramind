@@ -1,10 +1,17 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
+from time import monotonic
 
 import pytest
 from conftest import operation, pool, root
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
+from test_embedding import embedding, embedding_pool
 
+from intramind_runtime.contracts import EmbeddingResult
+from intramind_runtime.direct import DirectRequest
 from intramind_runtime.executor import Executor
+from intramind_runtime.memory_scheduler import MemoryScheduler
+from intramind_runtime.store import row
 
 pytestmark = pytest.mark.integration
 
@@ -17,7 +24,84 @@ async def prepare(store):
     blobs.data[spec.payload.key] = b'{"messages":[{"role":"user","content":"test"}]}'
     await store.submit_operation(spec)
     engine = IndependentEngine()
-    return engine, Executor(store, blobs, engine, "p", "executor")
+    return engine, Executor(store, blobs, engine, "p", "executor", TestPermits())
+
+
+async def test_embedding_qa_capacity_wait_does_not_spend_durable_attempt_or_budget(store):
+    await store.create_root(root(max_attempts=1,
+                                 resource_budgets={"embedding_characters": 4}))
+    await store.configure_pool(embedding_pool(target=1, transport_limit=1,
+                                              background_transport_limit=1), 1)
+    blobs = MemoryArtifacts()
+    payload = await blobs.put("t", b'{"texts":["ab","cd"],"input_type":"document"}')
+    spec = embedding(max_attempts=1, attempt_timeout_seconds=0.3).model_copy(
+        update={"payload": payload})
+    await store.submit_operation(spec)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+
+    class Permits:
+        async def acquire(self, reservation):
+            return await scheduler.durable(
+                reservation.attempt_id, reservation.pool_id, reservation.owner_id,
+                reservation.engine_epoch, reservation.workload_class,
+                reservation.attempt_deadline)
+
+        async def heartbeat(self, reservation):
+            scheduler.durable_heartbeat(reservation.attempt_id, reservation.owner_id)
+
+        async def release(self, reservation):
+            await scheduler.durable_release(reservation.attempt_id, reservation.owner_id)
+
+    class EmbeddingEngine:
+        calls = 0
+
+        async def execute(self, reservation, payload):
+            self.calls += 1
+            return EmbeddingResult(body={"embeddings": [[0.1], [0.2]]}, characters=4)
+
+        async def cancel(self, reservation):
+            raise AssertionError("QA capacity wait must not send to the engine")
+
+    engine = EmbeddingEngine()
+    executor = Executor(store, blobs, engine, "embedding", "worker", Permits())
+    qa = DirectRequest(request_id="qa-occupies-embedding", tenant_id="t",
+        payload_digest="a" * 64, model_profile="embedding-test",
+        capacity_profile_id="embed-v1", kind="embedding", request_bound=4,
+        batch_size=2, workload_class="qa",
+        deadline=datetime.now(UTC) + timedelta(minutes=1))
+    await scheduler.enqueue(qa, "embedding", "qa-owner")
+    held = await scheduler.reserve(qa, "embedding", "qa-owner")
+    assert held is not None
+    await scheduler.mark_send(held)
+    try:
+        started = monotonic()
+        assert await executor.tick()
+        assert monotonic() - started >= 0.3
+        assert engine.calls == 0
+        assert (await store.operation(spec.operation_id, "t"))["attempts"] == 0
+        state = await store.run("r", "t")
+        assert state["reserved"] == 0
+        assert state["resource_budgets"]["embedding_characters"]["reserved"] == 0
+        async with store.engine.connect() as c:
+            root_attempts = await row(c, "SELECT attempts FROM runtime_roots WHERE root_id='r'")
+            first = await row(c, """SELECT state,compute_held,budget_held FROM runtime_attempts
+                WHERE operation_id=:id""", id=spec.operation_id)
+        assert root_attempts["attempts"] == 0
+        assert dict(first) == {"state": "FAILED_NOT_SENT", "compute_held": False,
+                               "budget_held": False}
+        await scheduler.finish(held)
+        assert await executor.tick(), "background work must run as soon as QA releases the slot"
+        assert engine.calls == 1
+        assert (await store.operation(spec.operation_id, "t"))["state"] == "SUCCEEDED"
+        assert (await store.operation(spec.operation_id, "t"))["attempts"] == 1
+        async with store.engine.connect() as c:
+            assert (await row(c, "SELECT attempts FROM runtime_roots WHERE root_id='r'"))["attempts"] == 1
+        assert (await store.run("r", "t"))["resource_budgets"]["embedding_characters"] == {
+            "limit": 4, "reserved": 0, "spent": 4}
+        assert not scheduler.permits
+    finally:
+        await scheduler.close()
 
 
 async def test_transport_cancel_does_not_stop_backend_or_release_quota(store):

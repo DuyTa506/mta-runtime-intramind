@@ -28,6 +28,8 @@ from .drivers import OpenAICompletionDriver
 from .embedding import EmbeddingPreparer, EmbeddingProfile, ServingEmbeddingDriver
 from .epochs import epoch_lags_engine
 from .executor import Executor
+from .memory_scheduler import MemoryScheduler
+from .permits import PermitClient
 from .preparation import LlamaCppPromptSizer
 from .rerank import RerankProfile
 from .settings import Settings
@@ -160,7 +162,7 @@ def engine_driver(pool, speech, embeddings=None):
     return OpenAICompletionDriver(pool["base_url"], os.environ[pool["api_key_env"]], pool["model"])
 
 
-def direct_proxies(config, store, sizing):
+def direct_proxies(config, store, sizing, scheduler=None):
     """Enable direct HTTP only for one qualified, pinned pool per model profile."""
     from .direct_proxy import DirectProxy
 
@@ -189,6 +191,7 @@ def direct_proxies(config, store, sizing):
         selected[spec.model_profile] = (pool, spec, profile, api_key)
     return {
         key: DirectProxy(store, pool=spec, model=pool.get("model"), profile=profile,
+            scheduler=scheduler,
             timeout_seconds=pool.get("attempt_timeout_seconds", 1800),
             workload_deadline_seconds=pool.get("workload_deadline_seconds"),
             max_response_bytes=profile.max_response_bytes if profile else 16*1024*1024,
@@ -234,6 +237,7 @@ async def services(command, settings, config):
     store = Store(settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds)
     tasks = []
     drivers = []
+    permit_client = None
     wakeup = Wakeup(settings.database_url.get_secret_value())
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -276,6 +280,8 @@ async def services(command, settings, config):
                 )
             return
         if command == "executor":
+            permit_client = PermitClient(settings.api_url,
+                                         settings.service_token.get_secret_value())
             owner_id, boot_generation = "executor-" + str(uuid4()), str(uuid4())
             await store.register_owner(owner_id, boot_generation)
             tasks.append(asyncio.create_task(heartbeat_owner(owner_id, boot_generation)))
@@ -293,7 +299,8 @@ async def services(command, settings, config):
                     spec.background_transport_limit if spec.kind == "llm" else max(1, spec.target))
                 for _ in range(workers):
                     worker = Executor(
-                        store, blobs, driver, pool["admission"]["pool_id"], owner_id
+                        store, blobs, driver, pool["admission"]["pool_id"], owner_id,
+                        permit_client
                     )
                     tasks.append(asyncio.create_task(repeat(worker.tick, 5, on_events=True)))
         elif command == "reconciler":
@@ -344,6 +351,8 @@ async def services(command, settings, config):
                 await task
         for driver in drivers:
             await driver.close()
+        if permit_client is not None:
+            await permit_client.close()
         await wakeup.close()
         await store.close()
 
@@ -361,6 +370,17 @@ def main():
     config = json.loads(Path(settings.pool_config).read_text())
     if args.command == "api":
         store = Store(settings.database_url.get_secret_value(), lease_seconds=settings.lease_seconds)
+        slot_probes = {pool["admission"]["pool_id"]: (
+            pool["base_url"].rstrip("/").removesuffix("/v1"), pool["model"],
+            os.environ[pool["api_key_env"]]) for pool in config["pools"]
+            if pool["admission"].get("kind", "llm") == "llm" and
+            pool.get("api_key_env") and pool.get("base_url") and pool.get("model")}
+        scheduler = MemoryScheduler(store, grace_seconds=10, slot_probes=slot_probes,
+            attempt_timeouts={pool["admission"]["pool_id"]:
+                pool.get("attempt_timeout_seconds", 1800) for pool in config["pools"]},
+            restart_drain_seconds={pool["admission"]["pool_id"]:
+                pool["restart_drain_seconds"] for pool in config["pools"]
+                if "restart_drain_seconds" in pool})
         sizing = preparers(config)
         app = create_app(
             store,
@@ -376,7 +396,8 @@ def main():
                                  for key, profile in embedding_profiles(config).items()},
             artifact_max_bytes=settings.artifact_max_bytes,
             artifact_upload_concurrency=settings.artifact_upload_concurrency,
-            direct_proxies=direct_proxies(config, store, sizing),
+            direct_proxies=direct_proxies(config, store, sizing, scheduler),
+            scheduler=scheduler,
         )
         uvicorn.run(app, host="0.0.0.0", port=8070)
     else:

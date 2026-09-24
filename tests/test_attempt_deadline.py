@@ -6,7 +6,7 @@ from datetime import timedelta
 import httpx
 import pytest
 from conftest import operation, pool, root
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 from pydantic import ValidationError
 
 from intramind_runtime.contracts import RuntimeConflict
@@ -89,7 +89,7 @@ async def prepared_executor(store, *, timeout=0.5):
     artifacts.data[spec.payload.key] = b'{"messages":[{"role":"user","content":"test"}]}'
     await store.submit_operation(spec)
     engine = IndependentEngine()
-    return engine, Executor(store, artifacts, engine, "p", "worker")
+    return engine, Executor(store, artifacts, engine, "p", "worker", TestPermits())
 
 
 @pytest.mark.integration
@@ -105,7 +105,7 @@ async def test_total_timeout_releases_only_when_transport_has_not_started(store,
         await asyncio.wait_for(executor.tick(), 5)
         state = await store.operation("o", "t")
         assert state["state"] == ("RECONCILING" if sent else "RETRY_WAIT")
-        assert state["attempts"] == 1
+        assert state["attempts"] == int(sent)
         assert len(engine.calls) == int(sent)
         assert engine.finished == []
         assert (await store.run("r", "t"))["reserved"] == (30 if sent else 0)

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0rc18 — unreleased
+
+- Move direct request identities, waiters and permits to one runtime-api memory
+  scheduler per endpoint. Direct enqueue, grant, send and settle do not query
+  PostgreSQL. Durable executors obtain service-token HTTP permits from the same
+  owner before sending and retain UNKNOWN capacity until termination evidence.
+- Recover sent durable attempts on API restart, fence competing owners, and
+  bound native dirty-pool recovery by per-pool `restart_drain_seconds` (default:
+  the pool attempt timeout). Durable attempt timeouts are unchanged.
+- Charge durable operation/root attempts and reserve budget atomically at
+  `SEND_INTENT`, after a permit is acquired. A timed-out permit wait consumes
+  neither an attempt nor budget and is eligible to run as soon as capacity
+  returns; already-charged RESERVED rows from older images are not charged twice.
+- Keep durable retries in their original operation queue position, distinguish
+  send-budget rejection from worker fencing, and base backoff on sent attempts.
+  Migration `0007` makes `valid_until` an optional review date with warning and
+  signed-seconds metric rather than a dispatch cutoff. Reconciliation prunes
+  settled legacy direct attempts older than one day without touching held work.
+- Three 100 QA/s mock-serving runs at each backlog completed 100/100. Median
+  dispatch p95/p99/CPU were 1.77/3.58 ms/29.38% (0),
+  0.74/0.83 ms/24.15% (1,000), and 0.68/0.81 ms/23.75% (10,000).
+
 ## 0.2.0rc17 — unreleased
 
 - Remove a direct waiter if its enqueue committed but the caller was cancelled

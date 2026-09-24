@@ -24,6 +24,21 @@ class MemoryArtifacts:
         return await self.put(tenant_id, source.read(), content_type)
 
 
+class TestPermits:
+    """Explicit permit stand-in for executor tests not exercising admission."""
+
+    async def acquire(self, reservation):
+        return {"attempt_id": reservation.attempt_id,
+                "pool_id": reservation.pool_id,
+                "engine_epoch": reservation.engine_epoch}
+
+    async def heartbeat(self, reservation):
+        return None
+
+    async def release(self, reservation):
+        return None
+
+
 class IndependentEngine:
     """Engine task is shielded from the client's transport cancellation."""
     def __init__(self):

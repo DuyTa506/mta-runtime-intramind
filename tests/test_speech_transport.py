@@ -6,7 +6,7 @@ import wave
 import httpx
 import pytest
 from conftest import root
-from fakes import MemoryArtifacts
+from fakes import MemoryArtifacts, TestPermits
 from test_speech_ledger import speech, speech_pool
 
 from intramind_runtime.contracts import Artifact, CancelOutcome
@@ -57,7 +57,7 @@ async def driver_case(store, handler, *, timeout=5):
     await store.submit_operation(spec)
     client = httpx.AsyncClient(base_url="http://serving/", transport=httpx.MockTransport(handler))
     driver = ServingSpeechDriver("http://serving/", profile(), client=client)
-    return driver, blobs, Executor(store, blobs, driver, "voice", "worker")
+    return driver, blobs, Executor(store, blobs, driver, "voice", "worker", TestPermits())
 
 
 async def test_speech_preparation_pins_profile_and_preserves_voice_speed_and_pause():

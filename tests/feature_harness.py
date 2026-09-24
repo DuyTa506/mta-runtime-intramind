@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import httpx
 from conftest import pool, temporal_test_client
-from fakes import MemoryArtifacts
+from fakes import MemoryArtifacts, TestPermits
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
 from temporalio.service import RPCError
@@ -78,7 +78,7 @@ async def feature_environment(
         ), 1)
         speech_driver = ServingSpeechDriver("http://voice/", speech_profile, client=httpx.AsyncClient(
             base_url="http://voice/", transport=httpx.MockTransport(respond_speech)))
-        speech_executor = Executor(store, blobs, speech_driver, "voice", "voice-executor-" + uid)
+        speech_executor = Executor(store, blobs, speech_driver, "voice", "voice-executor-" + uid, TestPermits())
         speech_preparers = {speech_profile.model_profile: SpeechPreparer(speech_profile)}
 
     embedding_driver, embedding_executor, embedding_preparers = None, None, {}
@@ -94,7 +94,7 @@ async def feature_environment(
         embedding_driver = ServingEmbeddingDriver("http://embedding/", embedding_profile,
             client=httpx.AsyncClient(base_url="http://embedding/",
                                     transport=httpx.MockTransport(respond_embedding)))
-        embedding_executor = Executor(store, blobs, embedding_driver, "embedding", "embedding-" + uid)
+        embedding_executor = Executor(store, blobs, embedding_driver, "embedding", "embedding-" + uid, TestPermits())
         embedding_preparers = {embedding_profile.model_profile: EmbeddingPreparer(embedding_profile)}
 
     async def tokenize(request):
@@ -159,7 +159,7 @@ async def feature_environment(
 
     completion_driver = Engine("http://fake/v1/", "test-only", "test", client=httpx.AsyncClient(
         base_url="http://fake/v1/", transport=httpx.MockTransport(completion_http)))
-    executor = Executor(store, blobs, completion_driver, "p", "feature-executor-" + uid)
+    executor = Executor(store, blobs, completion_driver, "p", "feature-executor-" + uid, TestPermits())
     publisher = OutboxPublisher(store, temporal, "feature-publisher-" + uid)
     from intramind_runtime.buffering import BufferedSubmissions
 
