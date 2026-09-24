@@ -4,6 +4,11 @@
 
 - Remove a direct waiter if its enqueue committed but the caller was cancelled
   before a producer could take ownership of cleanup.
+- Bound each direct logical request across prompt sizing, owner startup,
+  capacity waiting, transport, retry and confirmed-engine recovery. Per-workload
+  defaults are configurable; callers can only shorten them through a trusted
+  header. Deadline responses carry the stable `deadline_exceeded` reason, while
+  unconfirmed sent compute remains held for fenced recovery.
 
 ## 0.2.0rc16 — unreleased
 

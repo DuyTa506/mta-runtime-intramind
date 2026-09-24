@@ -823,10 +823,12 @@ class Store:
                         (lease_expires_at<=clock_timestamp() AND NOT EXISTS (
                             SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=runtime_direct_attempts.owner_id
                                 AND ow.lease_expires_at>clock_timestamp())))""")
-            await execute(c, """DELETE FROM runtime_direct_waiters w
+            expired_waiters = await execute(c, """DELETE FROM runtime_direct_waiters w
                 WHERE deadline<=clock_timestamp() OR NOT EXISTS (
                     SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=w.owner_id
                         AND ow.lease_expires_at>clock_timestamp())""")
+            if expired_waiters.rowcount:
+                await self._wake(c)
             expired_operations = await rows(c, """SELECT operation_id FROM runtime_operations
                 WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')
                 AND (spec->>'deadline')::timestamptz<=clock_timestamp()""")

@@ -14,12 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 _tenant: ContextVar[str | None] = ContextVar("direct_inference_tenant", default=None)
 _workload: ContextVar[str] = ContextVar("direct_inference_workload", default="background")
 _logical_request: ContextVar[str | None] = ContextVar("direct_inference_request", default=None)
+_deadline_seconds: ContextVar[int | None] = ContextVar("direct_inference_deadline", default=None)
 WORKLOAD_CLASSES = frozenset({"qa", "user_task", "background", "maintenance"})
 
 
 @contextmanager
 def inference_scope(tenant_id: str | None, *, workload_class: str = "background",
-                    logical_request_id: str | None = None):
+                    logical_request_id: str | None = None,
+                    deadline_seconds: int | None = None):
     """Bind an identity verified by the application, including across asyncio.to_thread."""
     if tenant_id is not None and (
         not tenant_id or len(tenant_id) > 240 or not tenant_id.isascii()
@@ -33,12 +35,16 @@ def inference_scope(tenant_id: str | None, *, workload_class: str = "background"
         or not re.fullmatch(r"[A-Za-z0-9._:-]+", logical_request_id)
     ):
         raise ValueError("invalid logical inference request")
+    if deadline_seconds is not None and (type(deadline_seconds) is not int or deadline_seconds <= 0):
+        raise ValueError("inference deadline must be positive seconds")
     token = _tenant.set(tenant_id)
     workload_token = _workload.set(workload_class)
     request_token = _logical_request.set(logical_request_id)
+    deadline_token = _deadline_seconds.set(deadline_seconds)
     try:
         yield
     finally:
+        _deadline_seconds.reset(deadline_token)
         _logical_request.reset(request_token)
         _workload.reset(workload_token)
         _tenant.reset(token)
@@ -50,6 +56,16 @@ class DirectStreamEvent:
     text: str = ""
     generation: int = 0
     reason: str | None = None
+
+
+class DirectStreamError(RuntimeError):
+    """A managed terminal SSE error with a stable reason for application adapters."""
+
+    def __init__(self, message: str, *, reason: str | None = None,
+                 error_type: str | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.error_type = error_type
 
 
 @dataclass(frozen=True)
@@ -103,7 +119,8 @@ class DirectBinding:
                         return
                     frame = json.loads(raw)
                     if event_name == "intramind.error":
-                        raise RuntimeError(str(frame.get("message") or "managed inference failed"))
+                        raise DirectStreamError(str(frame.get("message") or "managed inference failed"),
+                            reason=frame.get("reason"), error_type=frame.get("type"))
                     if event_name == "intramind.control":
                         kind = frame.get("type")
                         if kind not in {"waiting", "resumed", "recovering", "generation_reset"}:
@@ -149,6 +166,9 @@ class _IdentityAuth(httpx.Auth):
         logical_request = _logical_request.get()
         if logical_request is not None:
             request.headers["X-Intramind-Logical-Request-ID"] = logical_request
+        deadline_seconds = _deadline_seconds.get()
+        if deadline_seconds is not None:
+            request.headers["X-Intramind-Deadline-Seconds"] = str(min(deadline_seconds, 86400))
         yield request
 
 

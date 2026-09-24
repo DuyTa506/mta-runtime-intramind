@@ -3,19 +3,26 @@
 import asyncio
 import json
 import logging
+import math
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import uuid4
 
 import httpx
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .contracts import AdmissionDenied, RuntimeConflict
 from .direct import DirectAdmissions, DirectRequest
 from .store import encode
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_WORKLOAD_DEADLINE_SECONDS = {"qa": 600, "user_task": 1800}
+
+
+class DirectDeadlineExceeded(TimeoutError):
+    """The logical request budget ended; it is never termination evidence."""
 
 
 async def _chunks(response, buffered):
@@ -85,11 +92,26 @@ class DirectProxy:
     """One endpoint dispatcher feeds the engine; no SQL polling per waiting user."""
 
     def __init__(self, store, *, client, pool, model=None, profile=None,
-                 timeout_seconds=1800, max_response_bytes=16*1024*1024):
+                 timeout_seconds=1800, max_response_bytes=16*1024*1024,
+                 workload_deadline_seconds=None):
+        if (type(timeout_seconds) not in {int, float} or not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= 86400):
+            raise ValueError("pool attempt timeout must be finite and positive")
         self.store, self.client, self.pool = store, client, pool
         self.model = model or pool.model_revision
         self.profile = profile
         self.timeout_seconds, self.max_response_bytes = timeout_seconds, max_response_bytes
+        deadlines = {**DEFAULT_WORKLOAD_DEADLINE_SECONDS,
+                     "background": timeout_seconds, "maintenance": timeout_seconds}
+        if workload_deadline_seconds is not None:
+            if not isinstance(workload_deadline_seconds, dict):
+                raise ValueError("workload deadlines must be a mapping")
+            for workload, seconds in workload_deadline_seconds.items():
+                if (workload not in deadlines or type(seconds) not in {int, float}
+                    or not math.isfinite(seconds) or not 0 < seconds <= 86400):
+                    raise ValueError("workload deadline must be finite and positive")
+                deadlines[workload] = seconds
+        self.workload_deadline_seconds = deadlines
         self.admission = DirectAdmissions(store)
         self.owner_id = "direct-api-" + uuid4().hex
         self.boot_generation = uuid4().hex
@@ -229,8 +251,53 @@ class DirectProxy:
             body["reason"] = reason
         return b"event: intramind.control\ndata: " + encode(body).encode() + b"\n\n"
 
+    def _deadline_seconds(self, workload_class, requested):
+        try:
+            limit = self.workload_deadline_seconds[workload_class]
+        except KeyError:
+            raise ValueError("invalid inference workload") from None
+        if requested is not None:
+            if type(requested) is not int or requested <= 0:
+                raise ValueError("inference deadline must be a positive number of seconds")
+            limit = min(limit, requested)
+        return limit
+
+    @staticmethod
+    def _remaining(until):
+        remaining = until-asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise DirectDeadlineExceeded("inference request deadline exceeded")
+        return remaining
+
+    @staticmethod
+    def _error_frame(message, error_type, reason=None):
+        data = {"message": message, "type": error_type}
+        if reason is not None:
+            data["reason"] = reason
+        return b"event: intramind.error\ndata: " + encode(data).encode() + b"\n\n"
+
+    @staticmethod
+    def _error_object(message, error_type, reason=None):
+        data = {"message": message, "type": error_type}
+        if reason is not None:
+            data["reason"] = reason
+        return {"error": data}
+
+    def _deadline_response(self, streaming):
+        message = "inference request deadline exceeded"
+        if not streaming:
+            return JSONResponse(self._error_object(message, "admission_timeout",
+                                    "deadline_exceeded"), status_code=504)
+
+        async def expired():
+            yield self._error_frame(message, "admission_timeout", "deadline_exceeded")
+
+        return StreamingResponse(expired(), status_code=200,
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+
     async def open(self, tenant_id, payload, *, request_bound, path="chat/completions", batch_size=1,
-                   workload_class="background", logical_request_id=None, disconnected=None):
+                   workload_class="background", logical_request_id=None, disconnected=None,
+                   deadline_seconds=None, started_at_monotonic=None):
         raw = encode(payload).encode()
         if len(raw) > 1024*1024:
             raise AdmissionDenied("direct request exceeds transport bound")
@@ -238,7 +305,25 @@ class DirectProxy:
             or type(payload.get("n", 1)) is not int or payload.get("n", 1) != 1
             or type(payload.get("stream", False)) is not bool):
             raise AdmissionDenied("direct request differs from the qualified model/completion contract")
-        await self.start()
+        streaming = self.pool.kind == "llm" and payload.get("stream", False)
+        total_seconds = self._deadline_seconds(workload_class, deadline_seconds)
+        now = asyncio.get_running_loop().time()
+        started = now if started_at_monotonic is None else min(started_at_monotonic, now)
+        until = started+total_seconds
+        if until <= now:
+            return self._deadline_response(streaming)
+        if not self._started:
+            try:
+                async with asyncio.timeout_at(until):
+                    await self.start()
+            except TimeoutError:
+                if until <= asyncio.get_running_loop().time():
+                    return self._deadline_response(streaming)
+                raise
+        remaining = until-asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return self._deadline_response(streaming)
+        deadline = datetime.now(UTC)+timedelta(seconds=remaining)
         request = DirectRequest(request_id=uuid4().hex, tenant_id=tenant_id,
             payload_digest=sha256(raw).hexdigest(), model_profile=self.pool.model_profile,
             model_revision=self.pool.model_revision,
@@ -246,25 +331,28 @@ class DirectProxy:
             capacity_profile_id=self.pool.profile_id, kind=self.pool.kind,
             request_bound=request_bound, batch_size=batch_size,
             workload_class=workload_class, logical_request_id=logical_request_id,
-            deadline=datetime(3000, 1, 1, tzinfo=UTC))
+            deadline=deadline)
         try:
-            queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
-        except BaseException:
+            async with asyncio.timeout_at(until):
+                queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        except BaseException as exc:
             # Enqueue can commit before caller cancellation is observed. No
             # producer exists yet to remove the resulting waiter.
             try:
                 await asyncio.shield(self.admission.leave(request.request_id, self.owner_id))
             except Exception:
                 logger.exception("Direct enqueue cleanup failed request=%s", request.request_id)
+            if isinstance(exc, TimeoutError) and until <= asyncio.get_running_loop().time():
+                return self._deadline_response(streaming)
             raise
         future = asyncio.get_running_loop().create_future()
         self._pending[request.request_id] = (request, future, queued_at, None)
         self._pending_signal.set()
         channel = _Channel()
         headers = asyncio.get_running_loop().create_future()
-        streaming = self.pool.kind == "llm" and payload.get("stream", False)
         task = asyncio.create_task(self._produce_waiting(request, future, payload, path,
-                                                          channel, headers, streaming, disconnected))
+                                                          channel, headers, streaming, disconnected,
+                                                          until))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
         if streaming:
@@ -279,8 +367,9 @@ class DirectProxy:
             raise
 
     async def _produce_waiting(self, request, future, payload, path, channel, headers,
-                               streaming, disconnected):
+                               streaming, disconnected, until):
         reservation = None
+        handed_off = False
         try:
             if streaming and not future.done():
                 await channel.put(self._control("waiting", reason="inference_capacity"))
@@ -289,8 +378,10 @@ class DirectProxy:
                 while not future.done():
                     if channel.detached or (disconnected and await disconnected()):
                         return
+                    remaining = self._remaining(until)
                     done, _ = await asyncio.wait((future, detached),
-                        timeout=1 if disconnected else 15, return_when=asyncio.FIRST_COMPLETED)
+                        timeout=min(remaining, 1 if disconnected else 15),
+                        return_when=asyncio.FIRST_COMPLETED)
                     if detached in done:
                         return
                     if not done and streaming and not disconnected:
@@ -298,15 +389,27 @@ class DirectProxy:
             finally:
                 detached.cancel()
             reservation = future.result()
+            self._remaining(until)
             if channel.detached:
-                await self._settle(reservation, "not_sent")
                 return
             if streaming:
                 await channel.put(self._control("resumed"))
             if channel.detached:
-                await self._settle(reservation, "not_sent")
                 return
-            await self._produce(reservation, payload, path, channel, headers, streaming)
+            self._remaining(until)
+            handed_off = True
+            await self._produce(reservation, payload, path, channel, headers, streaming, until)
+        except DirectDeadlineExceeded as exc:
+            if streaming:
+                await channel.put(self._error_frame(str(exc), "admission_timeout",
+                                                    "deadline_exceeded"))
+                await channel.finish()
+            else:
+                if not headers.done():
+                    headers.set_result((504, {"Content-Type": "application/json"}))
+                await channel.put(encode(self._error_object(str(exc), "admission_timeout",
+                    "deadline_exceeded")).encode())
+                await channel.finish()
         except Exception as exc:
             if streaming:
                 await channel.put(b"event: intramind.error\ndata: " + encode({
@@ -335,25 +438,40 @@ class DirectProxy:
                         pass
                     else:
                         await self._settle(granted, "not_sent")
+            elif not handed_off:
+                await self._settle(reservation, "not_sent")
             await self.admission.leave(request.request_id, self.owner_id)
             if reservation is None and not headers.done():
                 headers.set_result((499, {"Content-Type": "application/json"}))
                 await channel.finish("direct request disconnected before inference")
 
-    async def _produce(self, reservation, payload, path, channel, headers, streaming):
+    async def _produce(self, reservation, payload, path, channel, headers, streaming, until):
         current = reservation
         current_unsent = True
+        deadline_exceeded = False
+        error = None
         while True:
             if channel.detached:
                 if current_unsent:
                     await self._settle(current, "not_sent")
                 return
+            try:
+                self._remaining(until)
+            except DirectDeadlineExceeded as exc:
+                if current_unsent:
+                    await self._settle(current, "not_sent")
+                error, deadline_exceeded = str(exc), True
+                break
             current_unsent = False
-            outcome, error = await self._attempt(current, payload, path, channel, headers, streaming)
+            outcome, error = await self._attempt(current, payload, path, channel, headers,
+                                                  streaming, until)
             if outcome == "done":
                 await channel.finish()
                 return
             if outcome == "terminal_error":
+                break
+            if until <= asyncio.get_running_loop().time():
+                error, deadline_exceeded = "inference request deadline exceeded", True
                 break
             if outcome == "unknown":
                 if self.pool.kind != "llm":
@@ -362,7 +480,11 @@ class DirectProxy:
                     await channel.put(self._control("waiting", current.generation,
                                                     "engine_termination_unconfirmed"))
                 try:
-                    recovered = await self._await_confirmed_recovery(current, channel, streaming)
+                    recovered = await self._await_confirmed_recovery(current, channel, streaming,
+                                                                     until)
+                except DirectDeadlineExceeded as exc:
+                    error, deadline_exceeded = str(exc), True
+                    recovered = False
                 except Exception as exc:
                     error = str(exc)
                     recovered = False
@@ -377,7 +499,10 @@ class DirectProxy:
                 error = "inference recovery limit reached"
                 break
             try:
-                replacement = await self._queue_retry(current, channel, streaming)
+                replacement = await self._queue_retry(current, channel, streaming, until)
+            except DirectDeadlineExceeded as exc:
+                error, deadline_exceeded = str(exc), True
+                break
             except Exception as exc:
                 error = str(exc)
                 break
@@ -397,25 +522,27 @@ class DirectProxy:
             return
         error = error or "direct inference unavailable"
         if streaming:
-            await channel.put(b"event: intramind.error\ndata: " + encode({
-                "message": error, "type": "upstream_error"}).encode() + b"\n\n")
+            await channel.put(self._error_frame(error, "upstream_error",
+                "deadline_exceeded" if deadline_exceeded else None))
         else:
             if not headers.done():
-                headers.set_result((502, {"Content-Type": "application/json",
+                headers.set_result((504 if deadline_exceeded else 502, {"Content-Type": "application/json",
                     "X-Intramind-Attempt-ID": current.attempt_id}))
-            await channel.put(encode({"error": {"message": error,
-                "type": "upstream_error"}}).encode())
+            await channel.put(encode(self._error_object(error, "upstream_error",
+                "deadline_exceeded" if deadline_exceeded else None)).encode())
         await channel.finish()
 
-    async def _await_confirmed_recovery(self, reservation, channel, streaming):
+    async def _await_confirmed_recovery(self, reservation, channel, streaming, until):
         future = asyncio.get_running_loop().create_future()
         self._recovering[reservation.attempt_id] = future
         self._pending_signal.set()
         try:
             while not future.done() and not channel.detached:
                 try:
-                    await asyncio.wait_for(asyncio.shield(future), timeout=15)
+                    await asyncio.wait_for(asyncio.shield(future),
+                                           timeout=min(15, self._remaining(until)))
                 except TimeoutError:
+                    self._remaining(until)
                     if streaming:
                         await channel.put(b": heartbeat\n\n")
             if channel.detached:
@@ -425,9 +552,21 @@ class DirectProxy:
         finally:
             self._recovering.pop(reservation.attempt_id, None)
 
-    async def _queue_retry(self, reservation, channel, streaming):
+    async def _queue_retry(self, reservation, channel, streaming, until):
         request = reservation.request
-        queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        self._remaining(until)
+        try:
+            async with asyncio.timeout_at(until):
+                queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        except BaseException as exc:
+            # A retry enqueue can also commit just before its deadline fires.
+            try:
+                await asyncio.shield(self.admission.leave(request.request_id, self.owner_id))
+            except Exception:
+                logger.exception("Direct retry enqueue cleanup failed request=%s", request.request_id)
+            if isinstance(exc, TimeoutError) and until <= asyncio.get_running_loop().time():
+                raise DirectDeadlineExceeded("inference request deadline exceeded") from exc
+            raise
         future = asyncio.get_running_loop().create_future()
         replacement = None
         self._pending[request.request_id] = (request, future, queued_at, reservation.attempt_id)
@@ -439,7 +578,8 @@ class DirectProxy:
             detached = asyncio.create_task(channel.detached_event.wait())
             try:
                 while not future.done() and not channel.detached:
-                    done, _ = await asyncio.wait((future, detached), timeout=15,
+                    done, _ = await asyncio.wait((future, detached),
+                        timeout=min(15, self._remaining(until)),
                         return_when=asyncio.FIRST_COMPLETED)
                     if detached in done:
                         break
@@ -449,6 +589,7 @@ class DirectProxy:
                 detached.cancel()
             if channel.detached:
                 return None
+            self._remaining(until)
             replacement = future.result()
             return replacement
         finally:
@@ -469,12 +610,12 @@ class DirectProxy:
             if replacement is not None and channel.detached:
                 await self._settle(replacement, "not_sent")
 
-    async def _attempt(self, reservation, payload, path, channel, headers, streaming):
+    async def _attempt(self, reservation, payload, path, channel, headers, streaming, until):
         sent = terminated = False
         error = None
         retryable_not_sent = False
         try:
-            async with asyncio.timeout(self.timeout_seconds):
+            async with asyncio.timeout(min(self.timeout_seconds, self._remaining(until))):
                 await self.admission.mark_send(reservation)
                 sent = True
                 async with self.client.stream("POST", path, json=payload,
@@ -551,6 +692,10 @@ class DirectProxy:
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             sent = False
             error = "direct backend connection failed"
+        except TimeoutError:
+            error = ("inference request deadline exceeded"
+                     if until <= asyncio.get_running_loop().time()
+                     else "direct backend attempt timed out")
         except asyncio.CancelledError:
             raise
         except BaseException as exc:

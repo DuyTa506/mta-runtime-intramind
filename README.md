@@ -67,7 +67,28 @@ embedding source documents or unbounded child lists in workflow history.
 
 Version `0.2.0rc17` removes a direct waiter if caller cancellation interrupts
 the return from an already-committed enqueue, before a producer exists to own
-cleanup. It retains the rc16 admission and wire contracts.
+cleanup. Each direct request now has one deadline beginning at the authenticated
+route entry and covering body read, prompt sizing, proxy startup, capacity wait,
+transport, retry wait and confirmed-engine recovery. Defaults are 600 seconds
+for `qa`, 1,800 for `user_task`, and the pool's `attempt_timeout_seconds`
+(default 1,800) for `background` and `maintenance`. A pool entry may override
+these with `workload_deadline_seconds`, for example
+`{"qa": 600, "user_task": 1800, "background": 900, "maintenance": 300}`;
+values must be positive and no greater than 86,400 seconds. Authenticated
+callers may supply `X-Intramind-Deadline-Seconds` to shorten, never extend,
+their class limit. `inference_scope(..., deadline_seconds=N)` sets this header
+through the SDK. Stream timeouts end in an `intramind.error` with
+`reason=deadline_exceeded`, exposed on `DirectStreamError.reason`; non-stream
+timeouts return HTTP 504 JSON with the same reason. A timeout after send does
+not prove engine termination: its UNKNOWN attempt keeps compute held until the
+existing fenced recovery path confirms the old engine stopped. No schema
+migration is needed beyond rc15's additive migration `0006`. Paired disposable
+mock-serving runs of 100 QA requests at 100/s across four endpoints and 1,000
+background waiters completed every request without starvation in both rc16
+and rc17. Their enqueue-commit to send-intent p95 varied substantially between
+runs (roughly 0.7–0.94 seconds); rc17 did not establish a repeatable slowdown or
+meet the planned 50 ms/200 ms dispatch gate. This is not a stage load
+qualification.
 
 Version `0.2.0rc16` fixes a dispatcher ordering race exposed by concurrent
 enqueue: PostgreSQL's waiter `created_at` may precede the order in which

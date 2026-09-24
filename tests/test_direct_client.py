@@ -5,7 +5,12 @@ import asyncio
 import httpx
 import pytest
 
-from intramind_runtime.direct_client import DirectBinding, DirectRouting, inference_scope
+from intramind_runtime.direct_client import (
+    DirectBinding,
+    DirectRouting,
+    DirectStreamError,
+    inference_scope,
+)
 
 
 def binding():
@@ -141,7 +146,8 @@ async def test_managed_stream_preserves_ordered_controls_and_request_class():
 
     async with httpx.AsyncClient(**binding().client_kwargs(),
                                  transport=httpx.MockTransport(respond)) as client:
-        with inference_scope("user:one", workload_class="qa", logical_request_id="query-123"):
+        with inference_scope("user:one", workload_class="qa", logical_request_id="query-123",
+                             deadline_seconds=5):
             events = [event async for event in binding().stream_events({"stream": True}, client=client)]
     assert [(event.kind, event.text, event.generation) for event in events] == [
         ("waiting", "", 0), ("token", "partial", 0),
@@ -149,6 +155,22 @@ async def test_managed_stream_preserves_ordered_controls_and_request_class():
     ]
     assert seen[0].headers["X-Intramind-Workload-Class"] == "qa"
     assert seen[0].headers["X-Intramind-Logical-Request-ID"] == "query-123"
+    assert seen[0].headers["X-Intramind-Deadline-Seconds"] == "5"
+
+
+async def test_managed_stream_preserves_terminal_error_reason():
+    frame = (b'event: intramind.error\ndata: {"message":"request timed out",'
+             b'"type":"admission_timeout","reason":"deadline_exceeded"}\n\n')
+    async with httpx.AsyncClient(**binding().client_kwargs(), transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=frame,
+                                       headers={"Content-Type": "text/event-stream"})
+    )) as client:
+        with inference_scope("user:one"):
+            with pytest.raises(DirectStreamError) as raised:
+                _ = [event async for event in binding().stream_events({"stream": True}, client=client)]
+    assert str(raised.value) == "request timed out"
+    assert raised.value.reason == "deadline_exceeded"
+    assert raised.value.error_type == "admission_timeout"
 
 
 @pytest.mark.parametrize("stream", [

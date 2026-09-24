@@ -109,7 +109,8 @@ class DirectAdmissions:
             if previous["generation"] >= 2:
                 raise AdmissionDenied("inference recovery limit reached")
             if (not pool or pool["health"] != "HEALTHY" or pool["target"] == 0
-                or pool["valid_until"] <= datetime.now(UTC)):
+                or pool["valid_until"] <= datetime.now(UTC)
+                or request.deadline <= datetime.now(UTC)):
                 return None
             profile = parse_pool(pool["spec"])
             if (previous["state"] == "FAILED_RECOVERABLE"

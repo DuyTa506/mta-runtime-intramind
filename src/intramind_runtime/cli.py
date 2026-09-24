@@ -189,6 +189,8 @@ def direct_proxies(config, store, sizing):
         selected[spec.model_profile] = (pool, spec, profile, api_key)
     return {
         key: DirectProxy(store, pool=spec, model=pool.get("model"), profile=profile,
+            timeout_seconds=pool.get("attempt_timeout_seconds", 1800),
+            workload_deadline_seconds=pool.get("workload_deadline_seconds"),
             max_response_bytes=profile.max_response_bytes if profile else 16*1024*1024,
             client=httpx.AsyncClient(
             base_url=pool["base_url"].rstrip("/") + "/",
