@@ -8,7 +8,7 @@ from conftest import operation, pool, root
 from sqlalchemy import text
 from test_speech_ledger import speech, speech_pool
 
-from intramind_runtime.direct import DirectAdmissions, DirectRequest
+from intramind_runtime.direct import DirectRequest
 
 pytestmark = pytest.mark.integration
 
@@ -92,16 +92,20 @@ async def test_packaged_alembic_upgrade_is_repeatable_and_preserves_data(store):
             active_attempt='old-speech-attempt',attempts=1 WHERE operation_id='speech'"""))
     await migrate()
     await store.configure_pool(pool("direct-after-upgrade", target=1), 4)
-    direct = DirectAdmissions(store)
     direct_request = DirectRequest(
         request_id="upgrade-preserved", tenant_id="t", payload_digest="a" * 64,
         model_profile="test", capacity_profile_id="test-v1", request_bound=30,
         deadline=root().deadline,
     )
-    await direct.enqueue(direct_request, "direct-after-upgrade", "direct-owner")
-    reservation = await direct.reserve(direct_request, "direct-after-upgrade", "direct-owner")
-    await direct.mark_send(reservation)
-    await direct.unknown(reservation, "fixture_response_lost")
+    # Keep a legacy rc17 row to prove rc18's additive rollout and rollback.
+    async with store.engine.begin() as connection:
+        await connection.execute(text("""INSERT INTO runtime_direct_attempts
+            (attempt_id,request_id,tenant_id,spec,pool_id,engine_epoch,owner_id,
+             state,lease_expires_at,deadline,unknown_at)
+            VALUES ('old-direct','upgrade-preserved','t',CAST(:spec AS jsonb),
+                'direct-after-upgrade','e1','direct-owner','UNKNOWN',
+                now()+interval '1 hour',:deadline,now())"""),
+            {"spec": direct_request.model_dump_json(), "deadline": direct_request.deadline})
     await migrate()
     state = await store.run("migration-preserved", "t")
     assert state["state"] == "RUNNING" and state["reserved"] == 30

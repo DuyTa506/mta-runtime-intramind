@@ -12,7 +12,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from conftest import pool, temporal_test_client
-from fakes import MemoryArtifacts
+from fakes import MemoryArtifacts, TestPermits
 from feature_harness import ai_language_activities, peak_children
 from temporalio.api.workflowservice.v1 import SetWorkerDeploymentCurrentVersionRequest
 from temporalio.common import VersioningBehavior, WorkerDeploymentVersion
@@ -84,7 +84,7 @@ async def test_real_rewrite_children_publish_and_replay(store, monkeypatch):
                                 input_tokens=10, output_tokens=30)
 
     engine = EchoEngine()
-    executor = Executor(store, blobs, engine, "p", "rewrite-executor")
+    executor = Executor(store, blobs, engine, "p", "rewrite-executor", TestPermits())
     publisher = OutboxPublisher(store, client, "rewrite-outbox")
     broker = BrokerActivities(store, blobs)
     features = RewriteActivities(runtime_client, model_profile="test")

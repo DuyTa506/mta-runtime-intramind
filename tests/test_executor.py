@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 from conftest import operation, pool, root
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 
 from intramind_runtime.executor import Executor
 
@@ -17,7 +17,7 @@ async def prepare(store):
     blobs.data[spec.payload.key] = b'{"messages":[{"role":"user","content":"test"}]}'
     await store.submit_operation(spec)
     engine = IndependentEngine()
-    return engine, Executor(store, blobs, engine, "p", "executor")
+    return engine, Executor(store, blobs, engine, "p", "executor", TestPermits())
 
 
 async def test_transport_cancel_does_not_stop_backend_or_release_quota(store):

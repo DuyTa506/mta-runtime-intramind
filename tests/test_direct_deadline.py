@@ -6,12 +6,19 @@ import json
 import httpx
 import pytest
 from conftest import pool
-from sqlalchemy import text
 
 from intramind_runtime.direct_proxy import DirectProxy
 
 PAYLOAD = {"model": "model-1", "messages": [{"role": "user", "content": "hello"}],
            "stream": True, "max_tokens": 20}
+
+
+def held(proxy):
+    return [item for item in proxy.admission.permits.values() if item.kind == "direct"]
+
+
+def unknown(proxy):
+    return [item for item in held(proxy) if item.state == "UNKNOWN"]
 
 
 def test_workload_deadlines_are_configurable_and_client_only_shortens():
@@ -51,12 +58,9 @@ async def test_waiting_capacity_expires_without_sending_or_leaving_waiter(store,
         assert b'deadline_exceeded' in body
         assert b'admission_timeout' in body
         assert calls == []
-        assert (await store.drain_status())["compute_held"] == 0
-        async with store.engine.connect() as connection:
-            assert (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one() == 0
-            assert (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_attempts"))).scalar_one() == 0
+        assert held(proxy) == []
+        assert proxy.admission.waiters == {}
+        assert proxy.admission.direct_attempts == {}
     finally:
         await proxy.close()
 
@@ -83,13 +87,9 @@ async def test_timeout_after_send_keeps_unknown_compute_held_even_after_reconcil
             "error": {"message": "inference request deadline exceeded",
                       "type": "upstream_error", "reason": "deadline_exceeded"}}
         assert len(calls) == 1
-        async with store.engine.connect() as connection:
-            state = (await connection.execute(text(
-                "SELECT state,compute_held FROM runtime_direct_attempts"))).one()
-        assert state == ("UNKNOWN", True)
+        assert len(unknown(proxy)) == 1
         await store.reconcile_expired()
-        assert (await store.drain_status())["compute_held"] == 1
-        assert (await store.drain_status())["unknown_attempts"] == 1
+        assert len(unknown(proxy)) == 1
     finally:
         await proxy.close()
 
@@ -115,9 +115,9 @@ async def test_recovery_wait_expires_without_replaying_unknown_inference(store):
         assert b"partial" in body and b"engine_termination_unconfirmed" in body
         assert b'deadline_exceeded' in body
         assert len(calls) == 1
-        assert (await store.drain_status())["unknown_attempts"] == 1
+        assert len(unknown(proxy)) == 1
         await store.reconcile_expired()
-        assert (await store.drain_status())["compute_held"] == 1
+        assert len(held(proxy)) == 1
     finally:
         await proxy.close()
 
@@ -147,10 +147,8 @@ async def test_retry_capacity_wait_expires_without_requeue_or_second_send(store)
         body = await asyncio.wait_for(_consume(response), 3)
         assert b"deadline_exceeded" in body
         assert len(calls) == 1 and retried
-        async with store.engine.connect() as connection:
-            assert (await connection.execute(text(
-                "SELECT count(*) FROM runtime_direct_waiters"))).scalar_one() == 0
-        assert (await store.drain_status())["compute_held"] == 0
+        assert proxy.admission.waiters == {}
+        assert held(proxy) == []
     finally:
         await proxy.close()
 
@@ -182,8 +180,7 @@ async def test_streamed_token_then_stall_expires_without_replay_or_releasing_unk
         assert b"first" in body and b"deadline_exceeded" in body
         assert len(calls) == 1
         await store.reconcile_expired()
-        assert (await store.drain_status())["unknown_attempts"] == 1
-        assert (await store.drain_status())["compute_held"] == 1
+        assert len(unknown(proxy)) == 1
     finally:
         await proxy.close()
 

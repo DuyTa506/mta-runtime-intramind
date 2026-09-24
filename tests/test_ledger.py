@@ -5,6 +5,7 @@ from conftest import operation, pool, root
 from sqlalchemy import text
 
 from intramind_runtime.contracts import AdmissionDenied, RuntimeConflict
+from intramind_runtime.memory_scheduler import MemoryScheduler
 
 pytestmark = pytest.mark.integration
 
@@ -88,9 +89,25 @@ async def test_unknown_retains_budget_and_compute_after_lease(store):
     async with store.engine.begin() as c:
         await c.execute(text("UPDATE runtime_attempts SET lease_expires_at=now()-interval '1 second'"))
     await store.reconcile_expired()
-    assert await store.reserve_next("p", "b") is None
-    assert (await store.operation("o0", "t"))["state"] == "RECONCILING"
     assert (await store.run("r", "t"))["reserved"] == 30
+    # reserve_next now selects durable work; only runtime-api grants capacity.
+    queued = await store.reserve_next("p", "b")
+    assert queued is not None
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    pending = asyncio.create_task(scheduler.durable(
+        queued.attempt_id, queued.pool_id, queued.owner_id,
+        queued.engine_epoch, queued.workload_class, queued.attempt_deadline))
+    try:
+        await asyncio.sleep(0.05)
+        assert not pending.done()
+        assert set(scheduler.permits) == {r.attempt_id}
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await scheduler.close()
+    assert (await store.operation("o0", "t"))["state"] == "RECONCILING"
+    assert (await store.run("r", "t"))["reserved"] == 60
 
 
 async def test_expired_before_send_refunds_once_and_fences_worker(store):

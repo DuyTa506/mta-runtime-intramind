@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RUNTIME_", extra="ignore")
     database_url: SecretStr
     service_token: SecretStr = Field(min_length=32)
+    api_url: str = "http://runtime-api:8070"
     minio_endpoint: str
     minio_access_key: SecretStr
     minio_secret_key: SecretStr

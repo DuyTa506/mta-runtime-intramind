@@ -320,48 +320,22 @@ class Store:
             return [dict(item) for item in result]
 
     async def reserve_next(self, pool_id: str, owner_id: str) -> Reservation | None:
-        """Called only by an idle executor; no downstream worker queue."""
+        """Reserve durable work; runtime-api alone grants engine capacity."""
         async with self.transaction() as c:
-            initial = await row(c, "SELECT group_id,spec FROM runtime_pools WHERE pool_id=:id", id=pool_id)
-            if not initial:
-                return None
-            if parse_pool(initial["spec"]).kind != "llm":
-                await execute(c, "SELECT group_id FROM runtime_groups WHERE group_id=:id FOR UPDATE",
-                              id=initial["group_id"])
-            # This short lock makes the endpoint transport bound atomic across
-            # direct API and executor replicas. It is never held during HTTP.
             pool = await row(c, "SELECT * FROM runtime_pools WHERE pool_id=:id FOR UPDATE", id=pool_id)
             if (not pool or pool["health"] != "HEALTHY" or pool["target"] == 0
                 or pool["valid_until"] <= datetime.now(UTC)):
                 return None
             profile = parse_pool(pool["spec"])
-            if pool["group_id"] != initial["group_id"] or profile.kind != parse_pool(initial["spec"]).kind:
-                return None
-            group = await row(c, "SELECT * FROM runtime_groups WHERE group_id=:id", id=pool["group_id"])
-            used = await row(c, """SELECT count(*) AS group_used,
-                count(*) FILTER(WHERE a.pool_id=:pool) AS pool_used FROM runtime_inflight_attempts a
-                JOIN runtime_pools p USING(pool_id) WHERE a.compute_held AND p.group_id=:g
-                AND (:llm OR COALESCE(p.spec->>'kind','llm')<>'llm')""",
-                pool=pool_id, g=pool["group_id"], llm=profile.kind == "llm")
-            endpoint_limit = profile.transport_limit if profile.kind == "llm" else min(
-                pool["target"], pool["hard_ceiling"])
-            lower_usage = (await endpoint_usage(c, pool_id))["lower_class"] if profile.kind == "llm" else 0
-            if (group["health"] != "HEALTHY"
-                or (profile.kind != "llm" and used["group_used"] >= group["hard_ceiling"])
-                or used["pool_used"] >= endpoint_limit
-                or (profile.kind == "llm" and lower_usage >= profile.background_transport_limit)):
-                return None
-            # QA waiting for this endpoint gets the next safe transport opening.
-            # No global GPU turn clock or model-count-derived capacity is used.
-            foreground_waiting = await row(c, """SELECT 1 FROM runtime_direct_waiters
-                WHERE pool_id=:pool AND workload_class IN ('qa','user_task') AND deadline>now()
-                ORDER BY created_at LIMIT 1""", pool=pool_id)
-            if foreground_waiting:
+            group = await row(c, "SELECT health FROM runtime_groups WHERE group_id=:id",
+                              id=pool["group_id"])
+            if not group or group["health"] != "HEALTHY":
                 return None
             # Tenant service history is aggregated first, so splitting a job
             # into many roots does not gain priority over another tenant.
             candidates = await rows(c, """SELECT o.*,r.spec AS root_spec,r.reserved,r.spent,
                 r.budget_limit,r.attempts AS root_attempts,r.deadline AS root_deadline,
+                r.priority AS root_priority,
                 clock_timestamp() AS observed_at
                 FROM runtime_operations o JOIN runtime_roots r USING(root_id)
                 WHERE o.state IN ('READY','RETRY_WAIT') AND (o.retry_at IS NULL OR o.retry_at<=now())
@@ -478,6 +452,8 @@ class Store:
                 return Reservation(attempt_id=attempt_id, operation=spec, pool_id=pool_id,
                     engine_epoch=pool["engine_epoch"], model_revision=pool["spec"]["model_revision"],
                     owner_id=owner_id, lease_epoch=number,
+                    workload_class=("user_task" if candidate["root_priority"] == "interactive"
+                                    else candidate["root_priority"]),
                     attempt_deadline=min(candidate["root_deadline"], spec.deadline or candidate["root_deadline"], attempt["created_at"]
                         + timedelta(seconds=spec.attempt_timeout_seconds)))
             return None
@@ -519,6 +495,12 @@ class Store:
                     until=datetime.now(UTC)+timedelta(seconds=self.lease_seconds), id=reservation.attempt_id)
             return (not a["cancel_requested"] and a["root_state"] == "RUNNING"
                     and a["operation_state"] not in ("SUCCEEDED", "FAILED", "CANCELLED"))
+
+    async def attempt_compute_held(self, attempt_id: str) -> bool:
+        async with self.engine.connect() as c:
+            attempt = await row(c, "SELECT compute_held FROM runtime_attempts WHERE attempt_id=:id",
+                                id=attempt_id)
+            return bool(attempt and attempt["compute_held"])
 
     async def compute_finished(self, reservation: Reservation):
         async with self.transaction() as c:

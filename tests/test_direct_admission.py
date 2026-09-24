@@ -1,310 +1,456 @@
+"""rc18 direct permits live in RAM; durable ledger still owns task recovery."""
+
 import asyncio
-import json
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 
 import pytest
 from conftest import operation, pool, root
-from sqlalchemy import text
+from sqlalchemy import event, text
 
-from intramind_runtime.contracts import AdmissionDenied, EmbeddingPoolSpec, RuntimeConflict
-from intramind_runtime.direct import DirectAdmissions, DirectRequest
+from intramind_runtime.contracts import (
+    AdmissionDenied,
+    EmbeddingPoolSpec,
+    RerankPoolSpec,
+    RuntimeConflict,
+)
+from intramind_runtime.direct import DirectRequest
+from intramind_runtime.memory_scheduler import MemoryScheduler
 from intramind_runtime.metrics import snapshot
 
 pytestmark = pytest.mark.integration
 
 
 def request(request_id="direct", **changes):
-    values = dict(
-        request_id=request_id,
-        tenant_id="t",
-        payload_digest="a" * 64,
-        model_profile="test",
-        capacity_profile_id="test-v1",
-        request_bound=30,
-        deadline=datetime.now(UTC) + timedelta(minutes=5),
-    )
+    values = dict(request_id=request_id, tenant_id="t", payload_digest="a" * 64,
+                  model_profile="test", capacity_profile_id="test-v1",
+                  request_bound=30, deadline=datetime.now(UTC)+timedelta(minutes=5))
     return DirectRequest(**(values | changes))
 
 
-async def admit(direct, request, pool_id, owner_id):
-    """Keep direct unit grants behind the same live waiter contract as the proxy."""
-    await direct.enqueue(request, pool_id, owner_id)
+async def admit(scheduler, item, pool_id="p", owner_id="owner"):
+    await scheduler.enqueue(item, pool_id, owner_id)
+    return await scheduler.reserve(item, pool_id, owner_id)
+
+
+async def durable(scheduler, reservation):
+    return await scheduler.durable(reservation.attempt_id, reservation.pool_id,
+        reservation.owner_id, reservation.engine_epoch, reservation.workload_class,
+        reservation.attempt_deadline)
+
+
+async def test_direct_request_has_zero_sql_statements_after_start(store):
+    await store.configure_pool(pool(transport_limit=4, background_transport_limit=2), 4)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    scheduler._task.cancel()  # Periodic control refresh is unrelated to request SQL.
+    await asyncio.gather(scheduler._task, return_exceptions=True)
+    statements = []
+
+    def count_sql(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(store.engine.sync_engine, "before_cursor_execute", count_sql)
     try:
-        reservation = await direct.reserve(request, pool_id, owner_id)
-    except BaseException:
-        await direct.leave(request.request_id, owner_id)
-        raise
-    if reservation is None:
-        await direct.leave(request.request_id, owner_id)
-    return reservation
+        for index in range(100):
+            held = await admit(scheduler, request(f"zero-sql-{index}"))
+            assert held is not None
+            await scheduler.mark_send(held)
+            await scheduler.finish(held)
+    finally:
+        event.remove(store.engine.sync_engine, "before_cursor_execute", count_sql)
+        await scheduler.close()
+    assert statements == []
 
 
-async def expire(store, attempt_id):
-    async with store.engine.begin() as connection:
-        await connection.execute(text("""UPDATE runtime_direct_attempts
-            SET lease_expires_at=now()-interval '1 second'
-            WHERE attempt_id=:id"""), {"id": attempt_id})
-
-
-async def test_direct_and_background_race_for_endpoint_transport_bound(store):
-    await store.configure_pool(pool(target=1, transport_limit=2,
-                                    background_transport_limit=2), 1)
-    await store.create_root(root())
-    await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
-    results = await asyncio.gather(
-        store.reserve_next("p", "background-owner"),
-        *(admit(direct, request(f"direct-{i}"), "p", f"direct-owner-{i}") for i in range(8)),
-    )
-    assert sum(result is not None for result in results) == 2
-    assert (await store.drain_status())["compute_held"] == 2
-    assert await store.reserve_next("p", "another-background-owner") is None
-    assert await admit(direct, request("another-direct"), "p", "another-direct-owner") is None
-
-
-async def test_independent_llm_endpoints_are_not_serialized_by_gpu_group(store):
-    await store.configure_pool(pool(target=2), 1)
-    await store.configure_pool(pool("p2", target=2), 1)
-    await store.create_root(root())
-    await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
-    held = await admit(direct, request(), "p", "owner")
-    assert held is not None
-    assert await store.reserve_next("p2", "background-owner") is not None
-    assert await admit(direct, request("other"), "p2", "other-owner") is not None
-    await direct.finish(held, evidence="not_sent")
-
-
-async def test_unsent_expiry_releases_once_and_fences_the_old_worker(store):
-    await store.configure_pool(pool(target=1), 1)
-    direct = DirectAdmissions(store)
-    held = await admit(direct, request(), "p", "owner")
-    await expire(store, held.attempt_id)
-    assert not await direct.heartbeat(held)
-    await store.reconcile_expired()
-    await store.reconcile_expired()
-    assert (await store.drain_status())["compute_held"] == 0
-    assert not await direct.heartbeat(held)
-    with pytest.raises(RuntimeConflict):
-        await direct.mark_send(held)
-    assert await admit(direct, request("next"), "p", "next-owner") is not None
-
-
-async def test_sent_expiry_is_unknown_until_backend_termination_is_confirmed(store):
+async def test_qa_waiter_precedes_user_task_and_durable_background(store):
     await store.configure_pool(pool(target=1, transport_limit=1,
                                     background_transport_limit=1), 1)
-    direct = DirectAdmissions(store)
-    held = await admit(direct, request(), "p", "owner")
-    await direct.mark_send(held)
-    await expire(store, held.attempt_id)
-    assert not await direct.heartbeat(held)
-    await store.reconcile_expired()
-    status = await store.drain_status()
-    assert status["compute_held"] == status["unknown_attempts"] == status["unsettled_attempts"] == 1
-    assert not await direct.heartbeat(held)
-    assert await admit(direct, request("next"), "p", "next-owner") is None
-    metrics = (await snapshot(store)).decode()
-    assert 'intramind_runtime_compute_held{pool="p"} 1.0' in metrics
-    assert await store.confirm_epoch_stopped("p", "e1", "fixture process exited") == 1
-    assert await store.confirm_epoch_stopped("p", "e1", "fixture process exited") == 0
-    assert (await store.drain_status())["unsettled_attempts"] == 0
+    await store.create_root(root(priority="background"))
+    await store.submit_operation(operation())
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        task = request("tool", workload_class="user_task")
+        qa = request("qa", workload_class="qa")
+        await scheduler.enqueue(task, "p", "direct")
+        await scheduler.enqueue(qa, "p", "direct")
+        reservation = await store.reserve_next("p", "executor")
+        assert reservation.workload_class == "background"
+        background = asyncio.create_task(durable(scheduler, reservation))
+        await asyncio.sleep(0)
+        assert not background.done()
+        assert await scheduler.reserve(task, "p", "direct") is None
+        qa_held = await scheduler.reserve(qa, "p", "direct")
+        assert qa_held is not None
+        assert not background.done()
+        await scheduler.finish(qa_held, evidence="not_sent")
+        tool_held = await scheduler.reserve(task, "p", "direct")
+        assert tool_held is not None
+        assert not background.done()
+        await scheduler.finish(tool_held, evidence="not_sent")
+        permit = await asyncio.wait_for(background, 2)
+        assert permit.attempt_id == reservation.attempt_id
+        assert len(scheduler.permits) == 1
+        with pytest.raises(RuntimeConflict, match="termination"):
+            await scheduler.durable_release(reservation.attempt_id, reservation.owner_id)
+        await store.fail(reservation, "not_sent", not_sent=True, retry=False)
+        await scheduler.durable_release(reservation.attempt_id, reservation.owner_id)
+        assert not scheduler.permits
+    finally:
+        await scheduler.close()
 
 
-async def test_identity_owner_and_tenant_are_fenced_without_consuming_more_capacity(store):
-    await store.configure_pool(pool(target=2), 2)
-    direct = DirectAdmissions(store)
-    original = request()
-    held = await admit(direct, original, "p", "owner")
-    again = await admit(direct, original, "p", "owner")
-    assert again.attempt_id == held.attempt_id
-    with pytest.raises(RuntimeConflict):
-        await admit(direct, original.model_copy(update={"payload_digest": "b" * 64}), "p", "owner")
-    with pytest.raises(RuntimeConflict):
-        await admit(direct, original, "p", "other-owner")
-    impostor = held.model_copy(update={"owner_id": "other-owner"})
-    with pytest.raises(RuntimeConflict):
-        await direct.heartbeat(impostor)
-    with pytest.raises(RuntimeConflict):
-        await direct.mark_send(impostor)
-    with pytest.raises(RuntimeConflict):
-        await direct.finish(impostor, evidence="not_sent")
-    foreign = held.model_copy(update={
-        "request": original.model_copy(update={"tenant_id": "other-tenant"})
-    })
-    with pytest.raises(RuntimeConflict):
-        await direct.mark_send(foreign)
-    with pytest.raises(RuntimeConflict):
-        await direct.finish(foreign, evidence="not_sent")
-    assert await direct.heartbeat(held)
-    assert (await store.drain_status())["compute_held"] == 1
-    other_tenant = await admit(direct,
-        original.model_copy(update={"tenant_id": "other-tenant"}), "p", "other-owner"
-    )
-    assert other_tenant.attempt_id != held.attempt_id
+async def test_lower_class_cap_reserves_qa_headroom(store):
+    await store.configure_pool(pool(transport_limit=3, background_transport_limit=1), 1)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        tool = await admit(scheduler, request("tool", workload_class="user_task"))
+        assert tool is not None
+        queued = request("background", workload_class="background")
+        await scheduler.enqueue(queued, "p", "owner")
+        assert await scheduler.reserve(queued, "p", "owner") is None
+        question = await admit(scheduler, request("question", workload_class="qa"))
+        assert question is not None
+        assert len(scheduler.permits) == 2
+        await scheduler.finish(tool, evidence="not_sent")
+        background = await scheduler.reserve(queued, "p", "owner")
+        assert background is not None, "released lower-class slot can be reused"
+        await scheduler.finish(question, evidence="not_sent")
+        await scheduler.finish(background, evidence="not_sent")
+    finally:
+        await scheduler.close()
 
 
-async def test_completed_request_is_not_sent_twice_and_double_finish_keeps_other_permit(store):
-    await store.configure_pool(pool(target=2, transport_limit=2,
-                                    background_transport_limit=2), 2)
-    direct = DirectAdmissions(store)
-    original = request()
-    held = await admit(direct, original, "p", "owner")
-    other = await admit(direct, request("other"), "p", "other-owner")
-    await direct.mark_send(held)
-    await direct.finish(held, evidence="completed_response")
-    await direct.finish(held, evidence="completed_response")
-    assert await admit(direct, original, "p", "owner") is None
-    assert (await store.drain_status())["compute_held"] == 1
-    assert await direct.heartbeat(other)
-    assert await admit(direct, request("third"), "p", "third-owner") is not None
-    assert await admit(direct, request("fourth"), "p", "fourth-owner") is None
-
-
-@pytest.mark.parametrize("changes", [
-    {"capacity_profile_id": "old-profile"},
-    {"model_profile": "other-model"},
-    {"request_bound": 1025},
-    {"kind": "embedding"},
-])
-async def test_invalid_request_fit_does_not_hold_capacity(store, changes):
+async def test_non_llm_group_ceiling_does_not_serialize_llm_pools(store):
+    embedding = EmbeddingPoolSpec(**(pool("embedding", target=1).model_dump(
+        exclude={"context_limit"}) | {"character_limit": 40, "max_batch_size": 2}))
+    rerank = RerankPoolSpec(**(pool("rerank", target=1).model_dump(
+        exclude={"context_limit"}) | {"character_limit": 40, "max_batch_size": 2}))
     await store.configure_pool(pool(target=1), 1)
-    direct = DirectAdmissions(store)
-    with pytest.raises(AdmissionDenied):
-        await admit(direct, request(**changes), "p", "owner")
-    assert (await store.drain_status())["compute_held"] == 0
-    assert await admit(direct, request("valid"), "p", "owner") is not None
+    await store.configure_pool(embedding, 1)
+    await store.configure_pool(rerank, 1)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        held = await admit(scheduler, request("embedding", kind="embedding",
+            request_bound=40, batch_size=2), "embedding")
+        assert held is not None
+        other = request("rerank", kind="rerank", request_bound=40, batch_size=2)
+        await scheduler.enqueue(other, "rerank", "owner")
+        assert await scheduler.reserve(other, "rerank", "owner") is None
+        assert await admit(scheduler, request("llm")) is not None
+        await scheduler.finish(held, evidence="not_sent")
+        assert await scheduler.reserve(other, "rerank", "owner") is not None
+    finally:
+        await scheduler.close()
 
 
-async def test_expired_request_and_stopped_target_cannot_be_admitted(store):
-    await store.configure_pool(pool(target=1), 1)
-    direct = DirectAdmissions(store)
-    assert await admit(direct,
-        request(deadline=datetime.now(UTC) - timedelta(seconds=1)), "p", "owner"
-    ) is None
-    await store.update_target("p", 0, 1, "operator drain")
-    assert await admit(direct, request("fresh"), "p", "owner") is None
-    assert (await store.drain_status())["compute_held"] == 0
+async def test_identity_ttl_and_invalid_request_do_not_consume_capacity(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    scheduler = MemoryScheduler(store, request_ttl_seconds=1)
+    await scheduler.start()
+    try:
+        original = request()
+        await scheduler.enqueue(original, "p", "owner")
+        assert await scheduler.enqueue(original, "p", "owner")
+        with pytest.raises(RuntimeConflict):
+            await scheduler.enqueue(original.model_copy(update={"payload_digest": "b"*64}),
+                                    "p", "owner")
+        with pytest.raises(RuntimeConflict):
+            await scheduler.enqueue(original, "p", "other-owner")
+        held = await scheduler.reserve(original, "p", "owner")
+        await scheduler.mark_send(held)
+        await scheduler.finish(held)
+        with pytest.raises(RuntimeConflict, match="already accepted"):
+            await scheduler.enqueue(original, "p", "owner")
+        for changes in ({"capacity_profile_id": "old"}, {"model_profile": "foreign"},
+                        {"request_bound": 1025}, {"kind": "embedding"}):
+            with pytest.raises(AdmissionDenied):
+                await scheduler.enqueue(request("invalid-"+str(changes), **changes), "p", "owner")
+        assert not scheduler.permits
+    finally:
+        await scheduler.close()
 
 
-async def test_embedding_limits_hold_cpu_capacity_without_serializing_llm(store):
-    await store.configure_pool(pool(target=1), 1)
-    embedding_pool = EmbeddingPoolSpec(**(pool("embedding", target=1).model_dump(
-        exclude={"context_limit"}
-    ) | {"character_limit": 40, "max_batch_size": 2}))
-    await store.configure_pool(embedding_pool, 1)
+async def test_unknown_direct_keeps_slot_until_epoch_is_confirmed_stopped(store):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1)
+    await store.configure_pool(spec, 1)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        original = request(expected_engine_epoch="e1")
+        held = await admit(scheduler, original)
+        await scheduler.mark_send(held)
+        await scheduler.unknown(held, "transport_lost")
+        next_request = request("next")
+        await scheduler.enqueue(next_request, "p", "owner")
+        assert await scheduler.reserve(next_request, "p", "owner") is None
+        await store.quiesce_engine("p", "e1", "operator")
+        await store.confirm_epoch_stopped("p", "e1", "fixture process stopped")
+        await store.configure_pool(spec.model_copy(update={"engine_epoch": "e2"}), 1)
+        await scheduler._refresh()
+        assert scheduler.direct_attempts[held.attempt_id].state == "FAILED_RECOVERABLE"
+        assert not scheduler.permits
+        await scheduler.leave(next_request.request_id, "owner")
+        await scheduler.enqueue(original, "p", "owner")
+        replacement = await scheduler.retry_confirmed(original, "p", "owner", held.attempt_id)
+        assert replacement.engine_epoch == "e2" and replacement.generation == 1
+        await scheduler.finish(replacement, evidence="not_sent")
+    finally:
+        await scheduler.close()
+
+
+async def test_restart_hydrates_durable_held_and_unknown_is_not_reclaimed(store):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1)
+    await store.configure_pool(spec, 1)
     await store.create_root(root())
     await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
-    for changes in ({"request_bound": 41}, {"batch_size": 3}):
-        with pytest.raises(AdmissionDenied):
-            await admit(direct, request(kind="embedding", **changes), "embedding", "owner")
-    held = await admit(direct,
-        request("embedding-valid", kind="embedding", request_bound=40, batch_size=2),
-        "embedding", "owner",
-    )
-    assert held is not None
-    assert await store.reserve_next("p", "llm-owner") is not None
-    assert (await store.run("r", "t"))["reserved"] > 0
+    attempt = await store.reserve_next("p", "worker")
+    await store.mark_send(attempt)
+    await store.unknown(attempt, "lost transport")
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        assert attempt.attempt_id in scheduler.permits
+        item = request("blocked")
+        await scheduler.enqueue(item, "p", "owner")
+        assert await scheduler.reserve(item, "p", "owner") is None
+        await scheduler._reconcile_durable()
+        assert attempt.attempt_id in scheduler.permits
+        with pytest.raises(RuntimeConflict, match="termination"):
+            await scheduler.durable_release(attempt.attempt_id, attempt.owner_id)
+        await store.confirm_epoch_stopped("p", "e1", "fixture process stopped")
+        await scheduler._reconcile_durable()
+        assert attempt.attempt_id not in scheduler.permits
+    finally:
+        await scheduler.close()
 
 
-async def test_epoch_change_waits_for_direct_compute_and_fences_late_release(store):
-    original_pool = pool(target=1)
-    await store.configure_pool(original_pool, 1)
-    direct = DirectAdmissions(store)
-    held = await admit(direct, request(), "p", "owner")
-    await direct.mark_send(held)
-    await direct.unknown(held, "response_lost")
-    changed_pool = original_pool.model_copy(update={"engine_epoch": "e2"})
-    with pytest.raises(RuntimeConflict):
-        await store.configure_pool(changed_pool, 1)
-    await store.confirm_epoch_stopped("p", "e1", "fixture engine stopped")
-    await store.configure_pool(changed_pool, 1)
-    fresh = await admit(direct, request("new-epoch"), "p", "next-owner")
-    assert fresh.engine_epoch == "e2"
-    with pytest.raises(RuntimeConflict):
-        await direct.mark_send(held)
-    await direct.finish(held, evidence="completed_response")
-    assert (await store.drain_status())["compute_held"] == 1
-    assert await direct.heartbeat(fresh)
-
-
-async def test_waiting_qa_claims_next_endpoint_opening_before_background(store):
-    await store.configure_pool(pool(target=1, transport_limit=2,
-                                    background_transport_limit=2), 1)
-    await store.create_root(root(priority="background"))
-    await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
-    qa = request("qa", workload_class="qa")
-    await direct.enqueue(qa, "p", "owner")
-    assert await store.reserve_next("p", "background-owner") is None
-    held = await admit(direct, qa, "p", "owner")
-    assert held is not None
-    background = await store.reserve_next("p", "background-owner")
-    assert background.operation.operation_id == "o"
-
-
-async def test_qa_waiter_precedes_user_task_without_model_ratio(store):
-    await store.configure_pool(pool(target=1, transport_limit=2,
-                                    background_transport_limit=2), 1)
-    direct = DirectAdmissions(store)
-    tool = request("tool", workload_class="user_task")
-    qa = request("qa", workload_class="qa")
-    await direct.enqueue(tool, "p", "owner")
-    await direct.enqueue(qa, "p", "owner")
-    assert await admit(direct, tool, "p", "owner") is None
-    assert await admit(direct, qa, "p", "owner") is not None
-    assert await admit(direct, tool, "p", "owner") is not None
-
-
-async def test_direct_user_task_and_durable_background_share_lower_class_cap(store):
-    await store.configure_pool(pool(transport_limit=3, background_transport_limit=1), 1)
-    await store.create_root(root(priority="background"))
-    await store.submit_operation(operation())
-    direct = DirectAdmissions(store)
-    held = await admit(direct, request("tool", workload_class="user_task"), "p", "tool-owner")
-    assert held is not None
-    assert await admit(direct, request("next", workload_class="background"), "p", "next-owner") is None
-    assert await store.reserve_next("p", "background-owner") is None
-    qa = await admit(direct, request("question", workload_class="qa"), "p", "qa-owner")
-    assert qa is not None, "the lower-class safety cap must leave room for QA"
-    await direct.finish(held, evidence="not_sent")
-    assert await store.reserve_next("p", "background-owner") is not None
-
-
-async def test_cross_pool_reservation_rechecks_shared_root_budget(store):
-    await store.configure_pool(pool(transport_limit=2, background_transport_limit=2), 1)
-    await store.configure_pool(pool("other", transport_limit=2, background_transport_limit=2), 1)
-    await store.create_root(root(budget_limit=30))
-    await store.submit_operation(operation("one"))
-    await store.submit_operation(operation("two"))
-    granted = await asyncio.gather(store.reserve_next("p", "one-owner"),
-                                   store.reserve_next("other", "other-owner"))
-    assert sum(item is not None for item in granted) == 1
-    assert (await store.run("r", "t"))["reserved"] == 30
-
-
-async def test_watchdog_quiesce_token_and_replacement_proof_are_fenced(store):
+async def test_second_live_api_owner_is_fenced(store):
     await store.configure_pool(pool(), 1)
-    await store.quiesce_engine("p", "e1", "owner-a")
-    await store.quiesce_engine("p", "e1", "owner-a")
-    assert (await store.inspect_engine("p"))["quiesce_owned"] is True
-    with pytest.raises(RuntimeConflict):
-        await store.quiesce_engine("p", "e1", "owner-b")
-    with pytest.raises(RuntimeConflict):
-        await store.resume_engine("p", "e1", "owner-b")
-    invalid = {"pool_id": "p", "engine_epoch": "e1",
-        "verification": "container_stopped_or_replaced", "old_container_id": None,
-        "old_started_at": "2026-09-24T01:00:00Z", "observed_container_id": "new",
-        "observed_started_at": "2026-09-24T01:01:00Z", "model_pid": None}
-    with pytest.raises(ValueError):
-        await store.confirm_epoch_stopped("p", "e1", json.dumps(invalid), recover=True)
-    await store.resume_engine("p", "e1", "owner-a")
-    assert (await store.inspect_engine("p"))["health"] == "HEALTHY"
-    await store.quiesce_engine("p", "e1", "owner-a")
-    # Docker stop/start retains the container ID but advances StartedAt.
-    proof = invalid | {"old_container_id": "new",
-        "verified_stopped_at": "2026-09-24T01:02:00Z"}
-    assert await store.confirm_epoch_stopped("p", "e1", json.dumps(proof), recover=True) == 0
-    await store.configure_pool(pool().model_copy(update={"engine_epoch": "e2"}), 1)
-    status = await store.inspect_engine("p")
-    assert status["health"] == "HEALTHY" and status["quiesce_owned"] is False
+    first = MemoryScheduler(store)
+    second = MemoryScheduler(store)
+    await first.start()
+    try:
+        with pytest.raises(RuntimeConflict, match="another runtime-api"):
+            await second.start()
+    finally:
+        await first.close()
+    await second.start()
+    await second.close()
+
+
+async def test_dead_waiter_is_evicted_before_next_grant(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        expired = request("expired", deadline=datetime.now(UTC)+timedelta(milliseconds=20))
+        await scheduler.enqueue(expired, "p", "owner")
+        await asyncio.sleep(0.03)
+        fresh = request("fresh")
+        assert await admit(scheduler, fresh) is not None
+        assert "expired" not in scheduler.waiters
+    finally:
+        await scheduler.close()
+
+
+async def test_dirty_native_pool_reopens_at_old_lease_plus_restart_drain(store, caplog):
+    embedding = EmbeddingPoolSpec(**(pool("embedding", target=1).model_dump(
+        exclude={"context_limit"}) | {"character_limit": 40, "max_batch_size": 2}))
+    await store.configure_pool(embedding, 1)
+    first = MemoryScheduler(store, attempt_timeouts={"embedding": 1800},
+                            restart_drain_seconds={"embedding": 0.8})
+    await first.start()
+    in_flight = await admit(first, request("old-embed", kind="embedding",
+        request_bound=40, batch_size=2), "embedding")
+    await first.mark_send(in_flight)
+    await first.close()
+    async with store.engine.begin() as c:
+        await c.execute(text("""UPDATE runtime_owners SET
+            lease_expires_at=now()-interval '0.2 second'
+            WHERE owner_id='runtime-api-pool:embedding'"""))
+    restarted = MemoryScheduler(store, attempt_timeouts={"embedding": 1800},
+                                restart_drain_seconds={"embedding": 0.8})
+    await restarted.start()
+    try:
+        remaining = restarted._ready_by_pool["embedding"] - monotonic()
+        assert 0.4 < remaining < 0.8
+        fresh = request("new-embed", kind="embedding", request_bound=40, batch_size=2)
+        await restarted.enqueue(fresh, "embedding", "owner")
+        assert await restarted.reserve(fresh, "embedding", "owner") is None
+        assert restarted.dirty_blocked()["embedding"] == 1
+        metrics = (await snapshot(store, restarted)).decode()
+        assert 'intramind_runtime_dirty_recovery_blocked{pool="embedding"} 1.0' in metrics
+        await asyncio.sleep(max(0, remaining-0.1))
+        assert await restarted.reserve(fresh, "embedding", "owner") is None
+        await asyncio.sleep(0.12)
+        assert restarted.dirty_blocked()["embedding"] == 0
+        assert await restarted.reserve(fresh, "embedding", "owner") is not None
+        assert "blocks capacity after unclean runtime-api exit" in caplog.text
+    finally:
+        await restarted.close()
+
+
+async def test_idle_native_pool_crash_uses_configured_drain_not_durable_timeout(store):
+    embedding = EmbeddingPoolSpec(**(pool("embedding", target=1).model_dump(
+        exclude={"context_limit"}) | {"character_limit": 40, "max_batch_size": 2}))
+    await store.configure_pool(embedding, 1)
+    first = MemoryScheduler(store, attempt_timeouts={"embedding": 1800})
+    await first.start()
+    # An unclean exit leaves the owner row, even though no request was active.
+    first._task.cancel()
+    await asyncio.gather(first._task, return_exceptions=True)
+    async with store.engine.begin() as c:
+        await c.execute(text("""UPDATE runtime_owners SET
+            lease_expires_at=now()-interval '0.2 second'
+            WHERE owner_id='runtime-api-pool:embedding'"""))
+    restarted = MemoryScheduler(store, attempt_timeouts={"embedding": 1800},
+                                restart_drain_seconds={"embedding": 0.4})
+    await restarted.start()
+    try:
+        fresh = request("after-idle-crash", kind="embedding", request_bound=40,
+                        batch_size=2)
+        await restarted.enqueue(fresh, "embedding", "owner")
+        assert await restarted.reserve(fresh, "embedding", "owner") is None
+        assert restarted.dirty_blocked()["embedding"] == 1
+        await asyncio.sleep(0.24)
+        assert restarted.dirty_blocked()["embedding"] == 0
+        assert await restarted.reserve(fresh, "embedding", "owner") is not None
+    finally:
+        await restarted.close()
+        await first.close()
+
+
+def test_restart_drain_rejects_invalid_values():
+    for value in (0, -1, float("inf"), float("nan"), True, "30"):
+        with pytest.raises(ValueError, match="restart_drain_seconds"):
+            MemoryScheduler(None, restart_drain_seconds={"embedding": value})
+
+
+async def test_restart_requeues_reserved_durable_without_oversubscribing(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    reservations = []
+    for index in range(5):
+        root_id = f"root-{index}"
+        await store.create_root(root(root_id, priority="background"))
+        await store.submit_operation(operation(f"op-{index}", root_id))
+        reservations.append(await store.reserve_next("p", f"worker-{index}"))
+    active, pending = reservations[0], reservations[1:]
+    await store.mark_send(active)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    tasks = [asyncio.create_task(durable(scheduler, item)) for item in pending]
+    try:
+        assert set(scheduler.permits) == {active.attempt_id}
+        await asyncio.sleep(0.05)
+        assert all(not task.done() for task in tasks)
+        assert len(scheduler.permits) == 1
+        await store.compute_finished(active)
+        await scheduler._reconcile_durable()
+        for _ in pending:
+            done, _ = await asyncio.wait(tasks, timeout=2,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            assert len(done) == 1
+            task = done.pop()
+            tasks.remove(task)
+            permit = task.result()
+            assert len(scheduler.permits) == 1
+            reservation = next(item for item in pending if item.attempt_id == permit.attempt_id)
+            await store.fail(reservation, "not_sent", not_sent=True, retry=False)
+            await scheduler.durable_release(permit.attempt_id, permit.owner_id)
+        assert not scheduler.permits
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await scheduler.close()
+
+
+async def test_epoch_mismatch_removes_durable_head_waiter_immediately(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    await store.create_root(root(priority="background"))
+    await store.submit_operation(operation())
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    old_direct = await admit(scheduler, request("occupy"))
+    reservation = await store.reserve_next("p", "worker")
+    waiting = asyncio.create_task(durable(scheduler, reservation))
+    try:
+        async with asyncio.timeout(2):
+            while reservation.attempt_id not in scheduler.waiters:
+                await asyncio.sleep(0.01)
+        scheduler.pools["p"].epoch = "e2"
+        scheduler._notify()
+        with pytest.raises(RuntimeConflict, match="engine epoch changed"):
+            await asyncio.wait_for(waiting, 2)
+        assert reservation.attempt_id not in scheduler.waiters
+        await scheduler.finish(old_direct, evidence="not_sent")
+        fresh = await admit(scheduler, request("fresh-after-epoch"))
+        assert fresh is not None and fresh.engine_epoch == "e2"
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await scheduler.close()
+
+
+async def test_cancelled_duplicate_acquire_keeps_other_waiter_live(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    await store.create_root(root())
+    await store.submit_operation(operation())
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    reservation = await store.reserve_next("p", "worker")
+    scheduler.pools["p"].target = 0
+    first = asyncio.create_task(durable(scheduler, reservation))
+    second = asyncio.create_task(durable(scheduler, reservation))
+    try:
+        async with asyncio.timeout(2):
+            while scheduler._durable_waiter_refs[reservation.attempt_id] != 2:
+                await asyncio.sleep(0.01)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        assert reservation.attempt_id in scheduler.waiters
+        scheduler.pools["p"].target = 1
+        scheduler._notify()
+        assert (await asyncio.wait_for(second, 2)).attempt_id == reservation.attempt_id
+        assert reservation.attempt_id not in scheduler.waiters
+        assert reservation.attempt_id not in scheduler._durable_waiter_refs
+    finally:
+        for task in (first, second):
+            task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await scheduler.close()
+
+
+async def test_cancelled_durable_operation_cannot_block_queue_head(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    await store.create_root(root())
+    await store.submit_operation(operation())
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    reservation = await store.reserve_next("p", "worker")
+    scheduler.pools["p"].target = 0
+    waiting = asyncio.create_task(durable(scheduler, reservation))
+    try:
+        async with asyncio.timeout(2):
+            while reservation.attempt_id not in scheduler.waiters:
+                await asyncio.sleep(0.01)
+        await store.cancel("r", "t")
+        with pytest.raises(RuntimeConflict, match="no longer dispatchable"):
+            await asyncio.wait_for(waiting, 2)
+        assert reservation.attempt_id not in scheduler.waiters
+        scheduler.pools["p"].target = 1
+        assert await admit(scheduler, request("qa-after-cancel")) is not None
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await scheduler.close()

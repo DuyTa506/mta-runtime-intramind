@@ -17,15 +17,20 @@ log = logging.getLogger(__name__)
 
 class Executor:
     def __init__(self, store: Store, artifacts: ArtifactPort, driver: EngineDriver,
-                 pool_id: str, owner_id: str):
+                 pool_id: str, owner_id: str, permit_client):
         self.store, self.artifacts, self.driver = store, artifacts, driver
         self.pool_id, self.owner_id = pool_id, owner_id
+        if permit_client is None:
+            raise ValueError("executor requires runtime-api permits")
+        self.permits = permit_client
 
-    async def _heartbeat(self, reservation):
+    async def _heartbeat(self, reservation, permit_ready):
         while True:
             await asyncio.sleep(self.store.lease_seconds / 3)
             try:
                 active = await self.store.heartbeat(reservation)
+                if permit_ready.is_set():
+                    await self.permits.heartbeat(reservation)
                 if not active:
                     await self.driver.cancel(reservation)
             except Exception:
@@ -37,16 +42,30 @@ class Executor:
         reservation = await self.store.reserve_next(self.pool_id, self.owner_id)
         if reservation is None:
             return False
-        heartbeat = asyncio.create_task(self._heartbeat(reservation))
+        permit_ready = asyncio.Event()
+        heartbeat = asyncio.create_task(self._heartbeat(reservation, permit_ready))
         send_marked = False
         try:
             remaining = (reservation.attempt_deadline - datetime.now(UTC)).total_seconds()
             if remaining <= 0:
                 raise DriverFailure("attempt_deadline_exceeded", not_sent=True, retry=True)
             try:
+                await self.permits.acquire(reservation)
+                permit_ready.set()
+            except TimeoutError as exc:
+                raise DriverFailure("attempt_deadline_exceeded", not_sent=True,
+                                    retry=True) from exc
+            remaining = (reservation.attempt_deadline - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                raise DriverFailure("attempt_deadline_exceeded", not_sent=True, retry=True)
+            try:
                 async with asyncio.timeout(remaining) as deadline:
                     payload = json.loads(await self.artifacts.get(reservation.operation.payload))
+                    # The durable SEND_INTENT commit precedes the final permit
+                    # check. A runtime-api crash in this narrow window then
+                    # hydrates the attempt as occupied on restart.
                     await self.store.mark_send(reservation)
+                    await self.permits.heartbeat(reservation)
                     send_marked = True
                     result = await self.driver.execute(reservation, payload)
             except TimeoutError as exc:
@@ -61,6 +80,12 @@ class Executor:
                     if not termination_recorded:
                         await self.store.compute_finished(reservation)
                         termination_recorded = True
+                        try:
+                            await self.permits.release(reservation)
+                            permit_ready.clear()
+                        except Exception:
+                            log.exception("permit release will be reconciled: %s",
+                                          reservation.attempt_id)
                     attachments = ()
                     document = result.model_dump(mode="json")
                     if isinstance(result, SpeechResult):
@@ -102,6 +127,10 @@ class Executor:
             raise
         except RuntimeConflict:
             # A fenced worker may neither send nor change another owner's state.
+            if not send_marked:
+                with suppress(Exception):
+                    await self.store.fail(reservation, "permit_fenced_before_send",
+                                          not_sent=True, retry=True)
             log.warning("attempt fenced: %s", reservation.attempt_id)
         except Exception:
             with suppress(Exception):
@@ -114,4 +143,11 @@ class Executor:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
+            if permit_ready.is_set():
+                try:
+                    if not await self.store.attempt_compute_held(reservation.attempt_id):
+                        await self.permits.release(reservation)
+                except Exception:
+                    log.exception("permit retained pending DB reconciliation: %s",
+                                  reservation.attempt_id)
         return True

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from conftest import operation, pool, root
-from fakes import MemoryArtifacts
+from fakes import MemoryArtifacts, TestPermits
 
 from intramind_runtime.api import create_app
 from intramind_runtime.client import RuntimeClient
@@ -273,7 +273,7 @@ async def test_embedding_result_persistence_failure_does_not_repeat_compute(stor
     monkeypatch.setattr(blobs, "put", flaky)
     async with httpx.AsyncClient(base_url="http://serving/", transport=httpx.MockTransport(backend)) as client:
         driver = ServingEmbeddingDriver("http://serving", profile(), client=client)
-        await asyncio.wait_for(Executor(store, blobs, driver, "embedding", "worker").tick(), 6)
+        await asyncio.wait_for(Executor(store, blobs, driver, "embedding", "worker", TestPermits()).tick(), 6)
     op = await store.operation("embedding", "t")
     body = json.loads(await blobs.get(Artifact.model_validate(op["result"])))
     assert op["state"] == "SUCCEEDED" and body["body"] == vectors() and len(calls) == 1

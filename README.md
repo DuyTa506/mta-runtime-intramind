@@ -38,6 +38,7 @@ neither replaces storage nor migrates buckets.
 | `speech` | Qualified TTS preparation, termination contract and bounded WAV transport |
 | `embedding` | Pinned document/query batches, vector validation and independent input accounting |
 | `direct` / `direct_proxy` | Shared compute reservations and direct HTTP streaming without Temporal |
+| `memory_scheduler` / `permits` | Runtime-api endpoint owner, RAM direct queue and service-token permits for durable executors |
 | `artifacts` | Tenant-scoped immutable objects and checksum verification |
 | `uploads` | Bounded temporary files and concurrency for artifact ingestion |
 | `admin` | Namespace and pinned worker deployment administration |
@@ -64,6 +65,38 @@ Feature modules do not import Temporal primitives directly. Keep HTTP/database
 client initialization in activity modules, outside replayable workflow imports.
 Use stable item keys and immutable artifacts; paginate large plans rather than
 embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc18` makes runtime-api the single capacity owner for direct and
+durable inference. Direct request identity, waiters and attempts stay in RAM;
+normal direct requests issue no PostgreSQL statements. Executors reserve their
+durable operation, acquire an HTTP permit with the existing service token,
+write `SEND_INTENT`, then send to the engine. On restart, runtime-api restores
+only sent or UNKNOWN durable attempts as held capacity; RESERVED attempts must
+acquire a fresh permit. A competing runtime-api owner is fenced. No migration
+or new client SDK is required; rollback is the rc17 image.
+
+An unclean runtime-api exit marks each pool dirty until the former owner's
+lease expires plus its `restart_drain_seconds`. The field is optional per pool
+in `pools.json` and defaults to that pool's `attempt_timeout_seconds` (or
+1,800 seconds). It changes recovery gating, not durable attempt deadlines.
+Stage uses 30 seconds for embedding, 45 for rerank and 600 for speech; LLM
+pools can clear sooner on two idle `/slots` probes. A blocked pool exports
+`intramind_runtime_dirty_recovery_blocked` and logs a warning. Native compute
+can outlive an HTTP disconnect, so these finite windows should be reviewed
+against serving latency measurements as load changes.
+
+In three warmed mock-serving runs per backlog, 100 QA requests arrived at
+100/s across four endpoints; every run completed 100/100. Median results were:
+
+| Background backlog | Dispatch p95 | Dispatch p99 | Process CPU |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.77 ms | 3.58 ms | 29.38% |
+| 1,000 | 0.74 ms | 0.83 ms | 24.15% |
+| 10,000 | 0.68 ms | 0.81 ms | 23.75% |
+
+The benchmark runs against the disposable PostgreSQL database on port 55440;
+the timed direct request path does not use it. Mock serving and a local
+single-process scheduler do not substitute for the stage soak and crash gate.
 
 Version `0.2.0rc17` removes a direct waiter if caller cancellation interrupts
 the return from an already-committed enqueue, before a producer exists to own

@@ -6,7 +6,7 @@ from datetime import timedelta
 import httpx
 import pytest
 from conftest import operation, pool, root
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 from pydantic import ValidationError
 
 from intramind_runtime.contracts import RuntimeConflict
@@ -89,7 +89,7 @@ async def prepared_executor(store, *, timeout=0.5):
     artifacts.data[spec.payload.key] = b'{"messages":[{"role":"user","content":"test"}]}'
     await store.submit_operation(spec)
     engine = IndependentEngine()
-    return engine, Executor(store, artifacts, engine, "p", "worker")
+    return engine, Executor(store, artifacts, engine, "p", "worker", TestPermits())
 
 
 @pytest.mark.integration

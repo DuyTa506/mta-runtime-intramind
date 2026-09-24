@@ -13,7 +13,8 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .contracts import AdmissionDenied, RuntimeConflict
-from .direct import DirectAdmissions, DirectRequest
+from .direct import DirectRequest
+from .memory_scheduler import MemoryScheduler
 from .store import encode
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ class _Channel:
 
     async def finish(self, error=None):
         async with self.ready:
+            if self.ended:
+                return
             self.ended, self.error = True, error
             self.ready.notify_all()
 
@@ -93,7 +96,7 @@ class DirectProxy:
 
     def __init__(self, store, *, client, pool, model=None, profile=None,
                  timeout_seconds=1800, max_response_bytes=16*1024*1024,
-                 workload_deadline_seconds=None):
+                 workload_deadline_seconds=None, scheduler=None):
         if (type(timeout_seconds) not in {int, float} or not math.isfinite(timeout_seconds)
             or not 0 < timeout_seconds <= 86400):
             raise ValueError("pool attempt timeout must be finite and positive")
@@ -112,7 +115,8 @@ class DirectProxy:
                     raise ValueError("workload deadline must be finite and positive")
                 deadlines[workload] = seconds
         self.workload_deadline_seconds = deadlines
-        self.admission = DirectAdmissions(store)
+        self.admission = scheduler or MemoryScheduler(store)
+        self._owns_scheduler = scheduler is None
         self.owner_id = "direct-api-" + uuid4().hex
         self.boot_generation = uuid4().hex
         self._start_lock = asyncio.Lock()
@@ -129,9 +133,8 @@ class DirectProxy:
         async with self._start_lock:
             if self._started:
                 return
-            await self.store.register_owner(self.owner_id, self.boot_generation)
-            self._wakeup = await self.store.direct_wakeup()
-            self._owner_task = asyncio.create_task(self._heartbeat_owner())
+            await self.admission.start()
+            self._wakeup = self.admission
             self._dispatch_task = asyncio.create_task(self._dispatch())
             self._dispatch_task.add_done_callback(self._dispatch_done)
             self._started = True
@@ -170,6 +173,12 @@ class DirectProxy:
     async def _dispatch_once(self):
         for reservation, evidence in list(self._settlements.values()):
             await self._settle(reservation, evidence)
+        current_pool = self.admission.pools.get(self.pool.pool_id)
+        if (current_pool is not None and current_pool.epoch != self.pool.engine_epoch
+            and current_pool.spec.profile_id == self.pool.profile_id
+            and current_pool.spec.model_revision == self.pool.model_revision):
+            self.pool = self.pool.model_copy(update={"engine_epoch": current_pool.epoch,
+                "target": current_pool.target, "valid_until": current_pool.spec.valid_until})
         generation = self._wakeup.generation
         self._pending_signal.clear()
         if self._recovering:
@@ -232,6 +241,12 @@ class DirectProxy:
             dispatched += 1
         if dispatched:
             await asyncio.sleep(0)
+            return
+        # A quiescent endpoint has no need to observe every shared scheduler
+        # update from other pools. Local enqueue/recovery/settlement sets this
+        # signal when it has work again.
+        if not self._pending and not self._recovering and not self._settlements:
+            await self._pending_signal.wait()
             return
         wake = asyncio.create_task(self._wakeup.wait(generation, timeout=5))
         local = asyncio.create_task(self._pending_signal.wait())
@@ -441,7 +456,7 @@ class DirectProxy:
             elif not handed_off:
                 await self._settle(reservation, "not_sent")
             await self.admission.leave(request.request_id, self.owner_id)
-            if reservation is None and not headers.done():
+            if reservation is None and not headers.done() and not channel.ended:
                 headers.set_result((499, {"Content-Type": "application/json"}))
                 await channel.finish("direct request disconnected before inference")
 
@@ -733,4 +748,6 @@ class DirectProxy:
                 task.cancel()
         await asyncio.gather(*(task for task in (self._dispatch_task, self._owner_task) if task),
                              return_exceptions=True)
+        if self._owns_scheduler:
+            await self.admission.close()
         await self.client.aclose()

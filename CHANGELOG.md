@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0rc18 — unreleased
+
+- Move direct request identities, waiters and permits to one runtime-api memory
+  scheduler per endpoint. Direct enqueue, grant, send and settle do not query
+  PostgreSQL. Durable executors obtain service-token HTTP permits from the same
+  owner before sending and retain UNKNOWN capacity until termination evidence.
+- Recover sent durable attempts on API restart, fence competing owners, and
+  bound native dirty-pool recovery by per-pool `restart_drain_seconds` (default:
+  the pool attempt timeout). The stage values are 30s embedding, 45s rerank
+  and 600s speech; durable attempt timeouts are unchanged.
+- Three 100 QA/s mock-serving runs at each backlog completed 100/100. Median
+  dispatch p95/p99/CPU were 1.77/3.58 ms/29.38% (0),
+  0.74/0.83 ms/24.15% (1,000), and 0.68/0.81 ms/23.75% (10,000).
+
 ## 0.2.0rc17 — unreleased
 
 - Remove a direct waiter if its enqueue committed but the caller was cancelled

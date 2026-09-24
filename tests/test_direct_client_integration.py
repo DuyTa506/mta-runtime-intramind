@@ -48,10 +48,11 @@ async def test_bound_client_uses_native_proof_and_persisted_quota(store, kind, t
         if not timeout:
             assert response.json() == body
         assert len(calls) == 1
+        direct = next(iter(proxy.admission.direct_attempts.values()))
+        assert direct.reservation.request.tenant_id == "user:verified"
+        assert direct.state == ("UNKNOWN" if timeout else "FINISHED")
+        assert (direct.attempt_id in proxy.admission.permits) == timeout
         async with store.engine.connect() as connection:
-            row = (await connection.execute(text(
-                "SELECT tenant_id, state, compute_held FROM runtime_direct_attempts"))).one()
-            assert row == ("user:verified", "UNKNOWN" if timeout else "FINISHED", timeout)
             assert (await connection.execute(text("SELECT count(*) FROM runtime_roots"))).scalar_one() == 0
             assert (await connection.execute(text("SELECT count(*) FROM runtime_operations"))).scalar_one() == 0
     finally:

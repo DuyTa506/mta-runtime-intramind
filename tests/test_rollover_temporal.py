@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from conftest import pool, root, temporal_test_client
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 from rollover_workflows import rollover_feature
 from temporalio.api.workflowservice.v1 import (
     SetWorkerDeploymentCurrentVersionRequest,
@@ -38,7 +38,7 @@ async def test_rollover_attaches_operation_preserves_signal_and_replays_both_his
     blobs = MemoryArtifacts()
     ref = await blobs.put("t", b'{"messages":[{"role":"user","content":"test"}]}')
     engine = IndependentEngine()
-    executor = Executor(store, blobs, engine, "p", "rollover-executor")
+    executor = Executor(store, blobs, engine, "p", "rollover-executor", TestPermits())
     publisher = OutboxPublisher(store, client, "rollover-publisher")
     broker = BrokerActivities(store, blobs)
     version = WorkerDeploymentVersion("runtime-rollover-" + uid, "build-1")

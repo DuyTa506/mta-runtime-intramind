@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from conftest import pool, root, temporal_test_client
 from deadline_workflows import deadline_feature
-from fakes import IndependentEngine, MemoryArtifacts
+from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 from feature_harness import feature_environment
 from temporalio.api.workflowservice.v1 import (
     SetWorkerDeploymentCurrentVersionRequest,
@@ -73,7 +73,7 @@ async def test_real_temporal_async_completion_and_replay(store):
     ref = await blobs.put("t", b'{"messages":[{"role":"user","content":"test"}]}')
     engine = IndependentEngine()
     engine.gate.set()
-    executor = Executor(store, blobs, engine, "p", "executor")
+    executor = Executor(store, blobs, engine, "p", "executor", TestPermits())
     publisher = OutboxPublisher(store, client, "publisher")
     activities = BrokerActivities(store)
     version = WorkerDeploymentVersion("runtime-test-"+uid, "build-1")

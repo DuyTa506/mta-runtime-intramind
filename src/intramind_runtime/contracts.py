@@ -237,6 +237,7 @@ class Reservation(Contract):
     owner_id: str
     lease_epoch: int
     attempt_deadline: datetime
+    workload_class: Literal["qa", "user_task", "background", "maintenance"] = "background"
 
     @field_validator("attempt_deadline")
     @classmethod
