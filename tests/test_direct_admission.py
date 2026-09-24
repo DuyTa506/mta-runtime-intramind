@@ -92,6 +92,7 @@ async def test_qa_waiter_precedes_user_task_and_durable_background(store):
         permit = await asyncio.wait_for(background, 2)
         assert permit.attempt_id == reservation.attempt_id
         assert len(scheduler.permits) == 1
+        await store.mark_send(reservation)
         with pytest.raises(RuntimeConflict, match="termination"):
             await scheduler.durable_release(reservation.attempt_id, reservation.owner_id)
         await store.fail(reservation, "not_sent", not_sent=True, retry=False)

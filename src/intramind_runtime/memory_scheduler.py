@@ -550,7 +550,7 @@ class MemoryScheduler:
                 JOIN runtime_operations o USING(operation_id)
                 JOIN runtime_roots r USING(root_id) WHERE a.attempt_id=:id""",
                 id=attempt_id)
-        return bool(state and state["compute_held"] and state["state"] == "RESERVED"
+        return bool(state and state["state"] == "RESERVED"
                     and state["operation_state"] == "EXECUTING"
                     and state["root_state"] == "RUNNING" and not state["cancel_requested"]
                     and state["deadline"] > datetime.now(UTC))
@@ -567,10 +567,11 @@ class MemoryScheduler:
                 r.deadline AS root_deadline,o.spec AS operation_spec FROM runtime_attempts a
                 JOIN runtime_operations o USING(operation_id)
                 JOIN runtime_roots r USING(root_id) WHERE a.attempt_id=:id""", id=attempt_id)
-        if (not actual or not actual["compute_held"] or actual["pool_id"] != pool_id
+        if (not actual or actual["pool_id"] != pool_id
             or actual["owner_id"] != owner_id or actual["engine_epoch"] != engine_epoch
             or root_workload(actual["priority"]) != workload_class
-            or actual["state"] not in {"RESERVED", "SEND_INTENT", "ACTIVE"}):
+            or actual["state"] not in {"RESERVED", "SEND_INTENT", "ACTIVE"}
+            or (actual["state"] != "RESERVED" and not actual["compute_held"])):
             raise RuntimeConflict("durable permit identity conflicts with ledger")
         operation = parse_operation(actual["operation_spec"])
         authoritative_deadline = min(actual["root_deadline"],

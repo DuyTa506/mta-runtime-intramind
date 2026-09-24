@@ -105,7 +105,7 @@ async def test_total_timeout_releases_only_when_transport_has_not_started(store,
         await asyncio.wait_for(executor.tick(), 5)
         state = await store.operation("o", "t")
         assert state["state"] == ("RECONCILING" if sent else "RETRY_WAIT")
-        assert state["attempts"] == 1
+        assert state["attempts"] == int(sent)
         assert len(engine.calls) == int(sent)
         assert engine.finished == []
         assert (await store.run("r", "t"))["reserved"] == (30 if sent else 0)

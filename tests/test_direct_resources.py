@@ -134,7 +134,9 @@ async def test_rerank_direct_does_not_serialize_llm_transport(store):
     await direct.enqueue(direct_request, "rerank", "owner")
     held = await direct.reserve(direct_request, "rerank", "owner")
     assert held is not None
-    assert await store.reserve_next("p", "background") is not None
+    reservation = await store.reserve_next("p", "background")
+    assert reservation is not None
+    await store.mark_send(reservation)
     await direct.finish(held, evidence="not_sent")
     assert (await store.drain_status())["compute_held"] == 1
     await direct.close()

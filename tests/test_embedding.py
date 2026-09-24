@@ -15,6 +15,7 @@ from intramind_runtime.contracts import (
     EmbeddingOperationSpec,
     EmbeddingPoolSpec,
     Reservation,
+    RuntimeConflict,
     parse_operation,
     parse_pool,
 )
@@ -192,10 +193,16 @@ async def test_embedding_budget_reservation_is_atomic_while_llm_transport_is_ind
     await store.submit_operation(operation())
     attempts = await asyncio.gather(*(store.reserve_next("embedding", str(i)) for i in range(8)))
     winners = [a for a in attempts if a]
-    assert len(winners) == 1
-    assert await store.reserve_next("p", "llm") is not None
+    assert len(winners) == 3
+    llm = await store.reserve_next("p", "llm")
+    assert llm is not None
+    await store.mark_send(llm)
     attempt = winners[0]
     await store.mark_send(attempt)
+    for waiting in winners[1:]:
+        with pytest.raises(RuntimeConflict, match="budget unavailable"):
+            await store.mark_send(waiting)
+        await store.fail(waiting, "budget_wait", not_sent=True)
     await store.compute_finished(attempt)
     for _ in range(2):
         await store.commit_result(attempt, attempt.operation.payload, 4)

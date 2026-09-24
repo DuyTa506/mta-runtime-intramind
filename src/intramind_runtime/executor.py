@@ -114,7 +114,9 @@ class Executor:
                 await self.store.compute_finished(reservation)
             if exc.finished or exc.not_sent:
                 await self.store.fail(reservation, str(exc), not_sent=exc.not_sent, retry=exc.retry,
-                    delay=random.uniform(0, min(60, 2 ** reservation.lease_epoch)))
+                    delay=(0 if (exc.not_sent and not permit_ready.is_set()
+                                 and str(exc) == "attempt_deadline_exceeded")
+                           else random.uniform(0, min(60, 2 ** reservation.lease_epoch))))
             else:
                 await self.store.unknown(reservation, str(exc))
         except asyncio.CancelledError:

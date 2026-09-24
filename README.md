@@ -75,6 +75,14 @@ only sent or UNKNOWN durable attempts as held capacity; RESERVED attempts must
 acquire a fresh permit. A competing runtime-api owner is fenced. No migration
 or new client SDK is required; rollback is the rc17 image.
 
+`RESERVED` identifies a durable waiter but holds neither compute nor budget and
+does not increase operation/root attempt counters. The `mark_send` transaction
+rechecks those limits and atomically charges the attempt and budget when the
+permit is available. A permit wait timeout retries immediately without using an
+attempt; unique ledger attempt numbers remain separate from the number of sent
+attempts. This keeps the existing permit identity/recovery protocol intact and
+avoids holding budget throughout a capacity wait.
+
 An unclean runtime-api exit marks each pool dirty until the former owner's
 lease expires plus its `restart_drain_seconds`. The field is optional per pool
 in `pools.json` and defaults to that pool's `attempt_timeout_seconds` (or

@@ -64,11 +64,20 @@ async def setup(store, *, target=2, group_ceiling=2, budget=10000, count=3):
         await store.submit_operation(operation(f"o{i}"))
 
 
-async def test_last_permit_and_budget_are_atomic(store):
+async def test_last_budget_is_charged_atomically_at_send(store):
     await setup(store, target=4, group_ceiling=4, budget=30)
     reservations = await asyncio.gather(*(store.reserve_next("p", str(i)) for i in range(12)))
-    assert len([r for r in reservations if r]) == 1
+    pending = [r for r in reservations if r]
+    assert len(pending) == 3
+    assert (await store.run("r", "t"))["reserved"] == 0
+    await store.mark_send(pending[0])
+    for waiting in pending[1:]:
+        with pytest.raises(RuntimeConflict, match="budget unavailable"):
+            await store.mark_send(waiting)
+        await store.fail(waiting, "budget_wait", not_sent=True)
     assert (await store.run("r", "t"))["reserved"] == 30
+    async with store.engine.connect() as c:
+        assert (await c.execute(text("SELECT attempts FROM runtime_roots WHERE root_id='r'"))).scalar_one() == 1
 
 
 async def test_idempotency_and_conflicting_input(store):
@@ -107,7 +116,11 @@ async def test_unknown_retains_budget_and_compute_after_lease(store):
         await asyncio.gather(pending, return_exceptions=True)
         await scheduler.close()
     assert (await store.operation("o0", "t"))["state"] == "RECONCILING"
-    assert (await store.run("r", "t"))["reserved"] == 60
+    assert (await store.run("r", "t"))["reserved"] == 30
+    async with store.engine.connect() as c:
+        waiting = (await c.execute(text("SELECT compute_held,budget_held FROM runtime_attempts WHERE attempt_id=:id"),
+                                  {"id": queued.attempt_id})).one()
+        assert waiting == (False, False)
 
 
 async def test_expired_before_send_refunds_once_and_fences_worker(store):
@@ -129,11 +142,11 @@ async def test_compute_release_separate_from_idempotent_result_settle(store):
     await store.mark_send(r)
     await store.compute_finished(r)
     assert await store.reserve_next("p", "b")
-    assert (await store.run("r", "t"))["reserved"] == 60
+    assert (await store.run("r", "t"))["reserved"] == 30
     await store.commit_result(r, r.operation.payload, 12)
     await store.commit_result(r, r.operation.payload, 12)
     ledger = await store.run("r", "t")
-    assert (ledger["reserved"], ledger["spent"]) == (30, 12)
+    assert (ledger["reserved"], ledger["spent"]) == (0, 12)
     assert (await store.operation("o0", "t"))["state"] == "SUCCEEDED"
 
 
