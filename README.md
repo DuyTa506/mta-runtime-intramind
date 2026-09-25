@@ -547,10 +547,10 @@ SDK 1.33.0. The lockfile pins Python dependencies. Full integration tests use
 explicitly configured disposable services and reset the test database schema:
 
 ```bash
-RUNTIME_TEST_DATABASE_URL=postgresql+asyncpg://runtime_test:runtime_test_only@127.0.0.1:55439/runtime_test \
+RUNTIME_TEST_DATABASE_URL=postgresql+asyncpg://runtime_test:runtime_test_only@127.0.0.1:55440/runtime_test \
 RUNTIME_TEST_ALLOW_RESET=yes \
-RUNTIME_TEST_TEMPORAL_ADDRESS=127.0.0.1:17233 \
-RUNTIME_TEST_MINIO_ENDPOINT=127.0.0.1:19009 \
+RUNTIME_TEST_TEMPORAL_ADDRESS=127.0.0.1:17234 \
+RUNTIME_TEST_MINIO_ENDPOINT=127.0.0.1:19010 \
 .venv/bin/python -m pytest -q --junitxml=.test-data/runtime-tests.xml
 ```
 
