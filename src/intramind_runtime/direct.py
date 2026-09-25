@@ -22,11 +22,14 @@ class DirectRequest(Contract):
     deadline: datetime
     workload_class: Literal["qa", "user_task", "background", "maintenance"] = "qa"
     logical_request_id: str | None = Field(default=None, max_length=200)
+    admission_mode: Literal["wait", "try"] = "wait"
+    dispatch_before: datetime | None = None
+    execution_timeout_seconds: float | None = Field(default=None, gt=0, le=86400)
 
-    @field_validator("deadline")
+    @field_validator("deadline", "dispatch_before")
     @classmethod
     def aware(cls, value):
-        if value.tzinfo is None:
+        if value is not None and value.tzinfo is None:
             raise ValueError("deadline must include timezone")
         return value
 

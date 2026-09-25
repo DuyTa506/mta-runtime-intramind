@@ -11,6 +11,8 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .admission import apply_headers, before_request, observe_response
+
 _tenant: ContextVar[str | None] = ContextVar("direct_inference_tenant", default=None)
 _workload: ContextVar[str] = ContextVar("direct_inference_workload", default="background")
 _logical_request: ContextVar[str | None] = ContextVar("direct_inference_request", default=None)
@@ -82,10 +84,12 @@ class DirectBinding:
         if len(self.service_token) < 32 or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", self.model_profile):
             raise ValueError("runtime credential and model profile are required")
 
-    def client_kwargs(self) -> dict:
+    def client_kwargs(self, *, observe_admission=False) -> dict:
         url = self.base_url.rstrip("/") + f"/v1/direct/{self.model_profile}/"
         return {"base_url": url, "auth": _IdentityAuth(url, self.service_token),
-                "follow_redirects": False}
+                "follow_redirects": False,
+                **({"event_hooks": {"response": [observe_response], "request": [before_request]}}
+                   if observe_admission else {})}
 
     async def stream_events(self, payload: dict, *, client: httpx.AsyncClient | None = None
                             ) -> AsyncIterator[DirectStreamEvent]:
@@ -169,6 +173,7 @@ class _IdentityAuth(httpx.Auth):
         deadline_seconds = _deadline_seconds.get()
         if deadline_seconds is not None:
             request.headers["X-Intramind-Deadline-Seconds"] = str(min(deadline_seconds, 86400))
+        apply_headers(request)
         yield request
 
 

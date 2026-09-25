@@ -2,8 +2,11 @@
 
 import asyncio
 import json
+import math
 import re
+from datetime import UTC, datetime, timedelta
 
+import httpx
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -55,6 +58,31 @@ def register(app, tenant, proxies, preparers):
             raise HTTPException(400, "invalid direct inference deadline")
         return int(raw)
 
+    def admission_options(request, workload_class):
+        mode = request.headers.get("x-intramind-admission-mode", "wait")
+        if mode not in {"wait", "try"} or (mode == "try" and workload_class != "background"):
+            raise HTTPException(400, "invalid internal admission mode")
+        cutoff = request.headers.get("x-intramind-dispatch-before")
+        if cutoff is not None:
+            try:
+                if len(cutoff) > 64:
+                    raise ValueError()
+                cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+                if cutoff.tzinfo is None or cutoff.utcoffset() != timedelta(0):
+                    raise ValueError()
+            except ValueError:
+                raise HTTPException(400, "dispatch cutoff must be a UTC timestamp") from None
+        seconds = request.headers.get("x-intramind-step-timeout-seconds")
+        if seconds is not None:
+            try:
+                seconds = float(seconds) if len(seconds) <= 64 else float("nan")
+                if not math.isfinite(seconds) or not 0 < seconds <= 86400:
+                    raise ValueError()
+            except ValueError:
+                raise HTTPException(400, "invalid step execution timeout") from None
+        return {"admission_mode": mode, "dispatch_before": cutoff,
+                "execution_timeout_seconds": seconds}
+
     @app.post("/v1/direct/{model_profile}/chat/completions")
     async def completion(model_profile: str, request: Request, tenant_id=Depends(tenant)):
         started = asyncio.get_running_loop().time()
@@ -64,11 +92,21 @@ def register(app, tenant, proxies, preparers):
             raise HTTPException(503, "qualified direct inference profile unavailable")
         workload_class, logical_request_id = workload(request)
         requested = requested_deadline(request)
+        options = admission_options(request, workload_class)
+        trying = options["admission_mode"] == "try"
+        if options["dispatch_before"] and datetime.now(UTC) >= options["dispatch_before"]:
+            return proxy.deferred_response("dispatch_cutoff")
         until = until_for(proxy, workload_class, requested, started)
+        if trying:
+            seconds = min(30, proxy.timeout_seconds, options["execution_timeout_seconds"] or 30)
+            requested = min(requested or 86400, math.ceil(seconds + 10))
+            until = started + min(10, requested)
         try:
             async with asyncio.timeout_at(until):
                 payload = await _payload(request)
         except TimeoutError:
+            if trying:
+                return proxy.deferred_response("model_not_ready")
             if until <= asyncio.get_running_loop().time():
                 return expired(proxy)
             raise
@@ -86,17 +124,23 @@ def register(app, tenant, proxies, preparers):
             raise HTTPException(422, "output limit must be positive")
         if "max_tokens" in payload and "max_completion_tokens" in payload:
             raise HTTPException(422, "provide one output limit")
-        options = {k: v for k, v in payload.items() if k not in {
+        prompt_options = {k: v for k, v in payload.items() if k not in {
             "model", "n", "stream", "stream_options", "max_tokens", "max_completion_tokens"}}
         try:
             async with asyncio.timeout_at(until):
-                sized = await preparer.size(PrepareRequest(model_profile=model_profile, payload=options,
+                sized = await preparer.size(PrepareRequest(model_profile=model_profile, payload=prompt_options,
                                                           max_output_tokens=limit or 1))
         except TimeoutError:
+            if trying:
+                return proxy.deferred_response("model_not_ready")
             if until <= asyncio.get_running_loop().time():
                 return expired(proxy, payload.get("stream", False))
             raise
         except AdmissionDenied:
+            raise
+        except httpx.HTTPError:
+            if trying:
+                return proxy.deferred_response("model_not_ready")
             raise
         except ValueError:
             raise HTTPException(422, "request is outside the qualified prompt contract") from None
@@ -104,7 +148,7 @@ def register(app, tenant, proxies, preparers):
         bound = sized["input_tokens_bound"] + limit if limit else preparer.context_limit
         return await proxy.open(tenant_id, payload, request_bound=bound,
                                 workload_class=workload_class, logical_request_id=logical_request_id,
-                                deadline_seconds=requested, started_at_monotonic=started)
+                                deadline_seconds=requested, started_at_monotonic=started, **options)
 
     @app.post("/v1/direct/{model_profile}/api/v1/embed")
     @app.post("/v1/direct/{model_profile}/api/v1/rerank")
@@ -117,11 +161,21 @@ def register(app, tenant, proxies, preparers):
             raise HTTPException(503, "qualified direct inference profile unavailable")
         workload_class, logical_request_id = workload(request)
         requested = requested_deadline(request)
+        options = admission_options(request, workload_class)
+        trying = options['admission_mode'] == 'try'
+        if options['dispatch_before'] and datetime.now(UTC) >= options['dispatch_before']:
+            return proxy.deferred_response('dispatch_cutoff')
         until = until_for(proxy, workload_class, requested, started)
+        if trying:
+            seconds = min(30, proxy.timeout_seconds, options['execution_timeout_seconds'] or 30)
+            requested = min(requested or 86400, math.ceil(seconds + 10))
+            until = started + min(10, requested)
         try:
             async with asyncio.timeout_at(until):
                 payload = await _payload(request)
         except TimeoutError:
+            if trying:
+                return proxy.deferred_response('model_not_ready')
             if until <= asyncio.get_running_loop().time():
                 return expired(proxy)
             raise
@@ -138,4 +192,4 @@ def register(app, tenant, proxies, preparers):
         return await proxy.open(tenant_id, payload, request_bound=max(1, bound),
                                 path=f"api/v1/{path}", batch_size=batch,
                                 workload_class=workload_class, logical_request_id=logical_request_id,
-                                deadline_seconds=requested, started_at_monotonic=started)
+                                deadline_seconds=requested, started_at_monotonic=started, **options)

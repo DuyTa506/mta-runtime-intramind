@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0rc19 — unreleased
+
+- Add authenticated one-shot `try` admission through the existing class/FIFO
+  scheduler. Refused requests return `409 admission_deferred` with proven
+  `not_sent`, leaving no waiter, permit or per-request SQL write.
+- Check the UTC dispatch cutoff immediately before every engine send, including
+  recovery. Night steps use a pool-clamped execution timeout of at most 30 seconds,
+  a ten-second preflight bound and no automatic inference retry.
+- Expose `warehouse-admission-v1` capability and SDK dispatch evidence for internal
+  SSE consumers. UNKNOWN compute still holds capacity under the rc18 contract.
+
 ## 0.2.0rc18 — unreleased
 
 - Move direct request identities, waiters and permits to one runtime-api memory

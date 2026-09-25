@@ -10,6 +10,7 @@ from fakes import MemoryArtifacts
 from fastapi.responses import JSONResponse
 
 from intramind_runtime.api import create_app
+from intramind_runtime.direct_proxy import DirectProxy
 from intramind_runtime.preparation import LlamaCppPromptSizer
 
 TOKEN = "direct-route-test-credential-123456789"
@@ -47,7 +48,9 @@ async def test_direct_route_preserves_payload_and_uses_qualified_context_bound(d
     assert result.status_code == 200
     proxy.open.assert_awaited_once_with("owner", body, request_bound=bound,
                                         workload_class="background", logical_request_id=None,
-                                        deadline_seconds=None, started_at_monotonic=ANY)
+                                        deadline_seconds=None, started_at_monotonic=ANY,
+                                        admission_mode="wait", dispatch_before=None,
+                                        execution_timeout_seconds=None)
 
 
 @pytest.mark.parametrize("header,status", [("5", 200), ("0", 400), ("-1", 400),
@@ -122,3 +125,26 @@ async def test_direct_cli_requires_unique_qualified_sizing_and_is_opt_in(monkeyp
     assert proxies["test"].workload_deadline_seconds == {
         "qa": 90, "user_task": 120, "background": 45, "maintenance": 45}
     await proxies["test"].close()
+
+
+async def test_night_preflight_unavailable_is_proven_unsent():
+    proxy = SimpleNamespace(pool=pool(), model='model-1', timeout_seconds=120,
+        open=AsyncMock(), close=AsyncMock(), deferred_response=DirectProxy.deferred_response)
+    sizer = SimpleNamespace(size=AsyncMock(side_effect=httpx.ConnectError('offline')))
+    app = create_app(object(), MemoryArtifacts(), TOKEN, {}, preparers={'test': sizer},
+        direct_proxies={'test': proxy})
+    async with httpx.AsyncClient(base_url='http://runtime', transport=httpx.ASGITransport(app),
+        headers={'Authorization': 'Bearer ' + TOKEN, 'X-Tenant-ID': 'owner',
+                 'X-Intramind-Admission-Mode': 'try'}) as client:
+        response = await client.post('/v1/direct/test/chat/completions', json=BODY)
+        assert response.status_code == 409
+        assert response.json()['error']['compute_state'] == 'not_sent'
+        assert response.json()['error']['reason'] == 'model_not_ready'
+        for headers in ({'X-Intramind-Workload-Class': 'qa'},
+                        {'X-Intramind-Dispatch-Before': '2026-01-01'},
+                        {'X-Intramind-Step-Timeout-Seconds': 'nan'}):
+            assert (await client.post('/v1/direct/test/chat/completions', json=BODY,
+                                      headers=headers)).status_code == 400
+        assert 'warehouse-admission-v1' in (await client.get('/v1/capabilities')).json()['capabilities']
+        assert (await client.get('/v1/capabilities', headers={'Authorization': 'wrong'})).status_code == 401
+    proxy.open.assert_not_awaited()

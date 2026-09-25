@@ -47,7 +47,7 @@ async def store():
         pytest.skip("explicit disposable RUNTIME_TEST_DATABASE_URL required")
     parsed = make_url(url)
     if (parsed.database != "runtime_test" or parsed.host not in {"127.0.0.1", "localhost"}
-        or parsed.port not in {55439, 55440} or os.environ.get("RUNTIME_TEST_ALLOW_RESET") != "yes"):
+        or parsed.port != 55440 or os.environ.get("RUNTIME_TEST_ALLOW_RESET") != "yes"):
         pytest.fail("refusing to reset a database without the runtime_test name and explicit reset opt-in")
     store = Store(url)
     async with store.engine.begin() as c:
