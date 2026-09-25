@@ -49,6 +49,11 @@ UNKNOWN reservations remain accounted for until compute termination is known.
 No DB transaction spans inference. The completion driver does not promise
 reliable remote cancellation, backend status lookup or exactly-once inference.
 
+`runtime.finish_run` accepts the SDK's `CANCELLED` finalization through the
+existing cancellation path. Repeated acknowledgements preserve terminal results,
+tenant isolation and outstanding compute/budget accounting; cancelled workflows
+can close without retrying `invalid terminal state` indefinitely.
+
 ## Install and use
 
 Use Python 3.12. Applications install the release wheel from the maintainer's
