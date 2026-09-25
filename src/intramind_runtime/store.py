@@ -685,6 +685,13 @@ class Store:
         reason: str | None = None,
     ) -> None:
         """Commit a terminal result within the accepted deadline, without refunding compute."""
+        if state == "CANCELLED":
+            if result is not None:
+                raise ValueError("cancelled run cannot publish a result")
+            # The SDK also finalizes cancelled workflows through this activity.
+            # Reuse cancellation's idempotency, tenant guard and held-compute rules.
+            await self.cancel(root_id, tenant_id)
+            return
         if state not in ("SUCCEEDED", "PARTIAL", "FAILED"):
             raise ValueError("invalid terminal state")
         if result is not None:
