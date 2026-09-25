@@ -26,6 +26,14 @@ class DirectDeadlineExceeded(TimeoutError):
     """The logical request budget ended; it is never termination evidence."""
 
 
+class DispatchDeferred(Exception):
+    """This particular engine dispatch was proven not sent."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
 async def _chunks(response, buffered):
     if buffered is not None:
         yield buffered
@@ -170,15 +178,19 @@ class DirectProxy:
                 logger.exception("Direct endpoint dispatcher failed pool=%s; retrying", self.pool.pool_id)
                 await asyncio.sleep(1)
 
-    async def _dispatch_once(self):
-        for reservation, evidence in list(self._settlements.values()):
-            await self._settle(reservation, evidence)
+    def _sync_pool_epoch(self):
+        """Follow a qualified restart even when no wait-mode dispatcher is awake."""
         current_pool = self.admission.pools.get(self.pool.pool_id)
         if (current_pool is not None and current_pool.epoch != self.pool.engine_epoch
             and current_pool.spec.profile_id == self.pool.profile_id
             and current_pool.spec.model_revision == self.pool.model_revision):
             self.pool = self.pool.model_copy(update={"engine_epoch": current_pool.epoch,
                 "target": current_pool.target, "valid_until": current_pool.spec.valid_until})
+
+    async def _dispatch_once(self):
+        for reservation, evidence in list(self._settlements.values()):
+            await self._settle(reservation, evidence)
+        self._sync_pool_epoch()
         generation = self._wakeup.generation
         self._pending_signal.clear()
         if self._recovering:
@@ -310,9 +322,27 @@ class DirectProxy:
         return StreamingResponse(expired(), status_code=200,
             headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
 
+    @staticmethod
+    def deferred_response(reason):
+        return JSONResponse({"error": {"type": "admission_deferred",
+            "message": "inference dispatch deferred", "compute_state": "not_sent",
+            "reason": reason}}, status_code=409)
+
+    @staticmethod
+    def _evidence(reservation, compute_state):
+        return {"attempt_id": reservation.attempt_id,
+            "logical_request_id": reservation.request.logical_request_id,
+            "generation": reservation.generation, "compute_state": compute_state}
+
+    @staticmethod
+    def _check_cutoff(request):
+        if request.dispatch_before and datetime.now(UTC) >= request.dispatch_before:
+            raise DispatchDeferred("dispatch_cutoff")
+
     async def open(self, tenant_id, payload, *, request_bound, path="chat/completions", batch_size=1,
                    workload_class="background", logical_request_id=None, disconnected=None,
-                   deadline_seconds=None, started_at_monotonic=None):
+                   deadline_seconds=None, started_at_monotonic=None, admission_mode="wait",
+                   dispatch_before=None, execution_timeout_seconds=None):
         raw = encode(payload).encode()
         if len(raw) > 1024*1024:
             raise AdmissionDenied("direct request exceeds transport bound")
@@ -321,13 +351,28 @@ class DirectProxy:
             or type(payload.get("stream", False)) is not bool):
             raise AdmissionDenied("direct request differs from the qualified model/completion contract")
         streaming = self.pool.kind == "llm" and payload.get("stream", False)
-        total_seconds = self._deadline_seconds(workload_class, deadline_seconds)
+        if admission_mode not in {"wait", "try"}:
+            raise ValueError("invalid admission mode")
+        if execution_timeout_seconds is not None and (
+            isinstance(execution_timeout_seconds, bool) or
+            not math.isfinite(execution_timeout_seconds) or execution_timeout_seconds <= 0
+        ):
+            raise ValueError("invalid execution timeout")
+        execution_timeout_seconds = min(self.timeout_seconds,
+            execution_timeout_seconds or self.timeout_seconds,
+            30 if admission_mode == "try" else self.timeout_seconds)
+        total_seconds = (min(execution_timeout_seconds + 10, deadline_seconds or 86400)
+            if admission_mode == "try" else self._deadline_seconds(workload_class, deadline_seconds))
         now = asyncio.get_running_loop().time()
         started = now if started_at_monotonic is None else min(started_at_monotonic, now)
         until = started+total_seconds
         if until <= now:
+            if admission_mode == 'try':
+                return self.deferred_response('model_not_ready')
             return self._deadline_response(streaming)
         if not self._started:
+            if admission_mode == "try":
+                return self.deferred_response("model_not_ready")
             try:
                 async with asyncio.timeout_at(until):
                     await self.start()
@@ -337,8 +382,12 @@ class DirectProxy:
                 raise
         remaining = until-asyncio.get_running_loop().time()
         if remaining <= 0:
+            if admission_mode == 'try':
+                return self.deferred_response('model_not_ready')
             return self._deadline_response(streaming)
         deadline = datetime.now(UTC)+timedelta(seconds=remaining)
+        if admission_mode == "try":
+            self._sync_pool_epoch()
         request = DirectRequest(request_id=uuid4().hex, tenant_id=tenant_id,
             payload_digest=sha256(raw).hexdigest(), model_profile=self.pool.model_profile,
             model_revision=self.pool.model_revision,
@@ -346,23 +395,18 @@ class DirectProxy:
             capacity_profile_id=self.pool.profile_id, kind=self.pool.kind,
             request_bound=request_bound, batch_size=batch_size,
             workload_class=workload_class, logical_request_id=logical_request_id,
-            deadline=deadline)
-        try:
-            async with asyncio.timeout_at(until):
-                queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
-        except BaseException as exc:
-            # Enqueue can commit before caller cancellation is observed. No
-            # producer exists yet to remove the resulting waiter.
-            try:
-                await asyncio.shield(self.admission.leave(request.request_id, self.owner_id))
-            except Exception:
-                logger.exception("Direct enqueue cleanup failed request=%s", request.request_id)
-            if isinstance(exc, TimeoutError) and until <= asyncio.get_running_loop().time():
-                return self._deadline_response(streaming)
-            raise
-        future = asyncio.get_running_loop().create_future()
-        self._pending[request.request_id] = (request, future, queued_at, None)
-        self._pending_signal.set()
+            deadline=deadline, admission_mode=admission_mode, dispatch_before=dispatch_before,
+            execution_timeout_seconds=execution_timeout_seconds)
+        if admission_mode == "try":
+            reservation, reason = self.admission.try_reserve(request, self.pool.pool_id, self.owner_id)
+            if reservation is None:
+                return self.deferred_response(reason)
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(reservation)
+        else:
+            future = await self._enqueue_request(request, streaming, until)
+            if not isinstance(future, asyncio.Future):
+                return future
         channel = _Channel()
         headers = asyncio.get_running_loop().create_future()
         task = asyncio.create_task(self._produce_waiting(request, future, payload, path,
@@ -380,6 +424,25 @@ class DirectProxy:
         except BaseException:
             await channel.detach()
             raise
+
+    async def _enqueue_request(self, request, streaming, until):
+        try:
+            async with asyncio.timeout_at(until):
+                queued_at = await self.admission.enqueue(request, self.pool.pool_id, self.owner_id)
+        except BaseException as exc:
+            # Enqueue can commit before caller cancellation is observed. No
+            # producer exists yet to remove the resulting waiter.
+            try:
+                await asyncio.shield(self.admission.leave(request.request_id, self.owner_id))
+            except Exception:
+                logger.exception("Direct enqueue cleanup failed request=%s", request.request_id)
+            if isinstance(exc, TimeoutError) and until <= asyncio.get_running_loop().time():
+                return self._deadline_response(streaming)
+            raise
+        future = asyncio.get_running_loop().create_future()
+        self._pending[request.request_id] = (request, future, queued_at, None)
+        self._pending_signal.set()
+        return future
 
     async def _produce_waiting(self, request, future, payload, path, channel, headers,
                                streaming, disconnected, until):
@@ -415,6 +478,9 @@ class DirectProxy:
             handed_off = True
             await self._produce(reservation, payload, path, channel, headers, streaming, until)
         except DirectDeadlineExceeded as exc:
+            if request.admission_mode == 'try' and reservation is not None and not handed_off:
+                await self._deferred(channel, headers, streaming, reservation, 'model_not_ready')
+                return
             if streaming:
                 await channel.put(self._error_frame(str(exc), "admission_timeout",
                                                     "deadline_exceeded"))
@@ -464,6 +530,7 @@ class DirectProxy:
         current = reservation
         current_unsent = True
         deadline_exceeded = False
+        compute_state = 'unknown'
         error = None
         while True:
             if channel.detached:
@@ -472,9 +539,17 @@ class DirectProxy:
                 return
             try:
                 self._remaining(until)
+                self._check_cutoff(current.request)
+            except DispatchDeferred as exc:
+                await self._settle(current, "not_sent")
+                await self._deferred(channel, headers, streaming, current, exc.reason)
+                return
             except DirectDeadlineExceeded as exc:
                 if current_unsent:
                     await self._settle(current, "not_sent")
+                    if current.request.admission_mode == 'try':
+                        await self._deferred(channel, headers, streaming, current, 'model_not_ready')
+                        return
                 error, deadline_exceeded = str(exc), True
                 break
             current_unsent = False
@@ -483,8 +558,16 @@ class DirectProxy:
             if outcome == "done":
                 await channel.finish()
                 return
+            if outcome == "deferred" or (outcome == "not_sent"
+                                         and current.request.admission_mode == "try"):
+                await self._deferred(channel, headers, streaming, current,
+                    error if outcome == "deferred" else "model_not_ready")
+                return
             if outcome == "terminal_error":
+                compute_state = 'terminated'
                 break
+            if current.request.admission_mode == "try":
+                break  # No hidden recovery call for one warehouse work item.
             if until <= asyncio.get_running_loop().time():
                 error, deadline_exceeded = "inference request deadline exceeded", True
                 break
@@ -536,15 +619,31 @@ class DirectProxy:
         if channel.detached:
             return
         error = error or "direct inference unavailable"
+        evidence = self._evidence(current, compute_state)
         if streaming:
-            await channel.put(self._error_frame(error, "upstream_error",
-                "deadline_exceeded" if deadline_exceeded else None))
+            await channel.put(b"event: intramind.error\ndata: " + encode({
+                "message": error, "type": "upstream_error", **evidence,
+                "reason": "deadline_exceeded" if deadline_exceeded else None}).encode() + b"\n\n")
         else:
             if not headers.done():
                 headers.set_result((504 if deadline_exceeded else 502, {"Content-Type": "application/json",
                     "X-Intramind-Attempt-ID": current.attempt_id}))
             await channel.put(encode(self._error_object(error, "upstream_error",
                 "deadline_exceeded" if deadline_exceeded else None)).encode())
+        await channel.finish()
+
+    async def _deferred(self, channel, headers, streaming, reservation, reason):
+        # An earlier recovery generation already sent compute. Never refund it.
+        unsent = reservation.generation == 0
+        body = {"type": "admission_deferred" if unsent else "upstream_error",
+                "message": "inference dispatch deferred", "reason": reason,
+                **self._evidence(reservation, "not_sent" if unsent else "terminated")}
+        if streaming:
+            await channel.put(b"event: intramind.error\ndata: " + encode(body).encode() + b"\n\n")
+        else:
+            if not headers.done():
+                headers.set_result((409 if unsent else 502, {"Content-Type": "application/json"}))
+            await channel.put(encode({"error": body}).encode())
         await channel.finish()
 
     async def _await_confirmed_recovery(self, reservation, channel, streaming, until):
@@ -630,8 +729,11 @@ class DirectProxy:
         error = None
         retryable_not_sent = False
         try:
-            async with asyncio.timeout(min(self.timeout_seconds, self._remaining(until))):
+            async with asyncio.timeout(min(self.timeout_seconds, self._remaining(until),
+                reservation.request.execution_timeout_seconds or self.timeout_seconds)):
+                self._check_cutoff(reservation.request)
                 await self.admission.mark_send(reservation)
+                self._check_cutoff(reservation.request)
                 sent = True
                 async with self.client.stream("POST", path, json=payload,
                     headers={"X-Intramind-Attempt-ID": reservation.attempt_id,
@@ -659,6 +761,10 @@ class DirectProxy:
                         return ("not_sent" if retryable_not_sent else "unknown", error)
                     if self.pool.kind == "llm" and status not in {200, 400, 401, 403, 404, 422}:
                         return "unknown", "engine rejected request without termination proof"
+                    if streaming and reservation.request.admission_mode == "try":
+                        await channel.put(b"event: intramind.control\ndata: " + encode({
+                            "type": "started", **self._evidence(reservation, "sent")
+                        }).encode() + b"\n\n")
                     if self.pool.kind == "llm" and status in {400, 401, 403, 404, 422}:
                         terminated = True
                     forwarded = {name: value for name in (
@@ -696,7 +802,8 @@ class DirectProxy:
                         if status != 200:
                             await channel.put(b"event: intramind.error\ndata: " + encode({
                                 "message": buffered.decode(errors="replace"),
-                                "type": "upstream_error"}).encode() + b"\n\n")
+                                "type": "upstream_error",
+                                **self._evidence(reservation, "terminated")}).encode() + b"\n\n")
                     else:
                         if not headers.done():
                             headers.set_result((status, forwarded | {
@@ -704,6 +811,8 @@ class DirectProxy:
                         for offset in range(0, len(buffered), 16*1024):
                             await channel.put(bytes(buffered[offset:offset+16*1024]))
                     return "done", None
+        except DispatchDeferred as exc:
+            return "deferred", exc.reason
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             sent = False
             error = "direct backend connection failed"

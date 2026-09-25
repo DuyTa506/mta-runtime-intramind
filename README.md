@@ -49,6 +49,36 @@ UNKNOWN reservations remain accounted for until compute termination is known.
 No DB transaction spans inference. The completion driver does not promise
 reliable remote cancellation, backend status lookup or exactly-once inference.
 
+## Night warehouse admission
+
+Authenticated internal callers may use the following headers on direct inference:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Intramind-Admission-Mode: try` | One scheduler decision; default callers retain `wait` |
+| `X-Intramind-Dispatch-Before` | UTC ISO timestamp checked immediately before each engine send |
+| `X-Intramind-Step-Timeout-Seconds` | Execution limit, clamped to the pool and 30 seconds for `try` |
+
+`try` is restricted to the background workload class. Refusal returns HTTP 409
+with `error.type=admission_deferred`, `compute_state=not_sent` and a reason such as
+`inference_capacity`, `model_not_ready` or `dispatch_cutoff`. It does not leave a
+waiter/reservation, query PostgreSQL or send compute. Preflight is bounded by ten
+seconds; the total runtime deadline is the step timeout plus ten seconds.
+Already-sent work may finish after the cutoff. Timeout/disconnect remains UNKNOWN
+and holds capacity; it is never proof of an unsent request.
+
+New consumers check authenticated `GET /v1/capabilities` for
+`warehouse-admission-v1` before starting. The SDK `admission_scope` and opt-in
+`DirectBinding.client_kwargs(observe_admission=True)` expose attempt/logical IDs,
+generation and send/termination evidence without changing model payloads.
+Deploy runtime before AI/BE consumers.
+
+The try-only path follows qualified engine epoch changes without requiring a waiting
+caller, and both OpenAI and native SDK streams preserve dispatch evidence.
+
+Run integration tests only against disposable PostgreSQL on **55440**; the test
+fixture rejects other ports.
+
 `runtime.finish_run` accepts the SDK's `CANCELLED` finalization through the
 existing cancellation path. Repeated acknowledgements preserve terminal results,
 tenant isolation and outstanding compute/budget accounting; cancelled workflows
@@ -522,10 +552,10 @@ SDK 1.33.0. The lockfile pins Python dependencies. Full integration tests use
 explicitly configured disposable services and reset the test database schema:
 
 ```bash
-RUNTIME_TEST_DATABASE_URL=postgresql+asyncpg://runtime_test:runtime_test_only@127.0.0.1:55439/runtime_test \
+RUNTIME_TEST_DATABASE_URL=postgresql+asyncpg://runtime_test:runtime_test_only@127.0.0.1:55440/runtime_test \
 RUNTIME_TEST_ALLOW_RESET=yes \
-RUNTIME_TEST_TEMPORAL_ADDRESS=127.0.0.1:17233 \
-RUNTIME_TEST_MINIO_ENDPOINT=127.0.0.1:19009 \
+RUNTIME_TEST_TEMPORAL_ADDRESS=127.0.0.1:17234 \
+RUNTIME_TEST_MINIO_ENDPOINT=127.0.0.1:19010 \
 .venv/bin/python -m pytest -q --junitxml=.test-data/runtime-tests.xml
 ```
 

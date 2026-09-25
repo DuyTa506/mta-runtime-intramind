@@ -51,7 +51,9 @@ async def test_direct_resource_route_forwards_native_payload_without_artifact_or
         proxy.open.assert_awaited_once_with("owner", payload, request_bound=bound,
                                             path=f"api/v1/{path}", batch_size=2,
                                             workload_class="background", logical_request_id=None,
-                                            deadline_seconds=None, started_at_monotonic=ANY)
+                                            deadline_seconds=None, started_at_monotonic=ANY,
+                                            admission_mode='wait', dispatch_before=None,
+                                            execution_timeout_seconds=None)
         proxy.open.reset_mock()
         invalid = {"texts": ["x" * 25]} if kind == "embedding" else payload | {"query": "x" * 101}
         assert (await client.post(f"/v1/direct/{spec.model_profile}/api/v1/{path}", json=invalid)).status_code == 422

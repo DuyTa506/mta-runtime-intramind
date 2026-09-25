@@ -105,6 +105,12 @@ def create_app(
             raise HTTPException(401, "trusted service authentication required")
         return True
 
+    @app.get("/v1/capabilities")
+    async def capabilities(trusted=Depends(service)):
+        from .admission import CAPABILITY
+
+        return {"capabilities": [CAPABILITY]}
+
     if scheduler is not None:
         @app.post("/internal/permits/acquire")
         async def acquire_permit(body: PermitRequest, trusted=Depends(service)):

@@ -410,6 +410,9 @@ class MemoryScheduler:
             self._notify()
 
     async def enqueue(self, request, pool_id, owner_id):
+        return self._enqueue(request, pool_id, owner_id)
+
+    def _enqueue(self, request, pool_id, owner_id):
         pool = self._pool(pool_id)
         now = monotonic()
         identity = request.request_id
@@ -455,6 +458,43 @@ class MemoryScheduler:
             self._remove_waiter(request_id)
 
     async def reserve(self, request, pool_id, owner_id, *, previous_attempt_id=None):
+        return self._reserve(request, pool_id, owner_id, previous_attempt_id=previous_attempt_id)
+
+    def try_reserve(self, request, pool_id, owner_id):
+        """One atomic scheduler turn, using the same class/FIFO order as waiting callers.
+
+        No await can detach a caller between grant and handoff. A refusal leaves
+        no waiter, identity, reservation or heap tombstone and performs no SQL.
+        """
+        pool = self.pools.get(pool_id)
+        if (pool is None or not self.control_ready or pool.health != "HEALTHY"
+                or pool.group_health != "HEALTHY" or pool.target <= 0
+                or monotonic() < self._ready_by_pool.get(pool_id, float("inf"))):
+            return None, "model_not_ready"
+        if request.dispatch_before and datetime.now(UTC) >= request.dispatch_before:
+            return None, "dispatch_cutoff"
+        if (request.expected_engine_epoch is not None
+                and request.expected_engine_epoch != pool.epoch):
+            return None, "model_not_ready"
+        reservation = None
+        try:
+            try:
+                self._enqueue(request, pool_id, owner_id)
+            except AdmissionDenied as exc:
+                if not exc.retryable:
+                    raise
+                return None, "inference_capacity"
+            reservation = self._reserve(request, pool_id, owner_id)
+            return reservation, None if reservation else "inference_capacity"
+        finally:
+            if reservation is None:
+                self._remove_waiter(request.request_id)
+                self.request_identity.pop(request.request_id, None)
+                queue = self._queues.get(pool_id, [])
+                queue[:] = [entry for entry in queue if entry[2] != request.request_id]
+                heapq.heapify(queue)
+
+    def _reserve(self, request, pool_id, owner_id, *, previous_attempt_id=None):
         self._expire_dirty()
         pool = self._pool(pool_id)
         waiter = self.waiters.get(request.request_id)
