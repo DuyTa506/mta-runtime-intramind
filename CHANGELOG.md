@@ -11,6 +11,8 @@
 - Expose `warehouse-admission-v1` capability and SDK dispatch evidence for internal
   SSE consumers. UNKNOWN compute still holds capacity under the rc18 contract.
 
+- Follow qualified engine epoch changes for try-only traffic and preserve started/deferral evidence in native SDK streams.
+
 ## 0.2.0rc18 — unreleased
 
 - Move direct request identities, waiters and permits to one runtime-api memory

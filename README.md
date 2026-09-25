@@ -71,8 +71,13 @@ New consumers check authenticated `GET /v1/capabilities` for
 `warehouse-admission-v1` before starting. The SDK `admission_scope` and opt-in
 `DirectBinding.client_kwargs(observe_admission=True)` expose attempt/logical IDs,
 generation and send/termination evidence without changing model payloads.
-Deploy runtime before AI/BE consumers. Run integration tests only against disposable
-PostgreSQL on **55440**; the test fixture rejects other ports.
+Deploy runtime before AI/BE consumers.
+
+The try-only path follows qualified engine epoch changes without requiring a waiting
+caller, and both OpenAI and native SDK streams preserve dispatch evidence.
+
+Run integration tests only against disposable PostgreSQL on **55440**; the test
+fixture rejects other ports.
 
 `runtime.finish_run` accepts the SDK's `CANCELLED` finalization through the
 existing cancellation path. Repeated acknowledgements preserve terminal results,

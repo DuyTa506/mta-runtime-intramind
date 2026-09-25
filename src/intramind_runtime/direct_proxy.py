@@ -178,15 +178,19 @@ class DirectProxy:
                 logger.exception("Direct endpoint dispatcher failed pool=%s; retrying", self.pool.pool_id)
                 await asyncio.sleep(1)
 
-    async def _dispatch_once(self):
-        for reservation, evidence in list(self._settlements.values()):
-            await self._settle(reservation, evidence)
+    def _sync_pool_epoch(self):
+        """Follow a qualified restart even when no wait-mode dispatcher is awake."""
         current_pool = self.admission.pools.get(self.pool.pool_id)
         if (current_pool is not None and current_pool.epoch != self.pool.engine_epoch
             and current_pool.spec.profile_id == self.pool.profile_id
             and current_pool.spec.model_revision == self.pool.model_revision):
             self.pool = self.pool.model_copy(update={"engine_epoch": current_pool.epoch,
                 "target": current_pool.target, "valid_until": current_pool.spec.valid_until})
+
+    async def _dispatch_once(self):
+        for reservation, evidence in list(self._settlements.values()):
+            await self._settle(reservation, evidence)
+        self._sync_pool_epoch()
         generation = self._wakeup.generation
         self._pending_signal.clear()
         if self._recovering:
@@ -382,6 +386,8 @@ class DirectProxy:
                 return self.deferred_response('model_not_ready')
             return self._deadline_response(streaming)
         deadline = datetime.now(UTC)+timedelta(seconds=remaining)
+        if admission_mode == "try":
+            self._sync_pool_epoch()
         request = DirectRequest(request_id=uuid4().hex, tenant_id=tenant_id,
             payload_digest=sha256(raw).hexdigest(), model_profile=self.pool.model_profile,
             model_revision=self.pool.model_revision,

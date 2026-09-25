@@ -145,7 +145,8 @@ async def observe_response(response):
         frame = response.json().get("error", {})
         if frame.get("type") == "admission_deferred":
             await scope.observe(frame)
-    if response.headers.get("content-type", "").startswith("text/event-stream"):
+    if (response.headers.get("content-type", "").startswith("text/event-stream")
+            and not isinstance(response.stream, _EvidenceStream)):
         response.stream = _EvidenceStream(response.stream, scope)
 
 

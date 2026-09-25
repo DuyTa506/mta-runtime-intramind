@@ -197,3 +197,68 @@ async def test_sdk_separates_internal_evidence_from_openai_chunks():
                 assert (await response.aread()).decode() == completion + 'data: [DONE]\n\n'
         assert len(observed) == 1 and observed[0]['attempt_id'] == 'a'
         assert scope.evidence['compute_state'] == 'terminated'
+
+
+@pytest.mark.parametrize('same_profile', [True, False])
+async def test_try_only_proxy_follows_qualified_engine_restart(same_profile):
+    manager, spec = scheduler()
+    calls = []
+
+    def complete(req):
+        calls.append(req)
+        return httpx.Response(200, json={'choices': [
+            {'message': {'content': 'ok'}, 'finish_reason': 'stop'}]})
+
+    proxy = DirectProxy(object(), pool=spec, scheduler=manager,
+        client=httpx.AsyncClient(base_url='http://engine/', transport=httpx.MockTransport(complete)))
+    await proxy.start()
+    await asyncio.sleep(0)  # The empty wait dispatcher is now asleep.
+    manager.pools['p'].epoch = 'e2'
+    if not same_profile:
+        manager.pools['p'].spec = spec.model_copy(update={'profile_id': 'other-profile'})
+    try:
+        response = await proxy.open('tenant', {**PAYLOAD, 'stream': False}, request_bound=30,
+                                    admission_mode='try')
+        await body(response)
+        assert response.status_code == (200 if same_profile else 409)
+        assert len(calls) == int(same_profile)
+        assert proxy.pool.engine_epoch == ('e2' if same_profile else 'e1')
+        assert not manager.permits
+    finally:
+        await proxy.close()
+
+
+@pytest.mark.parametrize('hooks', [False, True])
+async def test_native_stream_observes_started_once_and_preserves_tokens(hooks):
+    frame = {'type': 'started', 'attempt_id': 'a', 'logical_request_id': 'l',
+             'generation': 0, 'compute_state': 'sent'}
+    raw = ('event: intramind.control\ndata: ' + json.dumps(frame) + '\n\n'
+           'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\ndata: [DONE]\n\n').encode()
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield raw
+
+    binding = DirectBinding('http://runtime', 'a' * 32, 'tool')
+    observed = []
+
+    async def observe(evidence):
+        observed.append(evidence)
+
+    with inference_scope('tenant'), admission_scope(mode='try', on_event=observe) as scope:
+        async with httpx.AsyncClient(**binding.client_kwargs(observe_admission=hooks),
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=Stream(),
+                headers={'Content-Type': 'text/event-stream'}))) as client:
+            events = [event async for event in binding.stream_events(PAYLOAD, client=client)]
+        assert [event.text for event in events] == ['Hello']
+        assert len(observed) == 1 and scope.evidence['compute_state'] == 'terminated'
+
+
+async def test_native_stream_preserves_unsent_deferral():
+    binding = DirectBinding('http://runtime', 'a' * 32, 'tool')
+    with inference_scope('tenant'), admission_scope(mode='try'):
+        async with httpx.AsyncClient(**binding.client_kwargs(), transport=httpx.MockTransport(
+            lambda _: httpx.Response(409, json={'error': {'type': 'admission_deferred',
+                'compute_state': 'not_sent', 'reason': 'inference_capacity'}}))) as client:
+            with pytest.raises(AdmissionDeferred, match='inference_capacity'):
+                _ = [event async for event in binding.stream_events(PAYLOAD, client=client)]

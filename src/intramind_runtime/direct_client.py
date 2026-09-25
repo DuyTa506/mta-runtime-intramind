@@ -107,7 +107,9 @@ class DirectBinding:
                 async for event in self.stream_events(payload, client=owned):
                     yield event
             return
+        await before_request(None)
         async with client.stream("POST", "chat/completions", json=payload) as response:
+            await observe_response(response)
             response.raise_for_status()
             event_name = "message"
             data = []
@@ -127,6 +129,9 @@ class DirectBinding:
                             reason=frame.get("reason"), error_type=frame.get("type"))
                     if event_name == "intramind.control":
                         kind = frame.get("type")
+                        if kind == "started":
+                            event_name = "message"
+                            continue
                         if kind not in {"waiting", "resumed", "recovering", "generation_reset"}:
                             raise ValueError("invalid direct stream control event")
                         if kind == "generation_reset":
