@@ -461,7 +461,17 @@ async def test_stale_proxy_epoch_does_not_send_to_the_reconfigured_pool(store):
     upstream = httpx.AsyncClient(base_url="http://engine/v1/", transport=httpx.MockTransport(backend))
     proxy = DirectProxy(store, client=upstream, pool=spec, timeout_seconds=30)
     try:
-        await store.configure_pool(spec.model_copy(update={"engine_epoch": "replacement"}), 1)
+        await proxy.start()
+        original_enqueue = proxy.admission.enqueue
+
+        async def restart_after_enqueue(*args):
+            queued = await original_enqueue(*args)
+            # A restart after request identity was fixed must still fence it.
+            await store.configure_pool(spec.model_copy(update={"engine_epoch": "replacement"}), 1)
+            await proxy.admission._refresh()
+            return queued
+
+        proxy.admission.enqueue = restart_after_enqueue
         response = await proxy.open("tenant", PAYLOAD | {"stream": False}, request_bound=30)
         assert response.status_code == 503
         assert json.loads(await consume(response))["error"]

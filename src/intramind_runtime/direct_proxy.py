@@ -386,8 +386,10 @@ class DirectProxy:
                 return self.deferred_response('model_not_ready')
             return self._deadline_response(streaming)
         deadline = datetime.now(UTC)+timedelta(seconds=remaining)
-        if admission_mode == "try":
-            self._sync_pool_epoch()
+        # An idle dispatcher sleeps through control-plane refreshes. Bind the
+        # current qualified epoch before either admission mode creates an
+        # immutable request; syncing only at dispatch is too late for waiters.
+        self._sync_pool_epoch()
         request = DirectRequest(request_id=uuid4().hex, tenant_id=tenant_id,
             payload_digest=sha256(raw).hexdigest(), model_profile=self.pool.model_profile,
             model_revision=self.pool.model_revision,
