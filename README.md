@@ -73,8 +73,15 @@ New consumers check authenticated `GET /v1/capabilities` for
 generation and send/termination evidence without changing model payloads.
 Deploy runtime before AI/BE consumers.
 
-The try-only path follows qualified engine epoch changes without requiring a waiting
-caller, and both OpenAI and native SDK streams preserve dispatch evidence.
+Both admission modes synchronize the qualified engine epoch before creating a
+request, including the first foreground request after an idle engine restart.
+Changes to the model revision or capacity profile still require a matching proxy
+configuration; a restart after enqueue still fences the old request. Both OpenAI
+and native SDK streams preserve dispatch evidence.
+
+Release checks must consume a real authenticated completion through its final
+stream event. `/health` checks ledger connectivity only; HTTP 200 alone does not
+prove successful inference because a stream can contain `intramind.error`.
 
 Run integration tests only against disposable PostgreSQL on **55440**; the test
 fixture rejects other ports.
