@@ -7,10 +7,18 @@ from hashlib import sha256
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import Field
 
-from .artifacts import MAX_ARTIFACT_BYTES, ArtifactPort, tenant_prefix
+from .artifacts import (
+    IO_CHUNK_BYTES,
+    MAX_ARTIFACT_BYTES,
+    ArtifactCapacityBusy,
+    ArtifactPort,
+    file_io,
+    tenant_prefix,
+    verify_artifact,
+)
 from .buffering import BufferedSubmission, BufferedSubmissions
 from .contracts import AdmissionDenied, Artifact, Contract, NotFound, RootSpec, RuntimeConflict
 from .embedding import EmbeddingPrepareRequest
@@ -86,6 +94,12 @@ def create_app(
                 await store.close()
 
     app = FastAPI(title="Intramind Runtime", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(ArtifactCapacityBusy)
+    async def artifact_busy(request, exc):
+        return JSONResponse(status_code=503, content={"detail": str(exc)},
+                            headers={"Retry-After": "1"})
+
     uploads = ArtifactUploads(artifacts, max_bytes=artifact_max_bytes,
                               concurrency=artifact_upload_concurrency)
     buffers = BufferedSubmissions(store, artifacts, control_queue=control_queue)
@@ -236,7 +250,29 @@ def create_app(
     async def download(ref: Artifact, tenant_id=Depends(tenant)):
         if not ref.key.startswith(tenant_prefix(tenant_id)):
             raise NotFound("artifact")
-        return Response(await artifacts.get(ref), media_type=ref.content_type)
+        # Older in-memory adapters remain usable; production MinIO always spools.
+        if not hasattr(artifacts, "open_verified"):
+            return Response(await artifacts.get(ref), media_type=ref.content_type)
+        context = artifacts.open_verified(ref)
+        source = await context.__aenter__()
+
+        async def chunks():
+            while chunk := await file_io(source.read, IO_CHUNK_BYTES):
+                yield chunk
+
+        class VerifiedResponse(StreamingResponse):
+            async def __call__(self, scope, receive, send):
+                try:
+                    await super().__call__(scope, receive, send)
+                finally:
+                    await context.__aexit__(None, None, None)
+
+        try:
+            return VerifiedResponse(chunks(), media_type=ref.content_type,
+                                    headers={"Content-Length": str(ref.size)})
+        except BaseException:
+            await context.__aexit__(None, None, None)
+            raise
 
     @app.post("/v1/runs", status_code=202)
     async def submit(request: Submission, tenant_id=Depends(tenant)):
@@ -245,11 +281,11 @@ def create_app(
             raise HTTPException(422, "task type/version is not registered")
         if not request.input.key.startswith(tenant_prefix(tenant_id)):
             raise NotFound("input")
-        await artifacts.get(request.input)
+        await verify_artifact(artifacts, request.input)
         if request.configuration:
             if not request.configuration.key.startswith(tenant_prefix(tenant_id)):
                 raise NotFound("configuration")
-            await artifacts.get(request.configuration)
+            await verify_artifact(artifacts, request.configuration)
         root_id = sha256(f"{tenant_id}\x00{request.submission_key}".encode()).hexdigest()
         deadline = datetime.now(UTC) + timedelta(seconds=definition["deadline_seconds"])
         root = RootSpec(
@@ -285,7 +321,7 @@ def create_app(
         for ref in (request.input, request.configuration):
             if not ref.key.startswith(tenant_prefix(tenant_id)):
                 raise NotFound("artifact")
-            await artifacts.get(ref)
+            await verify_artifact(artifacts, ref)
         item_id = await buffers.append(tenant_id, request, definition)
         return {"item_id": item_id, "status": "buffered", "owner": "temporal"}
 

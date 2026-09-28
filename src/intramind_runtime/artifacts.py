@@ -2,7 +2,9 @@
 
 import asyncio
 import io
+from contextlib import asynccontextmanager, contextmanager
 from hashlib import sha256
+from tempfile import TemporaryFile
 from typing import BinaryIO, Protocol
 
 from minio import Minio
@@ -15,6 +17,38 @@ IO_CHUNK_BYTES = 64 * 1024
 
 class ArtifactTooLarge(ValueError):
     """The upload exceeds the configured storage limit."""
+
+
+class ArtifactCapacityBusy(RuntimeError):
+    """Retryable exhaustion of the process-local artifact spool budget."""
+
+
+class SpoolBudget:
+    def __init__(self, *, concurrency=2, read_bytes=256 * 1024 * 1024,
+                 total_bytes=512 * 1024 * 1024):
+        if min(concurrency, read_bytes, total_bytes) <= 0:
+            raise ValueError("artifact budgets must be positive")
+        self.concurrency, self.read_limit, self.total_limit = concurrency, read_bytes, total_bytes
+        self.reads = self.read_bytes = self.total_bytes = 0
+
+    @contextmanager
+    def reserve(self, size, *, read=False):
+        # Used only on the owning event loop; admission has no suspension/queue.
+        if (self.total_bytes + size > self.total_limit or
+                (read and (self.reads >= self.concurrency or
+                           self.read_bytes + size > self.read_limit))):
+            raise ArtifactCapacityBusy("artifact spool capacity busy")
+        self.total_bytes += size
+        if read:
+            self.reads += 1
+            self.read_bytes += size
+        try:
+            yield
+        finally:
+            self.total_bytes -= size
+            if read:
+                self.reads -= 1
+                self.read_bytes -= size
 
 
 async def file_io(function, *args, **kwargs):
@@ -44,11 +78,17 @@ class ArtifactPort(Protocol):
     async def put_file(self, tenant_id: str, data: BinaryIO,
                        content_type="application/json") -> Artifact: ...
     async def get(self, artifact: Artifact) -> bytes: ...
+    def open_verified(self, artifact: Artifact): ...
 
 
 class MinioArtifacts:
-    def __init__(self, client: Minio, bucket: str, max_bytes: int = MAX_ARTIFACT_BYTES):
+    def __init__(self, client: Minio, bucket: str, max_bytes: int = MAX_ARTIFACT_BYTES,
+                 *, spool_directory=None, read_concurrency=2,
+                 read_spool_bytes=256 * 1024 * 1024, spool_bytes=512 * 1024 * 1024):
         self.client, self.bucket, self.max_bytes = client, bucket, max_bytes
+        self.spool_directory = spool_directory
+        self.spool_budget = SpoolBudget(concurrency=read_concurrency,
+            read_bytes=read_spool_bytes, total_bytes=spool_bytes)
 
     async def ready(self):
         # Provision explicitly; a typo must not silently create a new bucket.
@@ -102,13 +142,34 @@ class MinioArtifacts:
             response.close()
             response.release_conn()
 
-    async def get(self, artifact: Artifact) -> bytes:
+    @asynccontextmanager
+    async def open_verified(self, artifact: Artifact):
+        """Hold admission and disk until the consumer finishes, including cancellation."""
         if artifact.size > self.max_bytes:
             raise ArtifactTooLarge("artifact exceeds configured limit")
+        with self.spool_budget.reserve(artifact.size, read=True):
+            with TemporaryFile(dir=self.spool_directory) as destination:
+                await file_io(self._verify, artifact, destination)
+                await file_io(destination.seek, 0)
+                yield destination
 
-        def read():
-            with io.BytesIO() as destination:
-                self._verify(artifact, destination)
-                return destination.getvalue()
+    async def get(self, artifact: Artifact) -> bytes:
+        """Compatibility for small structured callers; binary readers use open_verified."""
+        async with self.open_verified(artifact) as source:
+            return await file_io(source.read)
 
-        return await file_io(read)
+    async def read_to_file(self, artifact: Artifact, destination: BinaryIO):
+        async with self.open_verified(artifact) as source:
+            def copy():
+                while chunk := source.read(IO_CHUNK_BYTES):
+                    destination.write(chunk)
+            await file_io(copy)
+
+
+async def verify_artifact(artifacts: ArtifactPort, artifact: Artifact):
+    """Validate references without materializing a binary payload in memory."""
+    if hasattr(artifacts, "open_verified"):
+        async with artifacts.open_verified(artifact):
+            pass
+    else:
+        await artifacts.get(artifact)

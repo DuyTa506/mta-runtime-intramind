@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     minio_secure: bool = True
     artifact_max_bytes: int = Field(default=MAX_ARTIFACT_BYTES, gt=0, le=MAX_ARTIFACT_BYTES)
     artifact_upload_concurrency: int = Field(default=2, ge=1, le=8)
+    artifact_spool_directory: str | None = None
+    artifact_read_concurrency: int = Field(default=2, ge=1, le=8)
+    artifact_read_spool_bytes: int = Field(default=256 * 1024 * 1024, gt=0)
+    artifact_spool_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
     temporal_address: str = "temporal:7233"
     temporal_namespace: str = "intramind"
     temporal_queue: str = "intramind-control"

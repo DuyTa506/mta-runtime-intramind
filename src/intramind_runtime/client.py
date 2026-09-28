@@ -1,13 +1,21 @@
 """Trusted-service HTTP client; public identity verification remains at gateway."""
 
 import json
+from contextlib import asynccontextmanager
+from hashlib import sha256
+from tempfile import TemporaryFile
 from urllib.parse import quote
 
 import httpx
 
+from .artifacts import IO_CHUNK_BYTES, MAX_ARTIFACT_BYTES, SpoolBudget, file_io
+from .contracts import Artifact
+
 
 class RuntimeClient:
-    def __init__(self, base_url: str, service_token: str, tenant_id: str, *, client=None):
+    def __init__(self, base_url: str, service_token: str, tenant_id: str, *, client=None, spool_directory=None):
+        self.spool_directory = spool_directory
+        self.spool_budget = SpoolBudget()
         self.client = client or httpx.AsyncClient(
             base_url=base_url,
             timeout=15,
@@ -68,6 +76,36 @@ class RuntimeClient:
         response = await self.client.post("/v1/artifacts/read", json=ref)
         response.raise_for_status()
         return response.content
+
+    @asynccontextmanager
+    async def open_verified(self, ref: dict):
+        """Download to disk and verify before exposing any bytes to the consumer."""
+        artifact = Artifact.model_validate(ref)
+        if artifact.size > MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact exceeds configured limit")
+        with self.spool_budget.reserve(artifact.size, read=True):
+            with TemporaryFile(dir=self.spool_directory) as staged:
+                checksum, size = sha256(), 0
+                async with self.client.stream("POST", "/v1/artifacts/read", json=ref) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(IO_CHUNK_BYTES):
+                        size += len(chunk)
+                        if size > artifact.size:
+                            raise ValueError("artifact checksum/length mismatch")
+                        checksum.update(chunk)
+                        await file_io(staged.write, chunk)
+                if size != artifact.size or checksum.hexdigest() != artifact.sha256:
+                    raise ValueError("artifact checksum/length mismatch")
+                await file_io(staged.seek, 0)
+                yield staged
+
+    async def read_to_file(self, ref: dict, destination):
+        """Copy verified bytes to a caller-owned binary file at its current position."""
+        async with self.open_verified(ref) as source:
+            def copy():
+                while chunk := source.read(IO_CHUNK_BYTES):
+                    destination.write(chunk)
+            await file_io(copy)
 
     async def prepare(
         self, *, model_profile: str, payload: dict, max_output_tokens: int,

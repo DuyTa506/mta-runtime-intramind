@@ -5,7 +5,7 @@ from tempfile import TemporaryFile
 
 from fastapi import HTTPException, Request
 
-from .artifacts import MAX_ARTIFACT_BYTES, ArtifactPort, ArtifactTooLarge, file_io
+from .artifacts import MAX_ARTIFACT_BYTES, ArtifactPort, ArtifactTooLarge, SpoolBudget, file_io
 from .contracts import Artifact
 
 JSON_LIMIT_BYTES = 16 * 1024 * 1024
@@ -20,6 +20,8 @@ class ArtifactUploads:
             raise ValueError("artifact size and upload concurrency must be positive")
         self.artifacts, self.max_bytes = artifacts, max_bytes
         self.capacity = asyncio.Semaphore(concurrency)
+        self.spool_budget = getattr(artifacts, "spool_budget", SpoolBudget())
+        self.spool_directory = getattr(artifacts, "spool_directory", None)
 
     async def receive(self, request: Request, tenant_id: str) -> Artifact:
         """Spool a bounded body, then publish its verified immutable reference."""
@@ -37,12 +39,15 @@ class ArtifactUploads:
         if self.capacity.locked():
             raise HTTPException(503, "artifact upload capacity busy", headers={"Retry-After": "1"})
         async with self.capacity:
-            with TemporaryFile() as staged:
+            with self.spool_budget.reserve(int(declared) if declared is not None else limit), \
+                    TemporaryFile(dir=self.spool_directory) as staged:
                 size = 0
                 async for chunk in request.stream():
                     size += len(chunk)
                     if size > limit:
                         raise HTTPException(413, f"artifact exceeds {limit} byte upload limit")
+                    if declared is not None and size > int(declared):
+                        raise HTTPException(400, "artifact content length mismatch")
                     if chunk:
                         await file_io(staged.write, chunk)
                 if declared is not None and size != int(declared):

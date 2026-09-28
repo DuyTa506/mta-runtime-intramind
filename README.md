@@ -596,3 +596,32 @@ not a semantic translation guarantee. `langdetect==1.0.9` ships the small profil
 inside its wheel, covered by the lockfile: no runtime download, GPU or extra LLM
 call is needed for detection. See the [detector documentation](https://github.com/Mimino666/langdetect)
 for supported languages and the deterministic seed behavior.
+
+### Verified artifact downloads
+
+`POST /v1/artifacts/read` keeps its existing request and byte-response contract.
+MinIO downloads are verified into a temporary disk file before response headers or
+payload bytes are sent. Admission covers verification, slow HTTP consumers, and
+cancellation drainage. Exhausted capacity returns HTTP 503 with `Retry-After: 1`;
+there is no unbounded waiting queue. Internal `get()` calls use the same read
+admission. Reference-only checks use `verify_artifact()` without building bytes.
+
+Configure `RUNTIME_ARTIFACT_SPOOL_DIRECTORY` to a writable **disk-backed** mount
+with at least 1 GiB available; do not use tmpfs under the 512 MiB API memory limit.
+Without this setting Python's temporary directory is used. Per-process defaults:
+`RUNTIME_ARTIFACT_READ_CONCURRENCY=2`,
+`RUNTIME_ARTIFACT_READ_SPOOL_BYTES=268435456`, and
+`RUNTIME_ARTIFACT_SPOOL_BYTES=536870912` (combined upload and read reservations).
+Chunks are 64 KiB. Unknown-length uploads reserve their route limit up front;
+known-length uploads reserve their declared length and reject mismatches.
+Keep runtime API admission single-authority: increasing processes also multiplies
+these local budgets and does not extend a shared disk quota.
+
+Binary SDK consumers should use `async with client.open_verified(ref) as source`
+or `await client.read_to_file(ref, destination)` with a caller-owned binary file.
+Both validate size and SHA-256 before exposing/copying bytes. `open_verified`
+holds the file and client admission until context exit. `RuntimeClient` accepts
+`spool_directory=` and defaults to two reads / 256 MiB read spool. Legacy
+`read_bytes` / `read_json` remain compatible and materialize their results; their
+callers still own the resulting memory. File-copy failures can leave partial
+output in caller-owned destinations, so publish such files only after success.
