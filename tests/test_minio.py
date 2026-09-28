@@ -16,9 +16,12 @@ async def test_minio_roundtrip_checksum_and_tenant_isolation():
     endpoint = os.environ.get("RUNTIME_TEST_MINIO_ENDPOINT")
     if not endpoint:
         pytest.skip("explicit disposable RUNTIME_TEST_MINIO_ENDPOINT required")
-    if endpoint not in {"127.0.0.1:19009", "127.0.0.1:19010"}:
+    if endpoint not in {"127.0.0.1:19009", "127.0.0.1:19010", "127.0.0.1:19180"}:
         pytest.fail("refusing to mutate an unrecognized MinIO endpoint")
-    client = Minio(endpoint, access_key="runtime_test", secret_key="runtime_test_only", secure=False)
+    client = Minio(endpoint,
+        access_key=os.environ["PERF_MINIO_USER"] if endpoint.endswith(":19180") else "runtime_test",
+        secret_key=os.environ["PERF_MINIO_PASSWORD"] if endpoint.endswith(":19180") else "runtime_test_only",
+        secure=False)
     bucket = "runtime-test-"+uuid4().hex
     await asyncio.to_thread(client.make_bucket, bucket)
     blobs = MinioArtifacts(client, bucket)
@@ -52,7 +55,12 @@ async def test_minio_roundtrip_checksum_and_tenant_isolation():
             audio = await blobs.put_file("tenant-a", source, "audio/wav")
             assert audio.size == 65 * 1024 * 1024
             assert audio.sha256 == checksum.hexdigest()
-            assert sha256(await blobs.get(audio)).hexdigest() == audio.sha256
+            async with blobs.open_verified(audio) as verified:
+                checksum = sha256()
+                while chunk := verified.read(64 * 1024):
+                    checksum.update(chunk)
+                assert checksum.hexdigest() == audio.sha256
+            assert blobs.spool_budget.total_bytes == 0
     finally:
         def cleanup():
             for obj in client.list_objects(bucket, recursive=True):

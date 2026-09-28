@@ -60,7 +60,10 @@ services:
       retries: 30
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # Public immutable CI fixture; run the binary directly, not vendor provisioning.
+    image: docker.io/bitnamilegacy/minio:2025.7.23@sha256:8935e75fa5d11295c17171e4aa49efe390a1193cd7f12e4d21b92af9ffef09d7
+    entrypoint: [/opt/bitnami/minio/bin/minio]
+    user: "0:0"
     command: [server, /data, --console-address, ':9001']
     environment:
       MINIO_ROOT_USER: runtime_test

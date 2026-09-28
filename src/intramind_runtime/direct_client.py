@@ -70,6 +70,11 @@ class DirectStreamError(RuntimeError):
         self.error_type = error_type
 
 
+def current_inference_tenant() -> str | None:
+    """Verified identity in the active scope; never infer one for callers."""
+    return _tenant.get()
+
+
 @dataclass(frozen=True)
 class DirectBinding:
     base_url: str
@@ -90,6 +95,23 @@ class DirectBinding:
                 "follow_redirects": False,
                 **({"event_hooks": {"response": [observe_response], "request": [before_request]}}
                    if observe_admission else {})}
+
+    async def embedding_profile(self, *, client=None):
+        """Read the current qualified profile with the same verified identity."""
+        from .embedding import EmbeddingProfile
+        url = self.base_url.rstrip("/") + "/v1/embedding/profiles/" + self.model_profile
+        async def read(session):
+            response = await session.get(url, auth=_IdentityAuth(url, self.service_token),
+                                         timeout=10, follow_redirects=False)
+            response.raise_for_status()
+            profile = EmbeddingProfile.model_validate(response.json())
+            if profile.model_profile != self.model_profile:
+                raise ValueError("embedding profile differs from runtime binding")
+            return profile
+        if client is not None:
+            return await read(client)
+        async with httpx.AsyncClient() as session:
+            return await read(session)
 
     async def stream_events(self, payload: dict, *, client: httpx.AsyncClient | None = None
                             ) -> AsyncIterator[DirectStreamEvent]:

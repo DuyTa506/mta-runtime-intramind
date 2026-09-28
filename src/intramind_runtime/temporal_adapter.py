@@ -12,7 +12,7 @@ from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import ApplicationError, CancelledError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
-from .artifacts import ArtifactPort
+from .artifacts import ArtifactPort, verify_artifact
 from .contracts import (
     AdmissionDenied,
     Artifact,
@@ -78,7 +78,7 @@ class BrokerActivities:
     async def finish(self, payload: dict[str, Any]) -> None:
         ref = Artifact.model_validate(payload["result"]) if payload.get("result") else None
         if ref and self.artifacts:
-            await self.artifacts.get(ref)
+            await verify_artifact(self.artifacts, ref)
         try:
             await self.store.finish_run(
                 payload["root_id"],
