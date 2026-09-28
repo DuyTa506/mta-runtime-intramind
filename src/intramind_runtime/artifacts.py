@@ -21,6 +21,10 @@ class ArtifactTooLarge(ValueError):
     """The upload exceeds the configured storage limit."""
 
 
+class ArtifactIntegrityError(ValueError):
+    """Stored content does not match the committed digest or length."""
+
+
 class ArtifactCapacityBusy(RuntimeError):
     """Retryable exhaustion of the process-local artifact spool budget."""
 
@@ -150,12 +154,12 @@ class MinioArtifacts:
             while chunk := response.read(IO_CHUNK_BYTES):
                 size += len(chunk)
                 if size > artifact.size:
-                    raise ValueError("artifact checksum/length mismatch")
+                    raise ArtifactIntegrityError("artifact checksum/length mismatch")
                 checksum.update(chunk)
                 if destination is not None:
                     destination.write(chunk)
             if size != artifact.size or checksum.hexdigest() != artifact.sha256:
-                raise ValueError("artifact checksum/length mismatch")
+                raise ArtifactIntegrityError("artifact checksum/length mismatch")
         finally:
             response.close()
             response.release_conn()

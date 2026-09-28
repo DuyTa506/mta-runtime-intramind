@@ -1,6 +1,7 @@
 """Internal authenticated API. Gateway remains the public identity authority."""
 
 import hmac
+import errno
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -14,6 +15,7 @@ from .artifacts import (
     IO_CHUNK_BYTES,
     MAX_ARTIFACT_BYTES,
     ArtifactCapacityBusy,
+    ArtifactIntegrityError,
     ArtifactPort,
     file_io,
     tenant_prefix,
@@ -226,6 +228,12 @@ def create_app(
             headers={"Retry-After": "5"} if exc.retryable else {},
         )
 
+    @app.exception_handler(ArtifactIntegrityError)
+    async def invalid_artifact(request, exc):
+        # Keep the existing 500 contract, but make it a handled response so a
+        # checksum failure cannot poison a pooled keep-alive connection.
+        return JSONResponse(status_code=500, content={"detail": "artifact integrity verification failed"})
+
     @app.exception_handler(NotFound)
     async def missing(request, exc):
         return JSONResponse(status_code=404, content={"detail": "not found"})
@@ -244,7 +252,12 @@ def create_app(
 
     @app.post("/v1/artifacts", response_model=Artifact)
     async def upload(request: Request, tenant_id=Depends(tenant)):
-        return await uploads.receive(request, tenant_id)
+        try:
+            return await uploads.receive(request, tenant_id)
+        except OSError as exc:
+            if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                raise HTTPException(503, "artifact spool capacity busy", headers={"Retry-After": "1"}) from exc
+            raise
 
     @app.post("/v1/artifacts/read")
     async def download(ref: Artifact, tenant_id=Depends(tenant)):
@@ -254,7 +267,12 @@ def create_app(
         if not hasattr(artifacts, "open_verified"):
             return Response(await artifacts.get(ref), media_type=ref.content_type)
         context = artifacts.open_verified(ref)
-        source = await context.__aenter__()
+        try:
+            source = await context.__aenter__()
+        except OSError as exc:
+            if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                raise HTTPException(503, "artifact spool capacity busy", headers={"Retry-After": "1"}) from exc
+            raise
 
         async def chunks():
             while chunk := await file_io(source.read, IO_CHUNK_BYTES):

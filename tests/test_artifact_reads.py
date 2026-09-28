@@ -45,6 +45,10 @@ async def test_corrupt_download_exposes_no_body_and_releases_budget():
         base_url="http://test", headers={"Authorization": f"Bearer {TOKEN}",
                                        "X-Tenant-ID": "owner"}) as client:
         response = await client.post("/v1/artifacts/read", json=ref.model_dump())
+        assert response.json() == {"detail": "artifact integrity verification failed"}
+        backend.corrupt = False
+        recovered = await client.post("/v1/artifacts/read", json=ref.model_dump())
+        assert recovered.status_code == 200 and recovered.content == b"verified payload"
     assert response.status_code == 500
     assert b"corrupt" not in response.content
 
@@ -261,3 +265,20 @@ async def test_client_put_file_rejects_unverified_upload_receipt():
         client = RuntimeClient("unused", TOKEN, "owner", client=http)
         with pytest.raises(ValueError, match="receipt checksum/length"):
             await client.put_file(io.BytesIO(b"good"), content_type="application/octet-stream")
+
+
+async def test_http_disk_exhaustion_is_retryable_before_response_headers(monkeypatch):
+    _, blobs, ref = await fixture_blob()
+    original = blobs._verify
+    def no_space(*args):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(blobs, "_verify", no_space)
+    app = create_app(None, blobs, TOKEN, {})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test",
+        headers={"Authorization":f"Bearer {TOKEN}","X-Tenant-ID":"owner"}) as client:
+        response = await client.post("/v1/artifacts/read", json=ref.model_dump())
+        assert response.status_code == 503 and response.headers['retry-after'] == '1'
+        assert blobs.spool_budget.total_bytes == 0
+        monkeypatch.setattr(blobs, "_verify", original)
+        response = await client.post("/v1/artifacts/read", json=ref.model_dump())
+        assert response.status_code == 200

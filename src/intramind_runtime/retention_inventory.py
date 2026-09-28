@@ -40,10 +40,35 @@ async def inventory(engine, *, grace_days=30, now=None):
             'reason': 'Complete external references, pinned histories and retry/idempotency tombstones are not established.'}
 
 
+def object_inventory(client, bucket, cutoff):
+    """Stream metadata only; absence from ledger is never deletion evidence."""
+    count = size = aged_count = aged_bytes = 0
+    oldest = None
+    for item in client.list_objects(bucket, prefix="tenants/", recursive=True):
+        count += 1
+        size += item.size or 0
+        if item.last_modified is not None:
+            oldest = min(oldest, item.last_modified) if oldest else item.last_modified
+            if item.last_modified < cutoff:
+                aged_count += 1
+                aged_bytes += item.size or 0
+    return {"objects": count, "bytes": size, "aged_objects": aged_count, "aged_bytes": aged_bytes,
+            "oldest": oldest.isoformat() if oldest else None, "deletion_candidates": None}
+
+
 async def execute(args):
     engine = create_async_engine(os.environ['RUNTIME_DATABASE_URL'])
     try:
-        print(json.dumps(await inventory(engine, grace_days=args.grace_days), sort_keys=True))
+        report = await inventory(engine, grace_days=args.grace_days)
+        if args.include_objects:
+            from minio import Minio
+            client = Minio(os.environ['RUNTIME_MINIO_ENDPOINT'],
+                access_key=os.environ['RUNTIME_MINIO_ACCESS_KEY'],
+                secret_key=os.environ['RUNTIME_MINIO_SECRET_KEY'],
+                secure=os.environ.get('RUNTIME_MINIO_SECURE', 'true').lower() in {'true', '1'})
+            report['objects'] = await asyncio.to_thread(object_inventory, client,
+                os.environ['RUNTIME_MINIO_BUCKET'], datetime.fromisoformat(report['cutoff']))
+        print(json.dumps(report, sort_keys=True))
     finally:
         await engine.dispose()
 
@@ -51,6 +76,7 @@ async def execute(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--grace-days', type=int, default=30)
+    parser.add_argument('--include-objects', action='store_true')
     # Deliberately no apply/delete switch or object-store write client.
     asyncio.run(execute(parser.parse_args()))
 
