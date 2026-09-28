@@ -629,3 +629,14 @@ output in caller-owned destinations, so publish such files only after success.
 `await client.put_file(source, content_type=...)` streams a seekable caller-owned
 file in 64 KiB chunks and checks the returned digest/length before returning its
 reference. The caller retains file ownership; cancellation drains active reads.
+
+Spool admission also checks filesystem free space. The default
+`RUNTIME_ARTIFACT_SPOOL_MIN_FREE_BYTES=1073741824` retains 1 GiB headroom after
+subtracting the new and outstanding local reservations. This conservative check
+is not a cross-process disk quota; budget other users of a shared volume separately.
+The runtime image creates `/var/lib/intramind/artifact-spool` for UID 10001 so an
+initial named-volume mount inherits writable ownership.
+
+SDK file readers honor `RUNTIME_ARTIFACT_SPOOL_DIRECTORY` and the free-space setting.
+Their concurrency/byte admission is shared by clients on the same event loop and
+spool configuration, including clients constructed separately by each activity.

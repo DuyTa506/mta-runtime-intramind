@@ -1,26 +1,59 @@
 """Trusted-service HTTP client; public identity verification remains at gateway."""
 
+import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from hashlib import sha256
-from tempfile import TemporaryFile
+from tempfile import TemporaryFile, gettempdir
 from urllib.parse import quote
+from weakref import WeakKeyDictionary
 
 import httpx
 
-from .artifacts import IO_CHUNK_BYTES, MAX_ARTIFACT_BYTES, SpoolBudget, file_io
+from .artifacts import (
+    IO_CHUNK_BYTES,
+    MAX_ARTIFACT_BYTES,
+    MIN_SPOOL_FREE_BYTES,
+    SpoolBudget,
+    file_io,
+)
 from .contracts import Artifact
+
+_client_budgets = WeakKeyDictionary()
+
+
+def client_budget(directory, concurrency, read_bytes, total_bytes, min_free_bytes):
+    loop = asyncio.get_running_loop()
+    budgets = _client_budgets.setdefault(loop, {})
+    key = (os.path.realpath(directory or gettempdir()), concurrency, read_bytes, total_bytes, min_free_bytes)
+    if key not in budgets:
+        budgets[key] = SpoolBudget(concurrency=concurrency, read_bytes=read_bytes,
+            total_bytes=total_bytes, spool_directory=key[0], min_free_bytes=min_free_bytes)
+    return budgets[key]
 
 
 class RuntimeClient:
-    def __init__(self, base_url: str, service_token: str, tenant_id: str, *, client=None, spool_directory=None):
-        self.spool_directory = spool_directory
-        self.spool_budget = SpoolBudget()
+    def __init__(self, base_url: str, service_token: str, tenant_id: str, *, client=None,
+                 spool_directory=None, read_concurrency=2, read_spool_bytes=256 * 1024 * 1024,
+                 spool_bytes=512 * 1024 * 1024, spool_min_free_bytes=None):
+        self.spool_directory = (spool_directory if spool_directory is not None
+                                else os.environ.get("RUNTIME_ARTIFACT_SPOOL_DIRECTORY"))
+        if spool_min_free_bytes is None:
+            spool_min_free_bytes = int(os.environ.get("RUNTIME_ARTIFACT_SPOOL_MIN_FREE_BYTES", MIN_SPOOL_FREE_BYTES))
+        self._spool_options = (self.spool_directory, read_concurrency, read_spool_bytes,
+                               spool_bytes, spool_min_free_bytes)
         self.client = client or httpx.AsyncClient(
             base_url=base_url,
             timeout=15,
             headers={"Authorization": f"Bearer {service_token}", "X-Tenant-ID": tenant_id},
         )
+
+    @property
+    def spool_budget(self):
+        # Clients are often created per activity. Admission belongs to the loop
+        # and spool configuration, not to the short-lived HTTP client object.
+        return client_budget(*self._spool_options)
 
     async def submit(self, submission: dict):
         response = await self.client.post("/v1/runs", json=submission)

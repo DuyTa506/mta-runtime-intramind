@@ -2,9 +2,10 @@
 
 import asyncio
 import io
+import os
 from contextlib import asynccontextmanager, contextmanager
 from hashlib import sha256
-from tempfile import TemporaryFile
+from tempfile import TemporaryFile, gettempdir
 from typing import BinaryIO, Protocol
 
 from minio import Minio
@@ -13,6 +14,7 @@ from .contracts import Artifact, digest
 
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 IO_CHUNK_BYTES = 64 * 1024
+MIN_SPOOL_FREE_BYTES = 1024 * 1024 * 1024
 
 
 class ArtifactTooLarge(ValueError):
@@ -25,19 +27,33 @@ class ArtifactCapacityBusy(RuntimeError):
 
 class SpoolBudget:
     def __init__(self, *, concurrency=2, read_bytes=256 * 1024 * 1024,
-                 total_bytes=512 * 1024 * 1024):
+                 total_bytes=512 * 1024 * 1024, spool_directory=None,
+                 min_free_bytes=MIN_SPOOL_FREE_BYTES):
         if min(concurrency, read_bytes, total_bytes) <= 0:
             raise ValueError("artifact budgets must be positive")
+        if min_free_bytes < 0:
+            raise ValueError("artifact minimum free space must not be negative")
+        self.spool_directory = spool_directory or gettempdir()
+        self.min_free_bytes = min_free_bytes
         self.concurrency, self.read_limit, self.total_limit = concurrency, read_bytes, total_bytes
         self.reads = self.read_bytes = self.total_bytes = 0
 
     @contextmanager
     def reserve(self, size, *, read=False):
         # Used only on the owning event loop; admission has no suspension/queue.
+        if type(size) is not int or size < 0:
+            raise ValueError("artifact reservation size must be a nonnegative integer")
         if (self.total_bytes + size > self.total_limit or
                 (read and (self.reads >= self.concurrency or
                            self.read_bytes + size > self.read_limit))):
             raise ArtifactCapacityBusy("artifact spool capacity busy")
+        disk = os.statvfs(self.spool_directory)
+        # Conservatively subtract all outstanding local reservations, even if
+        # some of their bytes already appear in disk usage. This is not a
+        # cross-process quota: deployment must also budget shared disk users.
+        available = disk.f_bavail * disk.f_frsize
+        if available - self.total_bytes - size < self.min_free_bytes:
+            raise ArtifactCapacityBusy("artifact spool disk headroom exhausted")
         self.total_bytes += size
         if read:
             self.reads += 1
@@ -84,11 +100,13 @@ class ArtifactPort(Protocol):
 class MinioArtifacts:
     def __init__(self, client: Minio, bucket: str, max_bytes: int = MAX_ARTIFACT_BYTES,
                  *, spool_directory=None, read_concurrency=2,
-                 read_spool_bytes=256 * 1024 * 1024, spool_bytes=512 * 1024 * 1024):
+                 read_spool_bytes=256 * 1024 * 1024, spool_bytes=512 * 1024 * 1024,
+                 spool_min_free_bytes=MIN_SPOOL_FREE_BYTES):
         self.client, self.bucket, self.max_bytes = client, bucket, max_bytes
         self.spool_directory = spool_directory
         self.spool_budget = SpoolBudget(concurrency=read_concurrency,
-            read_bytes=read_spool_bytes, total_bytes=spool_bytes)
+            read_bytes=read_spool_bytes, total_bytes=spool_bytes,
+            spool_directory=spool_directory, min_free_bytes=spool_min_free_bytes)
 
     async def ready(self):
         # Provision explicitly; a typo must not silently create a new bucket.

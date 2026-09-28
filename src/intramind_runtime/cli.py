@@ -53,6 +53,7 @@ def artifacts(settings):
         read_concurrency=settings.artifact_read_concurrency,
         read_spool_bytes=settings.artifact_read_spool_bytes,
         spool_bytes=settings.artifact_spool_bytes,
+        spool_min_free_bytes=settings.artifact_spool_min_free_bytes,
     )
 
 
