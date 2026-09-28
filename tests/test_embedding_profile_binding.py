@@ -1,5 +1,6 @@
 import httpx
 import pytest
+
 from intramind_runtime.direct_client import DirectBinding, current_inference_tenant, inference_scope
 
 PROFILE = dict(model_profile='embedding',capacity_profile_id='qualified-v1',model='embed',

@@ -1,9 +1,9 @@
 """Read-only retention inventory. Age is not proof an object can be deleted."""
 import argparse
 import asyncio
-from datetime import datetime, timedelta, timezone
 import json
 import os
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -25,7 +25,7 @@ COUNTS = {
 async def inventory(engine, *, grace_days=30, now=None):
     if type(grace_days) is not int or grace_days < 1:
         raise ValueError('Grace period must be a positive whole number of days')
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=grace_days)
     tables = {}
     async with engine.connect() as connection:

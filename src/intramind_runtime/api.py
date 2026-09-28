@@ -1,7 +1,7 @@
 """Internal authenticated API. Gateway remains the public identity authority."""
 
-import hmac
 import errno
+import hmac
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
