@@ -625,3 +625,7 @@ holds the file and client admission until context exit. `RuntimeClient` accepts
 `read_bytes` / `read_json` remain compatible and materialize their results; their
 callers still own the resulting memory. File-copy failures can leave partial
 output in caller-owned destinations, so publish such files only after success.
+
+`await client.put_file(source, content_type=...)` streams a seekable caller-owned
+file in 64 KiB chunks and checks the returned digest/length before returning its
+reference. The caller retains file ownership; cancellation drains active reads.

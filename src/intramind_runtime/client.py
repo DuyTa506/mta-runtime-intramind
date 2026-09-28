@@ -67,6 +67,36 @@ class RuntimeClient:
         response.raise_for_status()
         return response.json()
 
+    async def put_file(self, source, *, content_type: str):
+        """Stream a seekable caller-owned file without constructing a bytes copy."""
+        def measure():
+            source.seek(0, 2)
+            size = source.tell()
+            source.seek(0)
+            return size
+        size = await file_io(measure)
+        if size > MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact exceeds configured limit")
+        checksum, received = sha256(), 0
+        async def chunks():
+            nonlocal received
+            while chunk := await file_io(source.read, IO_CHUNK_BYTES):
+                received += len(chunk)
+                if received > size:
+                    raise ValueError("artifact file changed during upload")
+                checksum.update(chunk)
+                yield chunk
+            if received != size:
+                raise ValueError("artifact file changed during upload")
+        response = await self.client.post("/v1/artifacts", content=chunks(),
+            headers={"Content-Type": content_type, "Content-Length": str(size)})
+        response.raise_for_status()
+        result = response.json()
+        ref = Artifact.model_validate(result)
+        if received != size or ref.size != size or ref.sha256 != checksum.hexdigest():
+            raise ValueError("artifact upload receipt checksum/length mismatch")
+        return result
+
     async def read_json(self, ref: dict):
         response = await self.client.post("/v1/artifacts/read", json=ref)
         response.raise_for_status()

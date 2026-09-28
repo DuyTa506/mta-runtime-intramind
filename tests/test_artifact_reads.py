@@ -234,3 +234,30 @@ async def test_response_construction_failure_releases_open_file():
         with pytest.raises(UnicodeEncodeError):
             await client.post("/v1/artifacts/read", json=invalid_header.model_dump())
     assert blobs.spool_budget.total_bytes == 0
+
+
+async def test_client_put_file_streams_and_preserves_caller_ownership():
+    _, blobs, _ = await fixture_blob()
+    async with api(blobs) as http:
+        client = RuntimeClient("unused", TOKEN, "owner", client=http)
+        class BoundedFile(io.BytesIO):
+            def read(self, size=-1):
+                assert size == 64 * 1024
+                return super().read(size)
+        source = BoundedFile(b"upload" * 100000)
+        result = await client.put_file(source, content_type="application/octet-stream")
+        assert result["size"] == 600000
+        assert not source.closed
+        assert await client.read_bytes(result) == b"upload" * 100000
+
+
+async def test_client_put_file_rejects_unverified_upload_receipt():
+    from hashlib import sha256
+    async def wrong(request):
+        await request.aread()
+        return httpx.Response(200, json={"key": "ref", "size": 3,
+            "sha256": sha256(b"bad").hexdigest()})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(wrong), base_url="http://test") as http:
+        client = RuntimeClient("unused", TOKEN, "owner", client=http)
+        with pytest.raises(ValueError, match="receipt checksum/length"):
+            await client.put_file(io.BytesIO(b"good"), content_type="application/octet-stream")
