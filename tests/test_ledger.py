@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 from conftest import operation, pool, root
@@ -263,3 +264,26 @@ async def test_identical_artifact_bytes_have_independent_operation_commits(store
         await store.commit_result(reservation, reservation.operation.payload, 12)
     assert (await store.run("r", "t"))["spent"] == 24
     assert (await store.operation("o1", "t"))["state"] == "SUCCEEDED"
+
+
+async def test_idle_engine_settles_only_uncertainty_older_than_the_idle_proof(store):
+    await setup(store, target=1)
+    reservation = await store.reserve_next("p", "a")
+    await store.mark_send(reservation)
+    before_unknown = datetime.now(UTC)
+    await store.unknown(reservation, "read_timeout")
+    assert await store.settle_idle_unknown("p", "e1", before_unknown) == 0
+    assert await store.settle_idle_unknown("p", "other-epoch", datetime.now(UTC)) == 0
+    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC)) == 1
+    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC)) == 0
+    op = await store.operation("o0", "t")
+    assert op["state"] == "RETRY_WAIT" and op["wait_reason"] == "engine_recovery"
+    async with store.engine.connect() as c:
+        attempt = (await c.execute(text("""SELECT state,compute_held,error_class
+            FROM runtime_attempts WHERE attempt_id=:id"""), {"id": reservation.attempt_id})).one()
+        pool_row = (await c.execute(text(
+            "SELECT health,target FROM runtime_pools WHERE pool_id='p'"))).one()
+    assert tuple(attempt) == ("FAILED", False, "engine_idle_verified")
+    # Idle proof clears uncertainty; admission stays with the pool owner.
+    assert tuple(pool_row) == ("HEALTHY", 1)
+    assert (await store.run("r", "t"))["reserved"] == 0

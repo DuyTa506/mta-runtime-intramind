@@ -1065,38 +1065,78 @@ class Store:
                     # the result bytes and must finish persistence, never infer again.
                     continue
                 settled_attempts += 1
-                await self._settle(c, a, 0 if a["state"] == "RESERVED" else None)
-                await execute(c, """UPDATE runtime_attempts SET state='FAILED',compute_held=false,
-                    backend_finished_at=COALESCE(backend_finished_at,now()),error_class='engine_epoch_stopped'
-                    WHERE attempt_id=:id""", id=a["attempt_id"])
-                if a["operation_state"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
-                    continue
-                spec = parse_operation(a["operation_spec"])
-                root = await row(c, """SELECT state,cancel_requested,deadline,spent,reserved,budget_limit,
-                    attempts FROM runtime_roots WHERE root_id=:id FOR UPDATE""", id=a["root_id"])
-                budget = root if spec.budget_unit == "tokens" else await row(c,
-                    """SELECT spent,reserved,budget_limit FROM runtime_resource_budgets
-                    WHERE root_id=:id AND unit=:unit FOR UPDATE""",
-                    id=a["root_id"], unit=spec.budget_unit)
-                can_retry = (recover and root["state"] == "RUNNING" and not root["cancel_requested"]
-                    and root["deadline"] > datetime.now(UTC)
-                    and (spec.deadline is None or spec.deadline > datetime.now(UTC))
-                    and a["operation_attempts"] < spec.max_attempts
-                    and root["attempts"] < a["root_spec"]["max_attempts"]
-                    and budget is not None
-                    and budget["spent"] + budget["reserved"] + spec.budget_bound <= budget["budget_limit"])
-                if can_retry:
-                    await execute(c, """UPDATE runtime_operations SET state='RETRY_WAIT',
-                        active_attempt=NULL,wait_reason='engine_recovery',retry_at=now()
-                        WHERE operation_id=:id AND active_attempt=:old""",
-                        id=a["operation_id"], old=a["attempt_id"])
-                else:
-                    await self._terminal(c, a["operation_id"], "FAILED", "engine_epoch_stopped")
+                await self._settle_stopped_attempt(c, a, recover, "engine_epoch_stopped")
             await execute(c, """INSERT INTO runtime_controller_updates(pool_id,envelope_version,target,reason)
                 VALUES (:id,:version,0,:reason)""", id=pool_id, version=pool["envelope_version"],
                 reason=f"epoch_stopped:{engine_epoch}:{evidence}")
             await self._wake(c)
             return settled_attempts + direct.rowcount
+
+    async def _settle_stopped_attempt(self, c, a, recover: bool, error_class: str):
+        """Settle one attempt whose inference is proven over; retry it only when ``recover``."""
+        await self._settle(c, a, 0 if a["state"] == "RESERVED" else None)
+        await execute(c, """UPDATE runtime_attempts SET state='FAILED',compute_held=false,
+            backend_finished_at=COALESCE(backend_finished_at,now()),error_class=:error
+            WHERE attempt_id=:id""", id=a["attempt_id"], error=error_class)
+        if a["operation_state"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            return
+        spec = parse_operation(a["operation_spec"])
+        root = await row(c, """SELECT state,cancel_requested,deadline,spent,reserved,budget_limit,
+            attempts FROM runtime_roots WHERE root_id=:id FOR UPDATE""", id=a["root_id"])
+        budget = root if spec.budget_unit == "tokens" else await row(c,
+            """SELECT spent,reserved,budget_limit FROM runtime_resource_budgets
+            WHERE root_id=:id AND unit=:unit FOR UPDATE""",
+            id=a["root_id"], unit=spec.budget_unit)
+        can_retry = (recover and root["state"] == "RUNNING" and not root["cancel_requested"]
+            and root["deadline"] > datetime.now(UTC)
+            and (spec.deadline is None or spec.deadline > datetime.now(UTC))
+            and a["operation_attempts"] < spec.max_attempts
+            and root["attempts"] < a["root_spec"]["max_attempts"]
+            and budget is not None
+            and budget["spent"] + budget["reserved"] + spec.budget_bound <= budget["budget_limit"])
+        if can_retry:
+            await execute(c, """UPDATE runtime_operations SET state='RETRY_WAIT',
+                active_attempt=NULL,wait_reason='engine_recovery',retry_at=now()
+                WHERE operation_id=:id AND active_attempt=:old""",
+                id=a["operation_id"], old=a["attempt_id"])
+        else:
+            await self._terminal(c, a["operation_id"], "FAILED", error_class)
+
+    async def settle_idle_unknown(self, pool_id: str, engine_epoch: str,
+                                  idle_since: datetime) -> int:
+        """Settle UNKNOWN attempts that were already lost when the engine was proven idle.
+
+        ``idle_since`` is when the first of consecutive all-slots-idle probes of this
+        exact epoch was taken. An attempt that became UNKNOWN before it cannot still
+        be computing, so it is settled like a stopped epoch with recovery. Pool health
+        and target stay with their owner (watchdog quiesce or operator).
+        """
+        async with self.transaction() as c:
+            pool = await row(c, "SELECT engine_epoch FROM runtime_pools WHERE pool_id=:id FOR UPDATE",
+                             id=pool_id)
+            if not pool or pool["engine_epoch"] != engine_epoch:
+                return 0
+            direct = await execute(c, """UPDATE runtime_direct_attempts SET state='FAILED_RECOVERABLE',
+                compute_held=false,backend_finished_at=COALESCE(backend_finished_at,now()),
+                error_class='engine_idle_verified'
+                WHERE pool_id=:pool AND engine_epoch=:epoch AND compute_held
+                AND state='UNKNOWN' AND unknown_at<:idle""",
+                pool=pool_id, epoch=engine_epoch, idle=idle_since)
+            attempts = await rows(c, """SELECT a.*,o.root_id,o.state AS operation_state,
+                o.spec AS operation_spec,o.attempts AS operation_attempts,
+                r.spec AS root_spec,r.state AS root_state,
+                r.cancel_requested,r.deadline AS root_deadline
+                FROM runtime_attempts a JOIN runtime_operations o USING(operation_id)
+                JOIN runtime_roots r USING(root_id)
+                WHERE a.pool_id=:pool AND a.engine_epoch=:epoch AND a.compute_held
+                AND a.state='UNKNOWN' AND a.unknown_at<:idle
+                ORDER BY a.created_at FOR UPDATE OF a""",
+                pool=pool_id, epoch=engine_epoch, idle=idle_since)
+            for a in attempts:
+                await self._settle_stopped_attempt(c, a, True, "engine_idle_verified")
+            if attempts or direct.rowcount:
+                await self._wake(c)
+            return len(attempts) + direct.rowcount
 
     async def update_target(self, pool_id: str, target: int, version: int, reason: str):
         async with self.transaction() as c:

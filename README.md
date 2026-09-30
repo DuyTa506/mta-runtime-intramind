@@ -46,6 +46,12 @@ neither replaces storage nor migrates buckets.
 | `release_gate` | Application-supplied migration and qualification evidence validation |
 
 UNKNOWN reservations remain accounted for until compute termination is known.
+Termination is known when the epoch is confirmed stopped, or when runtime-api
+probes the pool's llama.cpp `/slots` and finds every slot of the same epoch idle
+twice in a row: UNKNOWN attempts recorded before the first idle probe are then
+settled (`error_class=engine_idle_verified`), durable work is requeued, RAM direct
+permits are released and their callers may retry once on the same epoch. Pool
+health and target stay with their owner (watchdog or operator).
 No DB transaction spans inference. The completion driver does not promise
 reliable remote cancellation, backend status lookup or exactly-once inference.
 
