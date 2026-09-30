@@ -216,11 +216,24 @@ async def test_native_fallback_does_not_swallow_root_or_compatibility_failure(
             await outcome()
 
 
+def patch_state(monkeypatch, enabled: bool) -> list[str]:
+    asked: list[str] = []
+
+    def patched(patch_id):
+        asked.append(patch_id)
+        return enabled
+
+    monkeypatch.setattr(sdk.workflow, "patched", patched)
+    return asked
+
+
+@pytest.mark.parametrize("rolling", [False, True])
 @pytest.mark.parametrize("window,expected", [(1, 1), (3, 3), (8, 4), (None, 4)])
 async def test_feature_window_bounds_materialization_and_preserves_order(
-    runtime_clock, monkeypatch, window, expected
+    runtime_clock, monkeypatch, rolling, window, expected
 ):
     now, _ = runtime_clock
+    patch_state(monkeypatch, rolling)
     ctx = context(now, policy=sdk.TaskPolicy(max_iterations=2, child_window=4))
     active, peak = 0, 0
 
@@ -244,6 +257,91 @@ async def test_feature_window_bounds_materialization_and_preserves_order(
     )
     assert result == items
     assert peak == expected
+
+
+def recording_children(ctx, monkeypatch, *, hold=(), fail=()):
+    """Children that finish immediately unless held; each logs start/finish/cancel."""
+    log: list[tuple[str, int]] = []
+    release = {index: asyncio.Event() for index in hold}
+
+    async def child(**kwargs):
+        index = kwargs["inputs"]["index"]
+        log.append(("start", index))
+        try:
+            with ctx._command():
+                if index in release:
+                    await release[index].wait()
+                await asyncio.sleep(0)
+                if index in fail:
+                    raise RuntimeError(f"child {index} failed")
+        except asyncio.CancelledError:
+            log.append(("cancelled", index))
+            raise
+        log.append(("finish", index))
+        return kwargs["inputs"]
+
+    monkeypatch.setattr(ctx, "run_child", child)
+    return log, release
+
+
+async def run_map(ctx, count, window):
+    return await ctx.map_children(
+        task_type="child/v1",
+        task_queue="features",
+        items=[{"index": i} for i in range(count)],
+        item_key="index",
+        key="phase",
+        window=window,
+    )
+
+
+async def test_rolling_window_starts_the_next_child_as_soon_as_any_finishes(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    asked = patch_state(monkeypatch, True)
+    ctx = context(now, policy=sdk.TaskPolicy(max_iterations=2, child_window=4))
+    log, release = recording_children(ctx, monkeypatch, hold={0})
+    work = asyncio.create_task(run_map(ctx, 5, 2))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    # The slow first child is still running while every later child already ran.
+    assert ("start", 4) in log and ("finish", 0) not in log
+    assert max(sum(1 if kind == "start" else -1 for kind, _ in log[: n + 1]) for n in range(len(log))) <= 2
+    release[0].set()
+    assert await asyncio.wait_for(work, 1) == [{"index": i} for i in range(5)]
+    assert [index for kind, index in log if kind == "start"] == [0, 1, 2, 3, 4]
+    assert asked == [sdk.ROLLING_CHILDREN_PATCH]
+
+
+async def test_history_before_the_patch_keeps_the_batch_barrier(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    patch_state(monkeypatch, False)
+    ctx = context(now, policy=sdk.TaskPolicy(max_iterations=2, child_window=4))
+    log, release = recording_children(ctx, monkeypatch, hold={0})
+    work = asyncio.create_task(run_map(ctx, 5, 2))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert log == [("start", 0), ("start", 1), ("finish", 1)]
+    release[0].set()
+    assert await asyncio.wait_for(work, 1) == [{"index": i} for i in range(5)]
+
+
+async def test_rolling_failure_cancels_the_children_in_flight_and_starts_no_more(runtime_clock, monkeypatch):
+    now, _ = runtime_clock
+    patch_state(monkeypatch, True)
+    ctx = context(now, policy=sdk.TaskPolicy(max_iterations=2, child_window=4))
+    log, _ = recording_children(ctx, monkeypatch, hold={0, 2}, fail={1})
+    with pytest.raises(RuntimeError, match="child 1 failed"):
+        await asyncio.wait_for(run_map(ctx, 6, 3), 1)
+    assert sorted(index for kind, index in log if kind == "cancelled") == [0, 2]
+    assert {index for kind, index in log if kind == "start"} == {0, 1, 2}
+    assert ctx._active_commands == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rolling_children_reports_the_recorded_patch(monkeypatch, runtime_clock, enabled):
+    asked = patch_state(monkeypatch, enabled)
+    assert context(runtime_clock[0]).rolling_children() is enabled
+    assert asked == ["intramind.map_children.rolling"]
 
 
 @pytest.mark.parametrize("window", [0, -1, True, 2.5])

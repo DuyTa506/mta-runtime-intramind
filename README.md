@@ -392,7 +392,11 @@ key; concurrent retries retain the first committed configuration and one start
 event. `TaskContext.configuration` carries that reference through children and
 Continue-As-New. Keep enable flags and credentials outside this snapshot.
 `map_children(window=...)` bounds each feature phase within `TaskPolicy.child_window`;
-it does not reserve inference capacity. These additions require matching API/SDK
+it does not reserve inference capacity. Runs that record the
+`intramind.map_children.rolling` patch refill a finished child's slot at once; older
+histories replay the batch-barrier schedule. When `TaskContext.rolling_children()`
+is true, a feature that sliced items into window-sized calls may pass them in one
+call. These additions require matching API/SDK
 builds and are not present in the previously published wheel.
 
 `RuntimeClient.buffer()` accepts tenant-scoped immutable input/configuration

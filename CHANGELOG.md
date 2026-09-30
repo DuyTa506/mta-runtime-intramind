@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0rc20 — unreleased
+
+- `map_children` keeps a rolling window: a finished child's slot is refilled at
+  once instead of waiting for the whole batch. Results stay in item order; a child
+  failure cancels the children in flight and starts no more. Gated by the
+  `intramind.map_children.rolling` patch, so histories recorded before it replay
+  the batch-barrier schedule. `TaskContext.rolling_children()` reports the gate.
+
 ## 0.2.0rc19 — unreleased
 
 - Add authenticated one-shot `try` admission through the existing class/FIFO

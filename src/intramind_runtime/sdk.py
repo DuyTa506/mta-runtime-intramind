@@ -20,6 +20,10 @@ with workflow.unsafe.imports_passed_through():
     from .contracts import Artifact, EmbeddingOperationSpec, OperationSpec, SpeechOperationSpec
 
 
+# Histories recorded before this marker keep the batch-barrier child schedule on replay.
+ROLLING_CHILDREN_PATCH = "intramind.map_children.rolling"
+
+
 class OperationDeadlineExceeded(TimeoutError):
     """The operation has expired; backend cleanup and accounting may still be pending."""
 
@@ -464,6 +468,8 @@ class TaskContext:
         identities = [str(item[item_key]) for item in items]
         if len(set(identities)) != len(identities):
             raise ValueError("duplicate child identity")
+        if self.rolling_children():
+            return await self._rolling_children(task_type, task_queue, items, identities, key, limit)
         result = []
         # Only a window of child starts is materialized in history at a time.
         for start in range(0, len(items), limit):
@@ -481,6 +487,53 @@ class TaskContext:
                 )
             )
         return result
+
+    def rolling_children(self) -> bool:
+        """Callers that split items into window-sized ``map_children`` calls may pass all items in one call when this is True."""
+        return workflow.patched(ROLLING_CHILDREN_PATCH)
+
+    async def _rolling_children(
+        self,
+        task_type: str,
+        task_queue: str,
+        items: list[dict],
+        identities: list[str],
+        key: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Keep up to ``limit`` children in flight; a finished child's slot is refilled at once.
+
+        Completions are harvested in item order, never completion order, so the
+        command sequence is deterministic. On a child failure the children still
+        in flight are cancelled and drained before the first error propagates.
+        """
+        results: list[Any] = [None] * len(items)
+        pending: dict[int, asyncio.Task] = {}
+        cursor = 0
+        try:
+            while cursor < len(items) or pending:
+                # Only a window of child starts is materialized in history at a time.
+                while cursor < len(items) and len(pending) < limit:
+                    pending[cursor] = asyncio.create_task(
+                        self.run_child(
+                            task_type=task_type,
+                            task_queue=task_queue,
+                            key=json.dumps([key, identities[cursor]], ensure_ascii=False),
+                            inputs=items[cursor],
+                        )
+                    )
+                    cursor += 1
+                await workflow.wait(pending.values(), return_when=asyncio.FIRST_COMPLETED)
+                for ordinal, task in list(pending.items()):
+                    if task.done():
+                        results[ordinal] = task.result()
+                        del pending[ordinal]
+            return results
+        finally:
+            for task in pending.values():
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending.values(), return_exceptions=True)
 
     async def sleep(self, seconds: float) -> None:
         if not math.isfinite(seconds) or seconds <= 0:
