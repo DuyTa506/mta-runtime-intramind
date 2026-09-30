@@ -17,6 +17,7 @@ from sqlalchemy import text
 from intramind_runtime.contracts import EmbeddingPoolSpec
 from intramind_runtime.direct import DirectRequest
 from intramind_runtime.direct_proxy import DirectProxy
+from intramind_runtime.memory_scheduler import MemoryScheduler
 
 pytestmark = pytest.mark.integration
 
@@ -578,5 +579,48 @@ async def test_embedding_proof_headers_are_preserved_and_invalid_proof_blocks_ve
         assert direct_held(proxy) == (
             1 if response_kind in {"missing_proof", "foreign_proof"} else 0
         )
+    finally:
+        await proxy.close()
+
+
+async def test_lost_stream_retries_on_same_epoch_after_engine_is_proven_idle(store):
+    spec = pool(target=1)
+    await store.configure_pool(spec, 1)
+    backend_calls, engine = [], {"busy": True}
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+            raise httpx.ReadTimeout("fixture lost backend response")
+
+    async def backend(request):
+        if request.url.path.endswith("/slots"):
+            return httpx.Response(200, json=[{"id": 0, "is_processing": engine["busy"]}])
+        backend_calls.append(request)
+        if len(backend_calls) == 1:
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=Stream())
+        return httpx.Response(200, content=(
+            b'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\n'
+            b'data: [DONE]\n\n'), headers={"Content-Type": "text/event-stream"})
+
+    transport = httpx.MockTransport(backend)
+    scheduler = MemoryScheduler(store, slot_probes={"p": ("http://engine", "alias", "key")})
+    scheduler._slot_clients["p"] = httpx.AsyncClient(base_url="http://engine/", transport=transport)
+    upstream = httpx.AsyncClient(base_url="http://engine/v1/", transport=transport)
+    proxy = DirectProxy(store, client=upstream, pool=spec, timeout_seconds=30, scheduler=scheduler)
+    try:
+        response = await proxy.open("tenant", PAYLOAD, request_bound=30)
+        consuming = asyncio.create_task(consume(response))
+        async with asyncio.timeout(5):
+            while direct_unknown(proxy) == 0:
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(2.5)
+        assert not consuming.done(), "a busy engine may still be computing the lost attempt"
+        engine["busy"] = False
+        streamed = await asyncio.wait_for(consuming, timeout=10)
+        assert b"hello" in streamed and b"recovered" in streamed
+        assert len(backend_calls) == 2
+        assert direct_held(proxy) == 0
+        assert proxy.admission.pools["p"].epoch == "e1"
     finally:
         await proxy.close()

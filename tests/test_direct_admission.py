@@ -568,3 +568,100 @@ async def test_reconcile_prunes_only_old_settled_direct_attempts(store):
         remaining = (await c.execute(text(
             "SELECT attempt_id FROM runtime_direct_attempts ORDER BY attempt_id"))).scalars().all()
     assert remaining == ["held"]
+
+
+def slot_engine(scheduler, answers, pool_id="p"):
+    """Serve scripted /slots answers: True idle, False busy, None engine error."""
+    import httpx
+
+    def handle(http_request):
+        answer = answers.pop(0)
+        if answer is None:
+            return httpx.Response(503)
+        return httpx.Response(200, json=[{"id": 0, "is_processing": not answer}])
+
+    scheduler.slot_probes[pool_id] = ("http://engine", "alias", "key")
+    scheduler._slot_clients[pool_id] = httpx.AsyncClient(
+        base_url="http://engine/", transport=httpx.MockTransport(handle))
+
+
+async def paused(scheduler):
+    await scheduler.start()
+    scheduler._task.cancel()
+    await asyncio.gather(scheduler._task, return_exceptions=True)
+
+
+async def test_idle_engine_releases_unknown_direct_and_allows_same_epoch_retry(store):
+    await store.configure_pool(pool(target=1, transport_limit=1,
+                                    background_transport_limit=1), 1)
+    scheduler = MemoryScheduler(store)
+    await paused(scheduler)
+    try:
+        slot_engine(scheduler, [False, True, None, True, True])
+        original = request(expected_engine_epoch="e1")
+        held = await admit(scheduler, original)
+        await scheduler.mark_send(held)
+        await scheduler.unknown(held, "client_disconnected")
+        for _ in range(4):
+            await scheduler._settle_idle_unknown()
+            assert held.attempt_id in scheduler.permits
+        await scheduler._settle_idle_unknown()
+        assert held.attempt_id not in scheduler.permits
+        status = (await scheduler.recovery_statuses([held.attempt_id]))[held.attempt_id]
+        assert status["state"] == "FAILED_RECOVERABLE" and status["idle_verified"]
+        assert status["current_epoch"] == status["engine_epoch"] == "e1"
+        await scheduler.enqueue(original, "p", "owner")
+        replacement = await scheduler.retry_confirmed(original, "p", "owner", held.attempt_id)
+        assert replacement.engine_epoch == "e1" and replacement.generation == 1
+        await scheduler.finish(replacement, evidence="not_sent")
+    finally:
+        await scheduler.close()
+
+
+async def test_idle_proof_covers_only_uncertainty_recorded_before_it_began(store):
+    await store.configure_pool(pool(target=2, transport_limit=2,
+                                    background_transport_limit=2), 2)
+    scheduler = MemoryScheduler(store)
+    await paused(scheduler)
+    try:
+        slot_engine(scheduler, [True, True, True, True])
+        first = await admit(scheduler, request("first"))
+        await scheduler.mark_send(first)
+        await scheduler.unknown(first, "client_disconnected")
+        await scheduler._settle_idle_unknown()
+        late = await admit(scheduler, request("late"))
+        await scheduler.mark_send(late)
+        await scheduler.unknown(late, "client_disconnected")
+        await scheduler._settle_idle_unknown()
+        assert set(scheduler.permits) == {late.attempt_id}
+        await scheduler._settle_idle_unknown()
+        assert late.attempt_id in scheduler.permits
+        await scheduler._settle_idle_unknown()
+        assert not scheduler.permits
+    finally:
+        await scheduler.close()
+
+
+async def test_idle_engine_settles_durable_unknown_without_touching_pool_health(store):
+    spec = pool(target=1, transport_limit=1, background_transport_limit=1)
+    await store.configure_pool(spec, 1)
+    await store.create_root(root())
+    await store.submit_operation(operation())
+    attempt = await store.reserve_next("p", "worker")
+    await store.mark_send(attempt)
+    await store.unknown(attempt, "attempt_deadline_exceeded")
+    await store.quiesce_engine("p", "e1", "watchdog")
+    scheduler = MemoryScheduler(store)
+    await paused(scheduler)
+    try:
+        slot_engine(scheduler, [True, True])
+        await scheduler._reconcile_durable()
+        await scheduler._settle_idle_unknown()
+        await scheduler._settle_idle_unknown()
+        await scheduler._reconcile_durable()
+        assert attempt.attempt_id not in scheduler.permits
+        assert (await store.operation("o", "t"))["state"] == "RETRY_WAIT"
+        await scheduler._refresh()
+        assert scheduler.pools["p"].health == "DEGRADED" and scheduler.pools["p"].target == 0
+    finally:
+        await scheduler.close()

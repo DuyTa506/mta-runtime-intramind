@@ -7,6 +7,12 @@
   failure cancels the children in flight and starts no more. Gated by the
   `intramind.map_children.rolling` patch, so histories recorded before it replay
   the batch-barrier schedule. `TaskContext.rolling_children()` reports the gate.
+- Settle UNKNOWN compute without an engine restart once two consecutive llama.cpp
+  `/slots` probes show every slot of the same epoch idle. Attempts that became
+  UNKNOWN before the first idle probe fail with `engine_idle_verified`; durable
+  work is requeued like `confirm_epoch_stopped --recover`, RAM direct permits are
+  released and their callers may retry once on the same epoch. Pool health and
+  target are left to their owner.
 
 ## 0.2.0rc19 — unreleased
 

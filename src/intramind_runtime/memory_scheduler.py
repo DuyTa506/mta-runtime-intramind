@@ -62,6 +62,8 @@ class _Permit:
     lease_until: float
     state: str = "RESERVED"
     reservation: DirectReservation | None = None
+    unknown_at: datetime | None = None
+    idle_verified: bool = False
 
 
 class SlotCapacity:
@@ -115,6 +117,7 @@ class MemoryScheduler:
             raise ValueError("restart_drain_seconds must be finite and positive")
         self._slot_clients = {}
         self._slot_idle = Counter()
+        self._unknown_idle = {}
         self._dirty_pools = set()
         self._old_owner_expires = {}
         self._ready_by_pool = {}
@@ -298,6 +301,7 @@ class MemoryScheduler:
                 self.control_ready = True
                 await self._probe_slots()
                 await self._reconcile_durable()
+                await self._settle_idle_unknown()
                 self._expire_requests()
             except asyncio.CancelledError:
                 raise
@@ -311,27 +315,72 @@ class MemoryScheduler:
             probe = self.slot_probes.get(pool_id)
             if not probe or self.pools[pool_id].spec.kind != "llm":
                 continue
-            base_url, alias, token = probe
-            client = self._slot_clients.get(pool_id)
-            if client is None:
-                client = httpx.AsyncClient(base_url=base_url.rstrip("/") + "/",
-                    headers={"Authorization": f"Bearer {token}"}, timeout=3,
-                    follow_redirects=False, transport=httpx.AsyncHTTPTransport(retries=0))
-                self._slot_clients[pool_id] = client
-            try:
-                response = await client.get("slots", params={"model": alias})
-                slots = response.json() if response.status_code == 200 else None
-                idle = (isinstance(slots, list) and bool(slots) and
-                        all(isinstance(slot, dict) and slot.get("is_processing") is False
-                            for slot in slots))
-            except (httpx.HTTPError, ValueError):
-                idle = False
+            idle = await self._slots_idle(pool_id)
             self._slot_idle[pool_id] = self._slot_idle[pool_id] + 1 if idle else 0
             if self._slot_idle[pool_id] >= 2:
                 self._ready_by_pool[pool_id] = monotonic()
                 self._dirty_pools.discard(pool_id)
                 self._notify()
         self._expire_dirty()
+
+    async def _slots_idle(self, pool_id):
+        base_url, alias, token = self.slot_probes[pool_id]
+        client = self._slot_clients.get(pool_id)
+        if client is None:
+            client = httpx.AsyncClient(base_url=base_url.rstrip("/") + "/",
+                headers={"Authorization": f"Bearer {token}"}, timeout=3,
+                follow_redirects=False, transport=httpx.AsyncHTTPTransport(retries=0))
+            self._slot_clients[pool_id] = client
+        try:
+            response = await client.get("slots", params={"model": alias})
+            slots = response.json() if response.status_code == 200 else None
+            return (isinstance(slots, list) and bool(slots) and
+                    all(isinstance(slot, dict) and slot.get("is_processing") is False
+                        for slot in slots))
+        except (httpx.HTTPError, ValueError):
+            return False
+
+    async def _settle_idle_unknown(self):
+        """Settle lost attempts once consecutive probes show every slot of the epoch idle.
+
+        UNKNOWN only means the caller lost the response (timeout, disconnect,
+        shutdown). An idle engine is not computing anything sent before the first
+        idle probe, so that uncertainty is settled without restarting the engine.
+        """
+        pending = {p.pool_id for p in self.permits.values() if p.state == "UNKNOWN"}
+        for pool_id in list(self._unknown_idle):
+            if pool_id not in pending:
+                self._unknown_idle.pop(pool_id)
+        for pool_id in pending:
+            pool = self.pools.get(pool_id)
+            if pool is None or pool.spec.kind != "llm" or pool_id not in self.slot_probes:
+                continue
+            started = datetime.now(UTC)
+            if not await self._slots_idle(pool_id):
+                self._unknown_idle.pop(pool_id, None)
+                continue
+            epoch, idle_since, probes = self._unknown_idle.get(pool_id, (pool.epoch, started, 0))
+            if epoch != pool.epoch:
+                epoch, idle_since, probes = pool.epoch, started, 0
+            if probes + 1 < 2:
+                self._unknown_idle[pool_id] = (epoch, idle_since, probes + 1)
+                continue
+            self._unknown_idle.pop(pool_id)
+            settled = 0
+            for permit in list(self.permits.values()):
+                if (permit.pool_id == pool_id and permit.kind == "direct"
+                        and permit.state == "UNKNOWN" and permit.engine_epoch == epoch
+                        and permit.unknown_at is not None and permit.unknown_at < idle_since):
+                    permit.state, permit.idle_verified = "FAILED_RECOVERABLE", True
+                    self.capacity.release(self.permits, permit.attempt_id)
+                    settled += 1
+            if any(p.pool_id == pool_id and p.kind != "direct" and p.state == "UNKNOWN"
+                   for p in self.permits.values()):
+                settled += await self.store.settle_idle_unknown(pool_id, epoch, idle_since)
+            if settled:
+                log.warning("pool %s settled %d UNKNOWN attempts after verified idle engine",
+                            pool_id, settled)
+                self._notify()
 
     def _expire_dirty(self):
         for pool_id in list(self._dirty_pools):
@@ -347,14 +396,16 @@ class MemoryScheduler:
         if not active:
             return
         async with self.store.engine.connect() as c:
-            held = await rows(c, """SELECT attempt_id FROM runtime_attempts
+            held = await rows(c, """SELECT attempt_id,state FROM runtime_attempts
                 WHERE attempt_id=ANY(CAST(:ids AS text[])) AND compute_held
-                UNION ALL SELECT attempt_id FROM runtime_direct_attempts
+                UNION ALL SELECT attempt_id,state FROM runtime_direct_attempts
                 WHERE attempt_id=ANY(CAST(:ids AS text[])) AND compute_held""",
                 ids=active)
-        live = {r["attempt_id"] for r in held}
+        live = {r["attempt_id"]: r["state"] for r in held}
         for attempt_id in active:
-            if attempt_id not in live:
+            if attempt_id in live:
+                self.permits[attempt_id].state = live[attempt_id]
+            else:
                 self.capacity.release(self.permits, attempt_id)
                 self._notify()
 
@@ -519,7 +570,8 @@ class MemoryScheduler:
             generation = old.reservation.generation + 1
             if generation > 2:
                 raise AdmissionDenied("inference recovery limit reached")
-            if old.state == "FAILED_RECOVERABLE" and old.engine_epoch == pool.epoch:
+            if (old.state == "FAILED_RECOVERABLE" and old.engine_epoch == pool.epoch
+                    and not old.idle_verified):
                 return None
         if self._first(pool_id) is not waiter or not self.capacity.try_acquire(
                 pool, self.permits, self.pools, request.workload_class):
@@ -573,7 +625,7 @@ class MemoryScheduler:
     async def unknown(self, reservation, reason):
         attempt = self._direct(reservation)
         if attempt.attempt_id in self.permits:
-            attempt.state = "UNKNOWN"
+            attempt.state, attempt.unknown_at = "UNKNOWN", datetime.now(UTC)
 
     async def recovery_statuses(self, attempt_ids):
         result = {}
@@ -585,7 +637,8 @@ class MemoryScheduler:
             if pool:
                 result[attempt_id] = {"state": attempt.state,
                     "engine_epoch": attempt.engine_epoch, "current_epoch": pool.epoch,
-                    "health": pool.health, "target": pool.target}
+                    "health": pool.health, "target": pool.target,
+                    "idle_verified": attempt.idle_verified}
         return result
 
     async def _durable_waiter_valid(self, attempt_id):

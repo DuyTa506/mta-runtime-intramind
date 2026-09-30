@@ -201,7 +201,8 @@ class DirectProxy:
                     if not status or future.done():
                         continue
                     if status["state"] == "FAILED_RECOVERABLE" and status["health"] == "HEALTHY" \
-                            and status["current_epoch"] != status["engine_epoch"]:
+                            and (status["current_epoch"] != status["engine_epoch"]
+                                 or status.get("idle_verified")):
                         future.set_result(status)
                         self._recovering.pop(attempt_id, None)
                     elif status["state"] == "FAILED":
