@@ -624,3 +624,43 @@ async def test_lost_stream_retries_on_same_epoch_after_engine_is_proven_idle(sto
         assert proxy.admission.pools["p"].epoch == "e1"
     finally:
         await proxy.close()
+
+
+async def test_serving_restart_mid_embed_frees_the_single_slot_once_serving_proves_it_gone(store):
+    spec = EmbeddingPoolSpec(**(pool(target=1).model_dump(exclude={"context_limit"}) | {
+        "character_limit": 40, "max_batch_size": 2}))
+    await store.configure_pool(spec, 1)
+    payload = {"texts": ["hello"], "input_type": "query"}
+    embed_calls, serving = [], {"inflight": []}
+
+    async def backend(request):
+        if request.url.path == "/api/v1/attempts/embedding":
+            return httpx.Response(200, json={"boot_id": "after-restart", "inflight": serving["inflight"]})
+        embed_calls.append(request)
+        if len(embed_calls) == 1:
+            serving["inflight"] = [request.headers["X-Intramind-Attempt-ID"]]
+            raise httpx.ReadError("fixture serving restarted mid-request")
+        return httpx.Response(200, json={"embeddings": [[1., 2.]], "dimension": 2, "model": "model-1"},
+            headers={"X-Intramind-Attempt-ID": request.headers["X-Intramind-Attempt-ID"],
+                     "X-Intramind-Embedding-Contract": "termination-v1",
+                     "X-Intramind-Compute-State": "terminated", "X-Intramind-Model-Revision": "model-1"})
+
+    transport = httpx.MockTransport(backend)
+    scheduler = MemoryScheduler(store, attempt_probes={"p": ("http://serving", "embedding")})
+    scheduler._slot_clients["p"] = httpx.AsyncClient(base_url="http://serving/", transport=transport)
+    upstream = httpx.AsyncClient(base_url="http://serving/", transport=transport)
+    proxy = DirectProxy(store, client=upstream, pool=spec, timeout_seconds=30, scheduler=scheduler)
+    try:
+        lost = await asyncio.wait_for(proxy.open("tenant", payload, request_bound=5, path="embed"), 5)
+        assert lost.status_code >= 500
+        assert direct_unknown(proxy) == 1
+        waiting = asyncio.create_task(proxy.open("tenant", payload, request_bound=5, path="embed"))
+        await asyncio.sleep(2.5)
+        assert not waiting.done(), "serving still lists the lost attempt as computing"
+        serving["inflight"] = []
+        response = await asyncio.wait_for(waiting, timeout=10)
+        assert response.status_code == 200
+        assert json.loads(await consume(response))["embeddings"] == [[1., 2.]]
+        assert len(embed_calls) == 2 and direct_held(proxy) == 0
+    finally:
+        await proxy.close()

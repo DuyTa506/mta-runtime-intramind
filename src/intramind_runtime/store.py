@@ -6,6 +6,7 @@ inference, transport waiting and progress never hold a database transaction.
 
 import asyncio
 import json
+from collections.abc import Collection
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -1103,13 +1104,14 @@ class Store:
             await self._terminal(c, a["operation_id"], "FAILED", error_class)
 
     async def settle_idle_unknown(self, pool_id: str, engine_epoch: str,
-                                  idle_since: datetime) -> int:
-        """Settle UNKNOWN attempts that were already lost when the engine was proven idle.
+                                  idle_since: datetime, attempt_ids: Collection[str]) -> int:
+        """Settle UNKNOWN attempts that were already lost when proven no longer computing.
 
-        ``idle_since`` is when the first of consecutive all-slots-idle probes of this
-        exact epoch was taken. An attempt that became UNKNOWN before it cannot still
-        be computing, so it is settled like a stopped epoch with recovery. Pool health
-        and target stay with their owner (watchdog quiesce or operator).
+        ``idle_since`` is when the first of the consecutive probes proving
+        ``attempt_ids`` not computing on this exact epoch was taken. An attempt that
+        became UNKNOWN before it cannot still be computing, so it is settled like a
+        stopped epoch with recovery. Pool health and target stay with their owner
+        (watchdog quiesce or operator).
         """
         async with self.transaction() as c:
             pool = await row(c, "SELECT engine_epoch FROM runtime_pools WHERE pool_id=:id FOR UPDATE",
@@ -1120,8 +1122,9 @@ class Store:
                 compute_held=false,backend_finished_at=COALESCE(backend_finished_at,now()),
                 error_class='engine_idle_verified'
                 WHERE pool_id=:pool AND engine_epoch=:epoch AND compute_held
-                AND state='UNKNOWN' AND unknown_at<:idle""",
-                pool=pool_id, epoch=engine_epoch, idle=idle_since)
+                AND state='UNKNOWN' AND unknown_at<:idle
+                AND attempt_id=ANY(CAST(:ids AS text[]))""",
+                pool=pool_id, epoch=engine_epoch, idle=idle_since, ids=list(attempt_ids))
             attempts = await rows(c, """SELECT a.*,o.root_id,o.state AS operation_state,
                 o.spec AS operation_spec,o.attempts AS operation_attempts,
                 r.spec AS root_spec,r.state AS root_state,
@@ -1130,8 +1133,9 @@ class Store:
                 JOIN runtime_roots r USING(root_id)
                 WHERE a.pool_id=:pool AND a.engine_epoch=:epoch AND a.compute_held
                 AND a.state='UNKNOWN' AND a.unknown_at<:idle
+                AND a.attempt_id=ANY(CAST(:ids AS text[]))
                 ORDER BY a.created_at FOR UPDATE OF a""",
-                pool=pool_id, epoch=engine_epoch, idle=idle_since)
+                pool=pool_id, epoch=engine_epoch, idle=idle_since, ids=list(attempt_ids))
             for a in attempts:
                 await self._settle_stopped_attempt(c, a, True, "engine_idle_verified")
             if attempts or direct.rowcount:

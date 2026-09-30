@@ -102,13 +102,15 @@ class MemoryScheduler:
 
     def __init__(self, store, *, grace_seconds=0, endpoint_limit=1024,
                  tenant_limit=256, request_ttl_seconds=3600, slot_probes=None,
-                 attempt_timeouts=None, restart_drain_seconds=None):
+                 attempt_probes=None, attempt_timeouts=None, restart_drain_seconds=None):
         self.store = store
         self.grace_seconds = grace_seconds
         self.endpoint_limit = endpoint_limit
         self.tenant_limit = tenant_limit
         self.request_ttl_seconds = request_ttl_seconds
         self.slot_probes = slot_probes or {}
+        # pool_id -> (serving base_url, kind) for pools without llama.cpp slots.
+        self.attempt_probes = attempt_probes or {}
         self.attempt_timeouts = attempt_timeouts or {}
         self.restart_drain_seconds = restart_drain_seconds or {}
         if any(not isinstance(value, (int, float)) or isinstance(value, bool)
@@ -323,14 +325,18 @@ class MemoryScheduler:
                 self._notify()
         self._expire_dirty()
 
-    async def _slots_idle(self, pool_id):
-        base_url, alias, token = self.slot_probes[pool_id]
+    def _probe_client(self, pool_id, base_url, headers):
         client = self._slot_clients.get(pool_id)
         if client is None:
             client = httpx.AsyncClient(base_url=base_url.rstrip("/") + "/",
-                headers={"Authorization": f"Bearer {token}"}, timeout=3,
+                headers=headers, timeout=3,
                 follow_redirects=False, transport=httpx.AsyncHTTPTransport(retries=0))
             self._slot_clients[pool_id] = client
+        return client
+
+    async def _slots_idle(self, pool_id):
+        base_url, alias, token = self.slot_probes[pool_id]
+        client = self._probe_client(pool_id, base_url, {"Authorization": f"Bearer {token}"})
         try:
             response = await client.get("slots", params={"model": alias})
             slots = response.json() if response.status_code == 200 else None
@@ -340,45 +346,86 @@ class MemoryScheduler:
         except (httpx.HTTPError, ValueError):
             return False
 
+    async def _terminated(self, pool, candidates):
+        """Return (proof key, candidate ids proven not computing), or None when unproven.
+
+        An llama.cpp engine with every slot idle proves all candidates at once. A
+        native serving pool proves each candidate absent from the in-flight registry
+        of one serving boot; a serving without that registry (404) proves nothing.
+        """
+        if pool.spec.kind == "llm":
+            if pool.spec.pool_id in self.slot_probes and await self._slots_idle(pool.spec.pool_id):
+                return "slots", candidates
+            return None
+        if pool.spec.pool_id not in self.attempt_probes:
+            return None
+        base_url, kind = self.attempt_probes[pool.spec.pool_id]
+        client = self._probe_client(pool.spec.pool_id, base_url, {})
+        try:
+            response = await client.get(f"api/v1/attempts/{kind}")
+            body = response.json() if response.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not (isinstance(body, dict) and isinstance(body.get("boot_id"), str)
+                and isinstance(body.get("inflight"), list)
+                and all(isinstance(item, str) for item in body["inflight"])):
+            return None
+        return body["boot_id"], candidates - set(body["inflight"])
+
     async def _settle_idle_unknown(self):
-        """Settle lost attempts once consecutive probes show every slot of the epoch idle.
+        """Settle lost attempts that consecutive probes prove are no longer computing.
 
         UNKNOWN only means the caller lost the response (timeout, disconnect,
-        shutdown). An idle engine is not computing anything sent before the first
-        idle probe, so that uncertainty is settled without restarting the engine.
+        shutdown). An attempt proven not computing by two probes of the same epoch
+        and proof source (all slots idle, or one serving boot) is settled without
+        restarting the engine, but only if it was already UNKNOWN before the first.
         """
-        pending = {p.pool_id for p in self.permits.values() if p.state == "UNKNOWN"}
+        pending = {}
+        for permit in self.permits.values():
+            if permit.state == "UNKNOWN":
+                pending.setdefault(permit.pool_id, set()).add(permit.attempt_id)
         for pool_id in list(self._unknown_idle):
             if pool_id not in pending:
                 self._unknown_idle.pop(pool_id)
-        for pool_id in pending:
+        for pool_id, candidates in pending.items():
             pool = self.pools.get(pool_id)
-            if pool is None or pool.spec.kind != "llm" or pool_id not in self.slot_probes:
+            if pool is None:
                 continue
             started = datetime.now(UTC)
-            if not await self._slots_idle(pool_id):
+            proof = await self._terminated(pool, candidates)
+            if proof is None or not proof[1]:
                 self._unknown_idle.pop(pool_id, None)
                 continue
-            epoch, idle_since, probes = self._unknown_idle.get(pool_id, (pool.epoch, started, 0))
-            if epoch != pool.epoch:
-                epoch, idle_since, probes = pool.epoch, started, 0
+            key, proven = proof
+            epoch, streak_key, since, probes, streak = self._unknown_idle.get(
+                pool_id, (None, None, started, 0, proven))
+            if (epoch, streak_key) != (pool.epoch, key):
+                epoch, since, probes, streak = pool.epoch, started, 0, proven
+            streak = streak & proven
+            if not streak:
+                self._unknown_idle.pop(pool_id, None)
+                continue
             if probes + 1 < 2:
-                self._unknown_idle[pool_id] = (epoch, idle_since, probes + 1)
+                self._unknown_idle[pool_id] = (epoch, key, since, probes + 1, streak)
                 continue
             self._unknown_idle.pop(pool_id)
             settled = 0
+            durable = []
             for permit in list(self.permits.values()):
-                if (permit.pool_id == pool_id and permit.kind == "direct"
-                        and permit.state == "UNKNOWN" and permit.engine_epoch == epoch
-                        and permit.unknown_at is not None and permit.unknown_at < idle_since):
+                if (permit.pool_id != pool_id or permit.attempt_id not in streak
+                        or permit.state != "UNKNOWN"):
+                    continue
+                if permit.kind != "direct":
+                    durable.append(permit.attempt_id)
+                elif (permit.engine_epoch == epoch and permit.unknown_at is not None
+                        and permit.unknown_at < since):
                     permit.state, permit.idle_verified = "FAILED_RECOVERABLE", True
                     self.capacity.release(self.permits, permit.attempt_id)
                     settled += 1
-            if any(p.pool_id == pool_id and p.kind != "direct" and p.state == "UNKNOWN"
-                   for p in self.permits.values()):
-                settled += await self.store.settle_idle_unknown(pool_id, epoch, idle_since)
+            if durable:
+                settled += await self.store.settle_idle_unknown(pool_id, epoch, since, durable)
             if settled:
-                log.warning("pool %s settled %d UNKNOWN attempts after verified idle engine",
+                log.warning("pool %s settled %d UNKNOWN attempts proven no longer computing",
                             pool_id, settled)
                 self._notify()
 
@@ -774,6 +821,15 @@ class MemoryScheduler:
         held = Counter((p.pool_id, p.workload_class) for p in self.permits.values()
                        if p.kind == "direct")
         return queued, held
+
+    def unknown_oldest_seconds(self):
+        now = datetime.now(UTC)
+        oldest = dict.fromkeys(self.pools, 0.0)
+        for permit in self.permits.values():
+            if permit.kind == "direct" and permit.state == "UNKNOWN" and permit.unknown_at:
+                oldest[permit.pool_id] = max(oldest.get(permit.pool_id, 0.0),
+                                             (now - permit.unknown_at).total_seconds())
+        return oldest
 
     def dirty_blocked(self):
         self._expire_dirty()

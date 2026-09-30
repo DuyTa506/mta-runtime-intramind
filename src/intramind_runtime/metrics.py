@@ -22,6 +22,9 @@ async def snapshot(store: Store, scheduler=None) -> bytes:
     dirty_recovery = Gauge("intramind_runtime_dirty_recovery_blocked",
                            "Pool blocked after an unclean runtime-api exit",
                            ["pool"], registry=registry)
+    direct_unknown = Gauge("intramind_runtime_direct_unknown_oldest_seconds",
+                           "Oldest RAM direct permit whose response was lost",
+                           ["pool"], registry=registry)
     async with store.engine.connect() as c:
         for r in await rows(c, "SELECT state,count(*) AS n FROM runtime_operations GROUP BY state"):
             states.labels(r["state"]).set(r["n"])
@@ -49,4 +52,6 @@ async def snapshot(store: Store, scheduler=None) -> bytes:
             direct_inflight.labels(pool_id, workload).set(count)
         for pool_id, blocked in scheduler.dirty_blocked().items():
             dirty_recovery.labels(pool_id).set(blocked)
+        for pool_id, age in scheduler.unknown_oldest_seconds().items():
+            direct_unknown.labels(pool_id).set(age)
     return generate_latest(registry)
