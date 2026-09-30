@@ -46,12 +46,21 @@ neither replaces storage nor migrates buckets.
 | `release_gate` | Application-supplied migration and qualification evidence validation |
 
 UNKNOWN reservations remain accounted for until compute termination is known.
-Termination is known when the epoch is confirmed stopped, or when runtime-api
-probes the pool's llama.cpp `/slots` and finds every slot of the same epoch idle
-twice in a row: UNKNOWN attempts recorded before the first idle probe are then
-settled (`error_class=engine_idle_verified`), durable work is requeued, RAM direct
-permits are released and their callers may retry once on the same epoch. Pool
-health and target stay with their owner (watchdog or operator).
+Termination is known when the epoch is confirmed stopped, or when two consecutive
+runtime-api probes of the same epoch prove the attempt is no longer computing:
+
+| Pool kind | Probe | Proves |
+|---|---|---|
+| `llm` | llama.cpp `/slots` | every UNKNOWN attempt, when every slot is idle |
+| `embedding` · `rerank` · `speech` | serving `GET /api/v1/attempts/{kind}` | each UNKNOWN attempt absent from `inflight`, both probes from one `boot_id` |
+
+Attempts recorded UNKNOWN before the first probe are then settled
+(`error_class=engine_idle_verified`), durable work is requeued, RAM direct
+permits are released and their callers may retry once on the same epoch. A
+serving without the attempts endpoint (404) or an unreachable engine proves
+nothing. Pool health and target stay with their owner (watchdog or operator).
+`intramind_runtime_direct_unknown_oldest_seconds{pool}` exports the age of the
+oldest unsettled RAM direct permit.
 No DB transaction spans inference. The completion driver does not promise
 reliable remote cancellation, backend status lookup or exactly-once inference.
 

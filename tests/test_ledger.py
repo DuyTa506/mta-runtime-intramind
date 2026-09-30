@@ -272,10 +272,12 @@ async def test_idle_engine_settles_only_uncertainty_older_than_the_idle_proof(st
     await store.mark_send(reservation)
     before_unknown = datetime.now(UTC)
     await store.unknown(reservation, "read_timeout")
-    assert await store.settle_idle_unknown("p", "e1", before_unknown) == 0
-    assert await store.settle_idle_unknown("p", "other-epoch", datetime.now(UTC)) == 0
-    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC)) == 1
-    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC)) == 0
+    ids = [reservation.attempt_id]
+    assert await store.settle_idle_unknown("p", "e1", before_unknown, ids) == 0
+    assert await store.settle_idle_unknown("p", "other-epoch", datetime.now(UTC), ids) == 0
+    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC), ["other-attempt"]) == 0
+    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC), ids) == 1
+    assert await store.settle_idle_unknown("p", "e1", datetime.now(UTC), ids) == 0
     op = await store.operation("o0", "t")
     assert op["state"] == "RETRY_WAIT" and op["wait_reason"] == "engine_recovery"
     async with store.engine.connect() as c:

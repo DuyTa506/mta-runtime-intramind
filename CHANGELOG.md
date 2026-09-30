@@ -13,6 +13,13 @@
   work is requeued like `confirm_epoch_stopped --recover`, RAM direct permits are
   released and their callers may retry once on the same epoch. Pool health and
   target are left to their owner.
+- Extend that settlement to embedding, rerank and speech pools, which have no
+  slots and a static epoch: an UNKNOWN attempt absent from two consecutive
+  serving `GET /api/v1/attempts/{kind}` answers of one `boot_id` is settled the
+  same way. Previously one lost response locked the single-slot pool until the
+  runtime restarted. `settle_idle_unknown` now takes the proven `attempt_ids`.
+- Export `intramind_runtime_direct_unknown_oldest_seconds{pool}`: UNKNOWN RAM
+  direct permits were invisible to metrics.
 
 ## 0.2.0rc19 — unreleased
 

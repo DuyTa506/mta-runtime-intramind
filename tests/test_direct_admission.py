@@ -665,3 +665,93 @@ async def test_idle_engine_settles_durable_unknown_without_touching_pool_health(
         assert scheduler.pools["p"].health == "DEGRADED" and scheduler.pools["p"].target == 0
     finally:
         await scheduler.close()
+
+
+def serving_attempts(scheduler, answers, pool_id="embedding", kind="embedding"):
+    """Serve scripted /api/v1/attempts answers: (boot_id, inflight ids) or an HTTP status."""
+    import httpx
+
+    def handle(http_request):
+        assert http_request.url.path == f"/api/v1/attempts/{kind}"
+        answer = answers.pop(0)
+        if isinstance(answer, int):
+            return httpx.Response(answer)
+        boot_id, inflight = answer
+        return httpx.Response(200, json={"boot_id": boot_id, "inflight": inflight})
+
+    scheduler.attempt_probes[pool_id] = ("http://serving", kind)
+    scheduler._slot_clients[pool_id] = httpx.AsyncClient(
+        base_url="http://serving/", transport=httpx.MockTransport(handle))
+
+
+async def lost_embedding(scheduler, request_id):
+    held = await admit(scheduler, request(request_id, kind="embedding", request_bound=40,
+                                          batch_size=2), "embedding")
+    await scheduler.mark_send(held)
+    await scheduler.unknown(held, "client_disconnected")
+    return held
+
+
+async def native_pool(store, target=1):
+    spec = EmbeddingPoolSpec(**(pool("embedding", target=target).model_dump(
+        exclude={"context_limit"}) | {"character_limit": 80, "max_batch_size": 2}))
+    await store.configure_pool(spec, target)
+
+
+async def test_serving_absence_settles_lost_native_attempt_and_reopens_the_pool(store):
+    await native_pool(store)
+    scheduler = MemoryScheduler(store)
+    await paused(scheduler)
+    try:
+        held = await lost_embedding(scheduler, "lost")
+        serving_attempts(scheduler, [("boot", [held.attempt_id]), ("boot", []), ("boot", [])])
+        blocked = request("next", kind="embedding", request_bound=40, batch_size=2)
+        await scheduler.enqueue(blocked, "embedding", "owner")
+        assert await scheduler.reserve(blocked, "embedding", "owner") is None
+        assert scheduler.unknown_oldest_seconds()["embedding"] > 0
+        for _ in range(2):
+            await scheduler._settle_idle_unknown()
+            assert held.attempt_id in scheduler.permits
+        await scheduler._settle_idle_unknown()
+        assert held.attempt_id not in scheduler.permits
+        status = (await scheduler.recovery_statuses([held.attempt_id]))[held.attempt_id]
+        assert status["state"] == "FAILED_RECOVERABLE" and status["idle_verified"]
+        assert scheduler.unknown_oldest_seconds()["embedding"] == 0
+        assert await scheduler.reserve(blocked, "embedding", "owner") is not None
+        assert "intramind_runtime_direct_unknown_oldest_seconds" in (
+            await snapshot(store, scheduler)).decode()
+    finally:
+        await scheduler.close()
+
+
+async def test_serving_proof_settles_only_absent_attempts_of_one_boot(store):
+    await native_pool(store, target=2)
+    scheduler = MemoryScheduler(store)
+    await paused(scheduler)
+    try:
+        done = await lost_embedding(scheduler, "done")
+        running = await lost_embedding(scheduler, "running")
+        serving_attempts(scheduler, [
+            ("boot-1", [running.attempt_id]), ("boot-2", [running.attempt_id]),
+            ("boot-2", [running.attempt_id])])
+        for _ in range(2):
+            await scheduler._settle_idle_unknown()
+            assert set(scheduler.permits) == {done.attempt_id, running.attempt_id}
+        await scheduler._settle_idle_unknown()
+        assert set(scheduler.permits) == {running.attempt_id}
+    finally:
+        await scheduler.close()
+
+
+async def test_serving_without_attempt_registry_never_settles(store):
+    await native_pool(store)
+    scheduler = MemoryScheduler(store)
+    await paused(scheduler)
+    try:
+        held = await lost_embedding(scheduler, "lost")
+        serving_attempts(scheduler, [404, 404, 503, ("boot", [])])
+        for _ in range(4):
+            await scheduler._settle_idle_unknown()
+        assert scheduler.permits[held.attempt_id].state == "UNKNOWN"
+    finally:
+        await scheduler.close()

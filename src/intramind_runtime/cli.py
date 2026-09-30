@@ -380,7 +380,11 @@ def main():
             os.environ[pool["api_key_env"]]) for pool in config["pools"]
             if pool["admission"].get("kind", "llm") == "llm" and
             pool.get("api_key_env") and pool.get("base_url") and pool.get("model")}
+        attempt_probes = {pool["admission"]["pool_id"]: (pool["base_url"], pool["admission"]["kind"])
+            for pool in config["pools"] if pool.get("base_url")
+            and pool["admission"].get("kind") in {"embedding", "rerank", "speech"}}
         scheduler = MemoryScheduler(store, grace_seconds=10, slot_probes=slot_probes,
+            attempt_probes=attempt_probes,
             attempt_timeouts={pool["admission"]["pool_id"]:
                 pool.get("attempt_timeout_seconds", 1800) for pool in config["pools"]},
             restart_drain_seconds={pool["admission"]["pool_id"]:
