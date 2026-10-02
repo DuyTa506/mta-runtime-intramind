@@ -29,6 +29,9 @@
   lease, so one lost write (02/10, blocked on the root an idle settlement held)
   left `SEND_INTENT` held; the watchdog saw known work on an idle engine and
   restarted it after 11 minutes of closed admission.
+  The budget-refusal path settles the same way, and after 4 inline tries the
+  retry continues in the background so a persistent error cannot hold the
+  executor's tick.
 
 ## 0.2.0rc19 — unreleased
 

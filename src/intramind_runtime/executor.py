@@ -14,6 +14,9 @@ from .store import Store, encode
 
 log = logging.getLogger(__name__)
 
+SETTLE_TRIES = 4
+SETTLE_BACKOFF_SECONDS = 1.0
+
 
 class Executor:
     def __init__(self, store: Store, artifacts: ArtifactPort, driver: EngineDriver,
@@ -23,6 +26,7 @@ class Executor:
         if permit_client is None:
             raise ValueError("executor requires runtime-api permits")
         self.permits = permit_client
+        self._settlements: set[asyncio.Task] = set()
 
     async def _heartbeat(self, reservation, permit_ready):
         while True:
@@ -38,17 +42,38 @@ class Executor:
                 # does not discard a response. Authority will retain uncertainty.
                 log.exception("attempt heartbeat failed: %s", reservation.attempt_id)
 
-    async def _end_attempt(self, write, reservation, *args, **kwargs):
-        """Retry the write ending this attempt; a live owner's lease blocks reconciliation."""
+    async def _write_end(self, reservation, write, tries: int | None) -> bool:
+        """Return False only when ``tries`` ran out; a fenced write counts as done."""
+        failures = 0
         while True:
             try:
-                return await write(reservation, *args, **kwargs)
+                await write()
+                return True
             except RuntimeConflict as exc:
                 log.warning("attempt settlement fenced: %s (%s)", reservation.attempt_id, exc)
-                return None
+                return True
             except Exception:
-                log.exception("retrying attempt settlement: %s", reservation.attempt_id)
-                await asyncio.sleep(2)
+                failures += 1
+                log.exception("attempt settlement failed (%d): %s", failures,
+                              reservation.attempt_id)
+                if tries is not None and failures >= tries:
+                    return False
+                await asyncio.sleep(min(30, SETTLE_BACKOFF_SECONDS * 2 ** (failures - 1)))
+
+    async def _end_attempt(self, reservation, write):
+        """Write this attempt's end, retrying in the background after ``SETTLE_TRIES``.
+
+        A live owner's lease keeps ``reconcile_expired`` away from the attempt, so
+        giving up would strand it; the background retry frees this executor instead.
+        Shutdown cancels it, and the expired owner lease then settles the attempt.
+        """
+        if await self._write_end(reservation, write, SETTLE_TRIES):
+            return
+        log.error("attempt settlement moved to background after %d tries: %s",
+                  SETTLE_TRIES, reservation.attempt_id)
+        task = asyncio.create_task(self._write_end(reservation, write, None))
+        self._settlements.add(task)
+        task.add_done_callback(self._settlements.discard)
 
     async def tick(self) -> bool:
         reservation = await self.store.reserve_next(self.pool_id, self.owner_id)
@@ -122,16 +147,22 @@ class Executor:
                     log.exception("retrying result persistence: %s", reservation.attempt_id)
                     await asyncio.sleep(2)
         except DriverFailure as exc:
-            if exc.finished:
-                await self._end_attempt(self.store.compute_finished, reservation)
-            if exc.finished or exc.not_sent:
-                await self._end_attempt(self.store.fail, reservation, str(exc), not_sent=exc.not_sent,
-                    retry=exc.retry,
-                    delay=(0 if (exc.not_sent and not permit_ready.is_set()
-                                 and str(exc) == "attempt_deadline_exceeded")
-                           else random.uniform(0, min(60, 2 ** (reservation.sent_attempts + 1)))))
-            else:
-                await self._end_attempt(self.store.unknown, reservation, str(exc))
+            # Bind now: ``exc`` is unbound when this block ends, before a background retry.
+            finished, not_sent, retry, reason = exc.finished, exc.not_sent, exc.retry, str(exc)
+            delay = (0 if (not_sent and not permit_ready.is_set()
+                           and reason == "attempt_deadline_exceeded")
+                     else random.uniform(0, min(60, 2 ** (reservation.sent_attempts + 1))))
+
+            async def settle():
+                if finished:
+                    await self.store.compute_finished(reservation)
+                if finished or not_sent:
+                    await self.store.fail(reservation, reason, not_sent=not_sent,
+                                          retry=retry, delay=delay)
+                else:
+                    await self.store.unknown(reservation, reason)
+
+            await self._end_attempt(reservation, settle)
         except asyncio.CancelledError:
             # Persist when possible; lease reconciliation is the crash fallback.
             with suppress(Exception):
@@ -142,22 +173,24 @@ class Executor:
             raise
         except SendBudgetUnavailable as exc:
             if not send_marked:
-                await self.store.fail(reservation, exc.reason, not_sent=True, retry=True)
+                await self._end_attempt(reservation, lambda reason=exc.reason: self.store.fail(
+                    reservation, reason, not_sent=True, retry=True))
             log.info("attempt could not send under current budget: %s (%s)",
                      reservation.attempt_id, exc.reason)
         except RuntimeConflict:
             # A fenced worker may neither send nor change another owner's state.
             if not send_marked:
-                await self._end_attempt(self.store.fail, reservation, "permit_fenced_before_send",
-                                   not_sent=True, retry=True)
+                await self._end_attempt(reservation, lambda: self.store.fail(
+                    reservation, "permit_fenced_before_send", not_sent=True, retry=True))
             log.warning("attempt fenced: %s", reservation.attempt_id)
         except Exception:
             log.exception("attempt execution failed: %s", reservation.attempt_id)
             if send_marked:
-                await self._end_attempt(self.store.unknown, reservation, "executor_error_after_send")
+                await self._end_attempt(reservation, lambda: self.store.unknown(
+                    reservation, "executor_error_after_send"))
             else:
-                await self._end_attempt(self.store.fail, reservation, "payload_unavailable",
-                                   not_sent=True, retry=True)
+                await self._end_attempt(reservation, lambda: self.store.fail(
+                    reservation, "payload_unavailable", not_sent=True, retry=True))
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):

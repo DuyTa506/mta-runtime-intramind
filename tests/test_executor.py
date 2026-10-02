@@ -175,6 +175,51 @@ async def test_fenced_permit_after_send_intent_settles_through_ledger_error(stor
     assert (await store.operation("o", "t"))["state"] == "RETRY_WAIT"
 
 
+async def test_persistent_settlement_error_frees_executor_then_settles(store, monkeypatch, caplog):
+    engine, executor = await prepare(store)
+
+    class FencedPermits(TestPermits):
+        async def heartbeat(self, reservation):
+            raise RuntimeConflict("durable permit heartbeat was fenced")
+
+    executor.permits = FencedPermits()
+    monkeypatch.setattr(store, "lease_seconds", 0.3)
+    monkeypatch.setattr("intramind_runtime.executor.SETTLE_BACKOFF_SECONDS", 0.01, raising=False)
+    original_fail, original_heartbeat = store.fail, store.heartbeat
+    broken, beats = True, 0
+
+    async def ledger_down(*args, **kwargs):
+        if broken:
+            raise OSError("injected persistent ledger error")
+        return await original_fail(*args, **kwargs)
+
+    async def counted(*args, **kwargs):
+        nonlocal beats
+        beats += 1
+        return await original_heartbeat(*args, **kwargs)
+
+    monkeypatch.setattr(store, "fail", ledger_down)
+    monkeypatch.setattr(store, "heartbeat", counted)
+    assert await asyncio.wait_for(executor.tick(), 5)
+    seen = beats
+    await asyncio.sleep(0.35)
+    assert beats == seen and not engine.calls
+    async with store.engine.connect() as c:
+        attempt = await row(c, "SELECT attempt_id,state FROM runtime_attempts")
+    assert attempt["state"] == "SEND_INTENT"
+    assert "attempt settlement moved to background" in caplog.text
+    assert attempt["attempt_id"] in caplog.text
+    broken = False
+    for _ in range(100):
+        async with store.engine.connect() as c:
+            attempt = await row(c, "SELECT state,compute_held,error_class FROM runtime_attempts")
+        if attempt["state"] != "SEND_INTENT":
+            break
+        await asyncio.sleep(0.05)
+    assert dict(attempt) == {"state": "FAILED_NOT_SENT", "compute_held": False,
+                             "error_class": "permit_fenced_before_send"}
+
+
 async def test_transport_cancel_does_not_stop_backend_or_release_quota(store):
     engine, executor = await prepare(store)
     transport = asyncio.create_task(executor.tick())

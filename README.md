@@ -64,7 +64,9 @@ oldest unsettled RAM direct permit.
 A durable permit stays held from grant through `SEND_INTENT` (a `RESERVED`
 attempt holds no compute yet but its permit covers the send). The executor
 retries the ledger write that ends an attempt until it lands: a live executor
-keeps its lease, so an unwritten end is never reconciled by anyone else.
+keeps its lease, so an unwritten end is never reconciled by anyone else. After
+4 inline tries (1/2/4 s backoff) the retry moves to a background task, capped at
+30 s between tries, so the executor slot is freed and the end still lands.
 No DB transaction spans inference. The completion driver does not promise
 reliable remote cancellation, backend status lookup or exactly-once inference.
 
