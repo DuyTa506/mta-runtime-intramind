@@ -85,3 +85,36 @@ async def test_backoff_uses_sent_attempts_not_ledger_reservations(store, monkeyp
     state = await store.operation("o", "t")
     assert state["attempts"] == 1
     assert state["state"] == "RETRY_WAIT"
+
+
+async def test_budget_refusal_settles_through_ledger_error(store, monkeypatch):
+    await store.configure_pool(pool(target=2), 2)
+    await store.create_root(root(budget_limit=30))
+    await store.submit_operation(operation("first"))
+    await store.submit_operation(operation("second"))
+    first = await store.reserve_next("p", "worker-1")
+    second = await store.reserve_next("p", "worker-2")
+    await store.mark_send(first)
+    artifacts = MemoryArtifacts()
+    artifacts.data[second.operation.payload.key] = (
+        b'{"messages":[{"role":"user","content":"test"}]}')
+    original = store.fail
+    failures = 0
+
+    async def selected(_pool, _owner):
+        return second
+
+    async def deadlock_once(*args, **kwargs):
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OSError("injected deadlock victim")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "reserve_next", selected)
+    monkeypatch.setattr(store, "fail", deadlock_once)
+    monkeypatch.setattr("intramind_runtime.executor.SETTLE_BACKOFF_SECONDS", 0.01, raising=False)
+    assert await Executor(store, artifacts, NeverRun(), "p", "worker-2", TestPermits()).tick()
+    state = await store.operation("second", "t")
+    assert failures == 2
+    assert (state["state"], state["wait_reason"]) == ("RETRY_WAIT", "send_budget_unavailable")

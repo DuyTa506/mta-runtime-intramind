@@ -443,8 +443,9 @@ class MemoryScheduler:
         if not active:
             return
         async with self.store.engine.connect() as c:
+            # A RESERVED attempt holds no compute yet, but its permit covers the send.
             held = await rows(c, """SELECT attempt_id,state FROM runtime_attempts
-                WHERE attempt_id=ANY(CAST(:ids AS text[])) AND compute_held
+                WHERE attempt_id=ANY(CAST(:ids AS text[])) AND (compute_held OR state='RESERVED')
                 UNION ALL SELECT attempt_id,state FROM runtime_direct_attempts
                 WHERE attempt_id=ANY(CAST(:ids AS text[])) AND compute_held""",
                 ids=active)

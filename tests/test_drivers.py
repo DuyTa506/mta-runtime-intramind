@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -28,6 +29,29 @@ async def test_transport_never_retries_and_timeout_is_unknown():
             await driver.execute(reservation(), {"messages": [{"role": "user", "content": "test"}]})
     assert count == 1
     assert not error.value.not_sent and not error.value.finished
+
+
+async def test_attempt_deadline_closes_the_engine_connection():
+    closed = asyncio.Event()
+
+    async def engine(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        await reader.read()
+        closed.set()
+        writer.close()
+
+    server = await asyncio.start_server(engine, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    driver = OpenAICompletionDriver(f"http://127.0.0.1:{port}/v1", "unused", "tool")
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.2):
+                await driver.execute(reservation(), {"messages": [{"role": "user", "content": "x"}]})
+        await asyncio.wait_for(closed.wait(), 2)
+    finally:
+        await driver.close()
+        server.close()
+        await server.wait_closed()
 
 
 async def test_caller_cannot_smuggle_multiple_completions_or_model_routing():
