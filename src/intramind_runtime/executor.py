@@ -38,6 +38,18 @@ class Executor:
                 # does not discard a response. Authority will retain uncertainty.
                 log.exception("attempt heartbeat failed: %s", reservation.attempt_id)
 
+    async def _end_attempt(self, write, reservation, *args, **kwargs):
+        """Retry the write ending this attempt; a live owner's lease blocks reconciliation."""
+        while True:
+            try:
+                return await write(reservation, *args, **kwargs)
+            except RuntimeConflict as exc:
+                log.warning("attempt settlement fenced: %s (%s)", reservation.attempt_id, exc)
+                return None
+            except Exception:
+                log.exception("retrying attempt settlement: %s", reservation.attempt_id)
+                await asyncio.sleep(2)
+
     async def tick(self) -> bool:
         reservation = await self.store.reserve_next(self.pool_id, self.owner_id)
         if reservation is None:
@@ -111,14 +123,15 @@ class Executor:
                     await asyncio.sleep(2)
         except DriverFailure as exc:
             if exc.finished:
-                await self.store.compute_finished(reservation)
+                await self._end_attempt(self.store.compute_finished, reservation)
             if exc.finished or exc.not_sent:
-                await self.store.fail(reservation, str(exc), not_sent=exc.not_sent, retry=exc.retry,
+                await self._end_attempt(self.store.fail, reservation, str(exc), not_sent=exc.not_sent,
+                    retry=exc.retry,
                     delay=(0 if (exc.not_sent and not permit_ready.is_set()
                                  and str(exc) == "attempt_deadline_exceeded")
                            else random.uniform(0, min(60, 2 ** (reservation.sent_attempts + 1)))))
             else:
-                await self.store.unknown(reservation, str(exc))
+                await self._end_attempt(self.store.unknown, reservation, str(exc))
         except asyncio.CancelledError:
             # Persist when possible; lease reconciliation is the crash fallback.
             with suppress(Exception):
@@ -135,17 +148,16 @@ class Executor:
         except RuntimeConflict:
             # A fenced worker may neither send nor change another owner's state.
             if not send_marked:
-                with suppress(Exception):
-                    await self.store.fail(reservation, "permit_fenced_before_send",
-                                          not_sent=True, retry=True)
+                await self._end_attempt(self.store.fail, reservation, "permit_fenced_before_send",
+                                   not_sent=True, retry=True)
             log.warning("attempt fenced: %s", reservation.attempt_id)
         except Exception:
-            with suppress(Exception):
-                if send_marked:
-                    await self.store.unknown(reservation, "executor_error_after_send")
-                else:
-                    await self.store.fail(reservation, "payload_unavailable", not_sent=True, retry=True)
             log.exception("attempt execution failed: %s", reservation.attempt_id)
+            if send_marked:
+                await self._end_attempt(self.store.unknown, reservation, "executor_error_after_send")
+            else:
+                await self._end_attempt(self.store.fail, reservation, "payload_unavailable",
+                                   not_sent=True, retry=True)
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):

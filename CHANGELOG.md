@@ -20,6 +20,15 @@
   runtime restarted. `settle_idle_unknown` now takes the proven `attempt_ids`.
 - Export `intramind_runtime_direct_unknown_oldest_seconds{pool}`: UNKNOWN RAM
   direct permits were invisible to metrics.
+- Keep a durable permit while its attempt is still `RESERVED`. rc18 rows hold no
+  compute before `SEND_INTENT`, so runtime-api reconciliation released permits in
+  the window between grant and send and fenced the executor
+  (`permit_fenced_before_send`, 128 on the staging tool pool 30/09–02/10).
+- The executor retries the ledger write that ends an attempt (fail/UNKNOWN/
+  finished) and logs each error instead of suppressing it. A live owner keeps its
+  lease, so one lost write (02/10, blocked on the root an idle settlement held)
+  left `SEND_INTENT` held; the watchdog saw known work on an idle engine and
+  restarted it after 11 minutes of closed admission.
 
 ## 0.2.0rc19 — unreleased
 

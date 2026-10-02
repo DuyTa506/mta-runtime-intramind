@@ -205,6 +205,30 @@ async def test_unknown_direct_keeps_slot_until_epoch_is_confirmed_stopped(store)
         await scheduler.close()
 
 
+async def test_reconcile_keeps_permit_of_reserved_durable_attempt_until_settled(store):
+    await store.configure_pool(pool(target=1, transport_limit=1, background_transport_limit=1), 1)
+    await store.create_root(root())
+    await store.submit_operation(operation())
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    try:
+        reservation = await store.reserve_next("p", "executor")
+        await durable(scheduler, reservation)
+        await scheduler._reconcile_durable()
+        assert reservation.attempt_id in scheduler.permits
+        await store.mark_send(reservation)
+        scheduler.durable_heartbeat(reservation.attempt_id, reservation.owner_id)
+        blocked = request("blocked")
+        await scheduler.enqueue(blocked, "p", "owner")
+        assert await scheduler.reserve(blocked, "p", "owner") is None
+        await store.fail(reservation, "not_sent", not_sent=True)
+        await scheduler._reconcile_durable()
+        assert reservation.attempt_id not in scheduler.permits
+        assert await scheduler.reserve(blocked, "p", "owner") is not None
+    finally:
+        await scheduler.close()
+
+
 async def test_restart_hydrates_durable_held_and_unknown_is_not_reclaimed(store):
     spec = pool(target=1, transport_limit=1, background_transport_limit=1)
     await store.configure_pool(spec, 1)

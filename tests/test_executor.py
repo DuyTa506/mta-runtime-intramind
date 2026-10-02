@@ -7,7 +7,7 @@ from conftest import operation, pool, root
 from fakes import IndependentEngine, MemoryArtifacts, TestPermits
 from test_embedding import embedding, embedding_pool
 
-from intramind_runtime.contracts import EmbeddingResult
+from intramind_runtime.contracts import EmbeddingResult, RuntimeConflict
 from intramind_runtime.direct import DirectRequest
 from intramind_runtime.executor import Executor
 from intramind_runtime.memory_scheduler import MemoryScheduler
@@ -102,6 +102,77 @@ async def test_embedding_qa_capacity_wait_does_not_spend_durable_attempt_or_budg
         assert not scheduler.permits
     finally:
         await scheduler.close()
+
+
+class SchedulerPermits:
+    """Executor permits served in-process by a real runtime-api scheduler."""
+
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+
+    async def acquire(self, reservation):
+        return await self.scheduler.durable(
+            reservation.attempt_id, reservation.pool_id, reservation.owner_id,
+            reservation.engine_epoch, reservation.workload_class, reservation.attempt_deadline)
+
+    async def heartbeat(self, reservation):
+        self.scheduler.durable_heartbeat(reservation.attempt_id, reservation.owner_id)
+
+    async def release(self, reservation):
+        await self.scheduler.durable_release(reservation.attempt_id, reservation.owner_id)
+
+
+async def test_reconcile_between_permit_and_send_intent_does_not_fence_attempt(store):
+    # 02/10: runtime-api reconciliation ran while the executor read the payload.
+    engine, executor = await prepare(store)
+    scheduler = MemoryScheduler(store)
+    await scheduler.start()
+    executor.permits = SchedulerPermits(scheduler)
+    original = executor.artifacts.get
+
+    async def reconcile_then_get(artifact):
+        await scheduler._reconcile_durable()
+        return await original(artifact)
+
+    executor.artifacts.get = reconcile_then_get
+    engine.gate.set()
+    try:
+        assert await asyncio.wait_for(executor.tick(), 10)
+        assert len(engine.calls) == 1
+        assert (await store.operation("o", "t"))["state"] == "SUCCEEDED"
+        assert not scheduler.permits
+    finally:
+        await scheduler.close()
+
+
+async def test_fenced_permit_after_send_intent_settles_through_ledger_error(store, monkeypatch):
+    engine, executor = await prepare(store)
+
+    class FencedPermits(TestPermits):
+        async def heartbeat(self, reservation):
+            raise RuntimeConflict("durable permit heartbeat was fenced")
+
+    executor.permits = FencedPermits()
+    original = store.fail
+    failures = 0
+
+    async def deadlock_once(*args, **kwargs):
+        nonlocal failures
+        failures += 1
+        if failures == 1:
+            raise OSError("injected deadlock victim")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "fail", deadlock_once)
+    assert await asyncio.wait_for(executor.tick(), 10)
+    report = await store.inspect_engine("p")
+    assert (report["known_inflight"], report["unknown_inflight"]) == (0, 0)
+    assert not engine.calls and failures == 2
+    async with store.engine.connect() as c:
+        attempt = await row(c, "SELECT state,compute_held,error_class FROM runtime_attempts")
+    assert dict(attempt) == {"state": "FAILED_NOT_SENT", "compute_held": False,
+                             "error_class": "permit_fenced_before_send"}
+    assert (await store.operation("o", "t"))["state"] == "RETRY_WAIT"
 
 
 async def test_transport_cancel_does_not_stop_backend_or_release_quota(store):
