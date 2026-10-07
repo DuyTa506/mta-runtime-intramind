@@ -32,6 +32,26 @@
   The budget-refusal path settles the same way, and after 4 inline tries the
   retry continues in the background so a persistent error cannot hold the
   executor's tick.
+- Settle an attempt whose inference ended but whose result can no longer be
+  committed. An executor stalled past its owner lease (97 s on the tool
+  pool, 07/10) after `compute_finished` had its `BACKEND_FINISHED` attempt turned
+  `UNKNOWN` with no compute held; its late `commit_result` was fenced and the
+  result, held only in RAM, was lost. No path settled that state (`/slots` idle
+  proof, the watchdog and `confirm_epoch_stopped` look at held compute), so the
+  operation stayed `RECONCILING` and `runtime.sh stop` timed out on "1 UNKNOWN
+  attempts". `reconcile_expired` now fails such an attempt with
+  `error_class=result_lost_after_backend_finished` and estimated usage (the
+  bound), for `BACKEND_FINISHED` under an expired owner and for rows an earlier
+  build left `UNKNOWN` with `compute_held=false` and `backend_finished_at` set,
+  so a deploy cleans rows already stuck. The operation is requeued with
+  `wait_reason=result_lost_after_backend_finished` (`recover=True`, as
+  `engine_idle_verified` and `confirm_epoch_stopped --recover` do for the same
+  row) when attempts, budget and deadlines allow, else fails. A completed
+  inference is still never re-run to repair persistence while its owner can
+  commit: a live owner is not touched, and `UNKNOWN` attempts that hold compute
+  keep requiring idle or stopped-epoch proof. Each row settles in its own
+  transaction under `FOR UPDATE SKIP LOCKED`, so one bad row cannot starve the
+  rest and a committing owner always wins.
 
 ## 0.2.0rc19 — unreleased
 
