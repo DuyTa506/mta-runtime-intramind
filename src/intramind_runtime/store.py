@@ -6,6 +6,7 @@ inference, transport waiting and progress never hold a database transaction.
 
 import asyncio
 import json
+import logging
 from collections.abc import Collection
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,8 @@ from .contracts import (
     parse_operation,
     parse_pool,
 )
+
+log = logging.getLogger(__name__)
 
 
 def encode(value) -> str:
@@ -873,7 +876,10 @@ class Store:
                     AND NOT EXISTS (SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=a.owner_id
                         AND ow.lease_expires_at>now()))
                     OR (a.state='RESERVED' AND o.state IN ('SUCCEEDED','FAILED','CANCELLED')))
-                AND a.state IN ('RESERVED','SEND_INTENT','ACTIVE','BACKEND_FINISHED')""")
+                AND a.state IN ('RESERVED','SEND_INTENT','ACTIVE','BACKEND_FINISHED')
+                AND NOT (a.state='BACKEND_FINISHED' AND NOT a.compute_held)""")
+            # BACKEND_FINISHED without compute is settled by _settle_lost_results below,
+            # not turned into an UNKNOWN attempt that nothing could ever settle.
             for a in attempts:
                 if a["state"] == "RESERVED":
                     await self._settle(c, a, 0)
@@ -927,7 +933,55 @@ class Store:
                 await self._terminal(c, op["operation_id"], "CANCELLED", "root_terminal")
             if direct.rowcount:
                 await self._wake(c)
-            return len(attempts) + direct.rowcount
+            count = len(attempts) + direct.rowcount
+        return count + await self._settle_lost_results()
+
+    async def _settle_lost_results(self) -> int:
+        """Settle attempts whose inference ended but whose result can no longer be committed.
+
+        ``commit_result`` needs the attempt in ``BACKEND_FINISHED`` under its owner's
+        fence. Once that owner lost its lease (an executor stalled past it), or the
+        attempt was left ``UNKNOWN`` after ``compute_finished``, nothing can commit the
+        result and nothing holds compute, so no probe or restart would ever settle it:
+        the operation stayed ``RECONCILING`` and blocked the drain forever. The
+        result is lost, so the attempt fails with estimated usage and the operation
+        retries inference like an idle-verified engine (bounded by attempts, budget and
+        deadlines), else fails. UNKNOWN attempts that still hold compute are not touched.
+        Every eligible row is visited on each call, each in its own transaction (the set
+        is bounded by work in flight when an owner was lost), so a row that keeps failing
+        or stays locked cannot hide the others behind a fixed-size batch.
+        """
+        lost = """NOT a.compute_held AND a.result_committed_at IS NULL AND (
+                (a.state='BACKEND_FINISHED' AND a.lease_expires_at<now()
+                    AND NOT EXISTS (SELECT 1 FROM runtime_owners ow WHERE ow.owner_id=a.owner_id
+                        AND ow.lease_expires_at>now()))
+                OR (a.state='UNKNOWN' AND a.backend_finished_at IS NOT NULL))"""
+        async with self.engine.connect() as c:
+            ids = [r["attempt_id"] for r in await rows(c, f"""SELECT a.attempt_id
+                FROM runtime_attempts a WHERE {lost} ORDER BY a.created_at""")]
+        settled = 0
+        for attempt_id in ids:
+            try:
+                async with self.transaction() as c:
+                    # Re-check under the attempt lock: an owner still committing wins.
+                    a = await row(c, f"""SELECT a.*,o.root_id,o.state AS operation_state,
+                        o.spec AS operation_spec,o.attempts AS operation_attempts,
+                        r.spec AS root_spec,r.state AS root_state,
+                        r.cancel_requested,r.deadline AS root_deadline
+                        FROM runtime_attempts a JOIN runtime_operations o USING(operation_id)
+                        JOIN runtime_roots r USING(root_id)
+                        WHERE a.attempt_id=:id AND {lost} FOR UPDATE OF a SKIP LOCKED""",
+                        id=attempt_id)
+                    if a is None:
+                        continue
+                    await self._settle_stopped_attempt(
+                        c, a, True, "result_lost_after_backend_finished",
+                        retry_reason="result_lost_after_backend_finished")
+                    await self._wake(c)
+                settled += 1
+            except Exception:
+                log.exception("lost result settlement failed: %s", attempt_id)
+        return settled
 
     async def inspect_engine(self, pool_id: str):
         """Bounded metadata only; never expose prompt or response payloads."""
@@ -1073,7 +1127,8 @@ class Store:
             await self._wake(c)
             return settled_attempts + direct.rowcount
 
-    async def _settle_stopped_attempt(self, c, a, recover: bool, error_class: str):
+    async def _settle_stopped_attempt(self, c, a, recover: bool, error_class: str,
+                                      *, retry_reason: str = "engine_recovery"):
         """Settle one attempt whose inference is proven over; retry it only when ``recover``."""
         await self._settle(c, a, 0 if a["state"] == "RESERVED" else None)
         await execute(c, """UPDATE runtime_attempts SET state='FAILED',compute_held=false,
@@ -1097,9 +1152,9 @@ class Store:
             and budget["spent"] + budget["reserved"] + spec.budget_bound <= budget["budget_limit"])
         if can_retry:
             await execute(c, """UPDATE runtime_operations SET state='RETRY_WAIT',
-                active_attempt=NULL,wait_reason='engine_recovery',retry_at=now()
+                active_attempt=NULL,wait_reason=:reason,retry_at=now()
                 WHERE operation_id=:id AND active_attempt=:old""",
-                id=a["operation_id"], old=a["attempt_id"])
+                id=a["operation_id"], old=a["attempt_id"], reason=retry_reason)
         else:
             await self._terminal(c, a["operation_id"], "FAILED", error_class)
 

@@ -67,6 +67,14 @@ retries the ledger write that ends an attempt until it lands: a live executor
 keeps its lease, so an unwritten end is never reconciled by anyone else. After
 4 inline tries (1/2/4 s backoff) the retry moves to a background task, capped at
 30 s between tries, so the executor slot is freed and the end still lands.
+A result that can no longer be committed does not wait for a probe. Once compute
+has ended and nothing can commit the output (`BACKEND_FINISHED` under an owner that
+lost its lease, or `UNKNOWN` with no compute held), the reconciler fails the attempt
+with `error_class=result_lost_after_backend_finished`, charges the bound as
+estimated usage and requeues the operation
+(`wait_reason=result_lost_after_backend_finished`) within its attempt, budget and
+deadline limits, else fails it. The late executor is fenced by its next ledger
+write; its in-memory result is discarded.
 No DB transaction spans inference. The completion driver does not promise
 reliable remote cancellation, backend status lookup or exactly-once inference.
 
