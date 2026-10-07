@@ -196,6 +196,24 @@ async def test_one_unsettleable_attempt_does_not_starve_the_others(store, monkey
     assert await attempt(store, first.attempt_id) == lost_attempt()
 
 
+async def test_unsettleable_attempts_never_fill_a_fixed_batch(store, monkeypatch):
+    attempts = await finished_attempt(store, ops=70, max_pending=100)
+    await expire_leases(store)
+    poisoned = {a.attempt_id for a in attempts[:66]}
+    settle = store._settle_stopped_attempt
+
+    async def selective(c, a, *args, **kwargs):
+        if a["attempt_id"] in poisoned:
+            raise RuntimeConflict("attempt budget ledger missing")
+        return await settle(c, a, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_settle_stopped_attempt", selective)
+    assert await store.reconcile_expired() == 4
+    for reservation in attempts[66:]:
+        assert await attempt(store, reservation.attempt_id) == lost_attempt()
+    assert (await attempt(store, attempts[0].attempt_id))[0] == "BACKEND_FINISHED"
+
+
 async def test_executor_stalled_past_its_lease_is_fenced_and_the_operation_reruns(store):
     await store.create_root(root())
     await store.configure_pool(pool(target=1), 1)

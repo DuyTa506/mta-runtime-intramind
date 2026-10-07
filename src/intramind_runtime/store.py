@@ -947,7 +947,9 @@ class Store:
         result is lost, so the attempt fails with estimated usage and the operation
         retries inference like an idle-verified engine (bounded by attempts, budget and
         deadlines), else fails. UNKNOWN attempts that still hold compute are not touched.
-        One unsettleable row must not starve the others, so each has its own transaction.
+        Every eligible row is visited on each call, each in its own transaction (the set
+        is bounded by work in flight when an owner was lost), so a row that keeps failing
+        or stays locked cannot hide the others behind a fixed-size batch.
         """
         lost = """NOT a.compute_held AND a.result_committed_at IS NULL AND (
                 (a.state='BACKEND_FINISHED' AND a.lease_expires_at<now()
@@ -956,7 +958,7 @@ class Store:
                 OR (a.state='UNKNOWN' AND a.backend_finished_at IS NOT NULL))"""
         async with self.engine.connect() as c:
             ids = [r["attempt_id"] for r in await rows(c, f"""SELECT a.attempt_id
-                FROM runtime_attempts a WHERE {lost} ORDER BY a.created_at LIMIT 64""")]
+                FROM runtime_attempts a WHERE {lost} ORDER BY a.created_at""")]
         settled = 0
         for attempt_id in ids:
             try:
