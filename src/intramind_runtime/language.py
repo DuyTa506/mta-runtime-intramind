@@ -16,6 +16,7 @@ _HAN = re.compile(
     "\U00020000-\U0002ee5f\U0002f800-\U0002fa1f\U00030000-\U000323af]"
 )
 _FIXED = re.compile(r"https?://\S+|\[[^\]\n]+\]|<[^>\n]+>|\{\{.*?\}\}|\d+(?:[.,:/-]\d+)*")
+_NUMBER = re.compile(r"\d+(?:[.,:/-]\d+)*")
 _LITERAL = re.compile(r'"[^"\n]+"|“[^”\n]+”|「[^」\n]+」|`[^`\n]+`|\$\$[^$]+\$\$')
 _ALIASES = {
     "vietnamese": "vi",
@@ -200,6 +201,27 @@ def repair_payload(issues: tuple[LanguageIssue, ...], policy: LanguagePolicy) ->
     }
 
 
+def _repair_keeps_fixed_tokens(original: str, repaired: str) -> bool:
+    """Keep URLs, brackets and numbers in order. Numbers may be added only to finish a Han repair.
+
+    The original fixed tokens must appear in the repair in the same order (an ordered
+    subsequence); the only extra tokens allowed are numbers. A repair that still contains
+    Han, or an original with no Han, must keep the fixed tokens exactly.
+    """
+    old, new = _FIXED.findall(original), _FIXED.findall(repaired)
+    if old == new:
+        return True
+    if not _HAN.search(original) or _HAN.search(repaired):
+        return False
+    index = 0
+    for token in new:
+        if index < len(old) and token == old[index]:
+            index += 1
+        elif not _NUMBER.fullmatch(token):
+            return False
+    return index == len(old)
+
+
 def apply_repair(value: Any, issues: tuple[LanguageIssue, ...], raw: str, policy: LanguagePolicy):
     try:
         patch = json.loads(raw)
@@ -214,7 +236,7 @@ def apply_repair(value: Any, issues: tuple[LanguageIssue, ...], raw: str, policy
     for issue, text in zip(issues, texts, strict=True):
         if not isinstance(text, str) or not text.strip():
             raise LanguageValidationError()
-        if _FIXED.findall(issue.text) != _FIXED.findall(text):
+        if not _repair_keeps_fixed_tokens(issue.text, text):
             raise LanguageValidationError()
         if any(
             issue.text.count(term) != text.count(term) for term in policy.protected_terms if term
