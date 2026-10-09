@@ -202,33 +202,24 @@ def repair_payload(issues: tuple[LanguageIssue, ...], policy: LanguagePolicy) ->
 
 
 def _repair_keeps_fixed_tokens(original: str, repaired: str) -> bool:
-    """Keep URLs and brackets identical. Numbers may grow only to finish a Han repair.
+    """Keep URLs, brackets and numbers in order. Numbers may be added only to finish a Han repair.
 
-    Every number from the original must remain. A repair that still contains Han,
-    or an original with no Han, cannot introduce or replace a number.
+    The original fixed tokens must appear in the repair in the same order (an ordered
+    subsequence); the only extra tokens allowed are numbers. A repair that still contains
+    Han, or an original with no Han, must keep the fixed tokens exactly.
     """
     old, new = _FIXED.findall(original), _FIXED.findall(repaired)
     if old == new:
         return True
     if not _HAN.search(original) or _HAN.search(repaired):
         return False
-
-    def split(tokens: list[str]) -> tuple[list[str], list[str]]:
-        numbers, other = [], []
-        for token in tokens:
-            (numbers if _NUMBER.fullmatch(token) else other).append(token)
-        return numbers, other
-
-    old_numbers, old_other = split(old)
-    new_numbers, new_other = split(new)
-    if old_other != new_other:
-        return False
-    pool = list(new_numbers)
-    for token in old_numbers:
-        if token not in pool:
+    index = 0
+    for token in new:
+        if index < len(old) and token == old[index]:
+            index += 1
+        elif not _NUMBER.fullmatch(token):
             return False
-        pool.remove(token)
-    return True
+    return index == len(old)
 
 
 def apply_repair(value: Any, issues: tuple[LanguageIssue, ...], raw: str, policy: LanguagePolicy):

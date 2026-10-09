@@ -96,6 +96,21 @@ def test_han_repair_keeps_original_number_and_may_add_another():
         apply_repair(original, issues, json.dumps({"texts": [lost]}), policy)
 
 
+def test_han_repair_cannot_reorder_fixed_tokens():
+    policy = LanguagePolicy("vi")
+    original = "Liều dùng 5 [mg] mỗi ngày theo thuật算 của hướng dẫn số 12 và 30 tháng."
+    issues = inspect_language(original, policy)
+    assert issues
+    for moved in (
+        "Liều dùng [mg] 5 mỗi ngày theo thuật toán của hướng dẫn số 12 và 30 tháng.",
+        "Liều dùng 5 [mg] mỗi ngày theo thuật toán của hướng dẫn số 30 và 12 tháng.",
+    ):
+        with pytest.raises(LanguageValidationError):
+            apply_repair(original, issues, json.dumps({"texts": [moved]}), policy)
+    added = "Liều dùng 5 [mg] mỗi ngày theo thuật toán 2 của hướng dẫn số 12 và 30 tháng."
+    assert apply_repair(original, issues, json.dumps({"texts": [added]}), policy) == added
+
+
 def test_repair_without_han_cannot_add_a_number():
     policy = LanguagePolicy("vi")
     original = "Có vấn đề 12 trong câu tiếng Việt này đây."
