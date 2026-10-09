@@ -16,6 +16,7 @@ _HAN = re.compile(
     "\U00020000-\U0002ee5f\U0002f800-\U0002fa1f\U00030000-\U000323af]"
 )
 _FIXED = re.compile(r"https?://\S+|\[[^\]\n]+\]|<[^>\n]+>|\{\{.*?\}\}|\d+(?:[.,:/-]\d+)*")
+_NUMBER = re.compile(r"\d+(?:[.,:/-]\d+)*")
 _LITERAL = re.compile(r'"[^"\n]+"|“[^”\n]+”|「[^」\n]+」|`[^`\n]+`|\$\$[^$]+\$\$')
 _ALIASES = {
     "vietnamese": "vi",
@@ -200,6 +201,36 @@ def repair_payload(issues: tuple[LanguageIssue, ...], policy: LanguagePolicy) ->
     }
 
 
+def _repair_keeps_fixed_tokens(original: str, repaired: str) -> bool:
+    """Keep URLs and brackets identical. Numbers may grow only to finish a Han repair.
+
+    Every number from the original must remain. A repair that still contains Han,
+    or an original with no Han, cannot introduce or replace a number.
+    """
+    old, new = _FIXED.findall(original), _FIXED.findall(repaired)
+    if old == new:
+        return True
+    if not _HAN.search(original) or _HAN.search(repaired):
+        return False
+
+    def split(tokens: list[str]) -> tuple[list[str], list[str]]:
+        numbers, other = [], []
+        for token in tokens:
+            (numbers if _NUMBER.fullmatch(token) else other).append(token)
+        return numbers, other
+
+    old_numbers, old_other = split(old)
+    new_numbers, new_other = split(new)
+    if old_other != new_other:
+        return False
+    pool = list(new_numbers)
+    for token in old_numbers:
+        if token not in pool:
+            return False
+        pool.remove(token)
+    return True
+
+
 def apply_repair(value: Any, issues: tuple[LanguageIssue, ...], raw: str, policy: LanguagePolicy):
     try:
         patch = json.loads(raw)
@@ -214,7 +245,7 @@ def apply_repair(value: Any, issues: tuple[LanguageIssue, ...], raw: str, policy
     for issue, text in zip(issues, texts, strict=True):
         if not isinstance(text, str) or not text.strip():
             raise LanguageValidationError()
-        if _FIXED.findall(issue.text) != _FIXED.findall(text):
+        if not _repair_keeps_fixed_tokens(issue.text, text):
             raise LanguageValidationError()
         if any(
             issue.text.count(term) != text.count(term) for term in policy.protected_terms if term

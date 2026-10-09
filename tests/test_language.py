@@ -4,6 +4,7 @@ import pytest
 
 from intramind_runtime.language import (
     LanguageGuardedPort,
+    LanguageIssue,
     LanguagePolicy,
     LanguageValidationError,
     apply_repair,
@@ -72,6 +73,44 @@ def test_confident_detector_is_deterministic_and_short_terms_are_uncertain():
     assert {detect_language(VI) for _ in range(5)} == {"vi"}
     assert detect_language(EN) == "en"
     assert detect_language("GPU RAG") is None
+
+
+def test_han_repair_may_add_a_number_once_the_han_is_gone():
+    policy = LanguagePolicy("vi")
+    original = "Yêu cầu mã hóa dữ liệu mật bằng thuật算 cho các hệ thống của đơn vị."
+    repaired = "Yêu cầu mã hóa dữ liệu mật bằng thuật toán AES-256 cho các hệ thống của đơn vị."
+    issues = inspect_language(original, policy)
+    assert issues
+    assert apply_repair(original, issues, json.dumps({"texts": [repaired]}), policy) == repaired
+
+
+def test_han_repair_keeps_original_number_and_may_add_another():
+    policy = LanguagePolicy("vi")
+    original = "Yêu cầu mã hóa bằng thuật算 AES-256 cho dữ liệu mật của đơn vị."
+    issues = inspect_language(original, policy)
+    assert issues
+    kept = "Yêu cầu mã hóa bằng thuật toán AES-256 cho 3 nhóm dữ liệu mật của đơn vị."
+    assert apply_repair(original, issues, json.dumps({"texts": [kept]}), policy) == kept
+    lost = "Yêu cầu mã hóa bằng thuật toán cho 3 nhóm dữ liệu mật của đơn vị."
+    with pytest.raises(LanguageValidationError):
+        apply_repair(original, issues, json.dumps({"texts": [lost]}), policy)
+
+
+def test_repair_without_han_cannot_add_a_number():
+    policy = LanguagePolicy("vi")
+    original = "Có vấn đề 12 trong câu tiếng Việt này đây."
+    issue = (LanguageIssue((), original),)
+    repaired = {"texts": ["Có vấn đề 12 99 trong câu tiếng Việt này đây."]}
+    with pytest.raises(LanguageValidationError):
+        apply_repair(original, issue, json.dumps(repaired), policy)
+
+
+def test_han_left_in_the_repair_is_still_rejected():
+    policy = LanguagePolicy("vi")
+    original = "Cụm này phù hợp vai期 của hệ thống giám sát an toàn."
+    issues = inspect_language(original, policy)
+    with pytest.raises(LanguageValidationError):
+        apply_repair(original, issues, json.dumps({"texts": [original]}), policy)
 
 
 def test_non_han_repair_must_reach_the_requested_target():
