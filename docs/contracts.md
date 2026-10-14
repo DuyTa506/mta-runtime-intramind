@@ -1,0 +1,468 @@
+# Runtime contracts
+
+## Night warehouse admission
+
+Authenticated internal callers may use the following headers on direct inference:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Intramind-Admission-Mode: try` | One scheduler decision; default callers retain `wait` |
+| `X-Intramind-Dispatch-Before` | UTC ISO timestamp checked immediately before each engine send |
+| `X-Intramind-Step-Timeout-Seconds` | Execution limit, clamped to the pool and 30 seconds for `try` |
+
+`try` is restricted to the background workload class. Refusal returns HTTP 409
+with `error.type=admission_deferred`, `compute_state=not_sent` and a reason such as
+`inference_capacity`, `model_not_ready` or `dispatch_cutoff`. It does not leave a
+waiter/reservation, query PostgreSQL or send compute. Preflight is bounded by ten
+seconds; the total runtime deadline is the step timeout plus ten seconds.
+Already-sent work may finish after the cutoff. Timeout/disconnect remains UNKNOWN
+and holds capacity; it is never proof of an unsent request.
+
+New consumers check authenticated `GET /v1/capabilities` for
+`warehouse-admission-v1` before starting. The SDK `admission_scope` and opt-in
+`DirectBinding.client_kwargs(observe_admission=True)` expose attempt/logical IDs,
+generation and send/termination evidence without changing model payloads.
+Deploy runtime before AI/BE consumers.
+
+Both admission modes synchronize the qualified engine epoch before creating a
+request, including the first foreground request after an idle engine restart.
+Changes to the model revision or capacity profile still require a matching proxy
+configuration; a restart after enqueue still fences the old request. Both OpenAI
+and native SDK streams preserve dispatch evidence.
+
+Release checks must consume a real authenticated completion through its final
+stream event. `/health` checks ledger connectivity only; HTTP 200 alone does not
+prove successful inference because a stream can contain `intramind.error`.
+
+Run integration tests only against disposable PostgreSQL on **55440**; the test
+fixture rejects other ports.
+
+`runtime.finish_run` accepts the SDK's `CANCELLED` finalization through the
+existing cancellation path. Repeated acknowledgements preserve terminal results,
+tenant isolation and outstanding compute/budget accounting; cancelled workflows
+can close without retrying `invalid terminal state` indefinitely.
+
+## Install and use
+
+Use Python 3.12. Applications install the release wheel from the maintainer's
+release artifacts or internal package index and pin its version and hash.
+
+```bash
+uv pip install /release/intramind_runtime-0.2.0rc10-py3-none-any.whl
+```
+
+Declare features with `@durable_task` and call `TaskContext.activity`, `llm`,
+`run_child`, `map_children`, `sleep` and `wait_event`. See
+[the example workflow](../src/intramind_runtime/example_workflow.py).
+Feature modules do not import Temporal primitives directly. Keep HTTP/database
+client initialization in activity modules, outside replayable workflow imports.
+Use stable item keys and immutable artifacts; paginate large plans rather than
+embedding source documents or unbounded child lists in workflow history.
+
+Version `0.2.0rc18` makes runtime-api the single capacity owner for direct and
+durable inference. Direct request identity, waiters and attempts stay in RAM;
+normal direct requests issue no PostgreSQL statements. Executors reserve their
+durable operation, acquire an HTTP permit with the existing service token,
+write `SEND_INTENT`, then send to the engine. On restart, runtime-api restores
+only sent or UNKNOWN durable attempts as held capacity; RESERVED attempts must
+acquire a fresh permit. A competing runtime-api owner is fenced. Migration
+`0007` makes the pool review date nullable; no client SDK change is required.
+Rollback to rc17 remains possible while every pool config supplies a future
+`valid_until` value.
+
+`RESERVED` identifies a durable waiter but holds neither compute nor budget and
+does not increase operation/root attempt counters. The `mark_send` transaction
+rechecks those limits and atomically charges the attempt and budget when the
+permit is available. A permit wait timeout retries immediately without using an
+attempt; unique ledger attempt numbers remain separate from the number of sent
+attempts. This keeps the existing permit identity/recovery protocol intact and
+avoids holding budget throughout a capacity wait.
+
+Durable permit waiters retain their operation's `created_at` position if an
+unsent reservation expires and the executor reserves again. A later request in
+the same priority class cannot jump ahead simply because the retry has a new
+attempt ID. The executor's retry backoff uses the number of attempts actually
+sent, not the ledger reservation number. A budget change between reservation
+and `SEND_INTENT` yields `send_attempts_exhausted` or `send_budget_unavailable`
+and retries without sending engine traffic.
+
+`valid_until` is an optional review date in rc18, not a capacity cutoff. Once
+past, runtime-api logs at most one warning per pool per hour and exports
+`intramind_runtime_pool_valid_until_seconds{pool}` as signed seconds remaining.
+An unset date has no gauge sample. Deployments that may roll back to rc17 must
+still supply a future date, because rc17 treats it as a dispatch cutoff.
+Legacy terminal direct attempts older than one day and no longer holding
+compute are pruned during reconciliation; unsettled attempts remain available
+for recovery.
+
+An unclean runtime-api exit marks each pool dirty until the former owner's
+lease expires plus its `restart_drain_seconds`. The field is optional per pool
+in `pools.json` and defaults to that pool's `attempt_timeout_seconds` (or
+1,800 seconds). It changes recovery gating, not durable attempt deadlines.
+LLM pools can clear sooner on two idle `/slots` probes. A blocked pool exports
+`intramind_runtime_dirty_recovery_blocked` and logs a warning. Native compute
+can outlive an HTTP disconnect, so these finite windows should be reviewed
+against serving latency measurements as load changes.
+
+In three warmed mock-serving runs per backlog, 100 QA requests arrived at
+100/s across four endpoints; every run completed 100/100. Median results were:
+
+| Background backlog | Dispatch p95 | Dispatch p99 | Process CPU |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.77 ms | 3.58 ms | 29.38% |
+| 1,000 | 0.74 ms | 0.83 ms | 24.15% |
+| 10,000 | 0.68 ms | 0.81 ms | 23.75% |
+
+The benchmark runs against the disposable PostgreSQL database on port 55440;
+the timed direct request path does not use it. Mock serving and a local
+single-process scheduler do not substitute for the stage soak and crash gate.
+
+Version `0.2.0rc17` removes a direct waiter if caller cancellation interrupts
+the return from an already-committed enqueue, before a producer exists to own
+cleanup. Each direct request now has one deadline beginning at the authenticated
+route entry and covering body read, prompt sizing, proxy startup, capacity wait,
+transport, retry wait and confirmed-engine recovery. Defaults are 600 seconds
+for `qa`, 1,800 for `user_task`, and the pool's `attempt_timeout_seconds`
+(default 1,800) for `background` and `maintenance`. A pool entry may override
+these with `workload_deadline_seconds`, for example
+`{"qa": 600, "user_task": 1800, "background": 900, "maintenance": 300}`;
+values must be positive and no greater than 86,400 seconds. Authenticated
+callers may supply `X-Intramind-Deadline-Seconds` to shorten, never extend,
+their class limit. `inference_scope(..., deadline_seconds=N)` sets this header
+through the SDK. Stream timeouts end in an `intramind.error` with
+`reason=deadline_exceeded`, exposed on `DirectStreamError.reason`; non-stream
+timeouts return HTTP 504 JSON with the same reason. A timeout after send does
+not prove engine termination: its UNKNOWN attempt keeps compute held until the
+existing fenced recovery path confirms the old engine stopped. No schema
+migration is needed beyond rc15's additive migration `0006`. Eight paired
+disposable mock-serving runs, each with 100 QA requests at 100/s across four
+endpoints and 1,000 background waiters, completed every request without
+starvation. Enqueue-commit to send-intent p95 values in pair order (ms) were:
+
+| Version | Paired p95 samples (ms) | Median |
+| --- | --- | ---: |
+| rc16 | 854.62, 821.86, 825.56, 935.17, 842.69, 842.93, 719.85, 812.45 | 834.13 |
+| rc17 | 833.37, 774.84, 921.42, 918.36, 924.13, 888.15, 868.21, 938.18 | 903.26 |
+
+The rc17 median is 8.3% above rc16 on this test, within the accepted 15%
+release guard; individual pairs varied more. The planned p95 50 ms/p99 200 ms
+dispatch target remains open and requires separate coordinator architecture
+work. These synthetic runs are not stage load qualification.
+
+Version `0.2.0rc16` fixes a dispatcher ordering race exposed by concurrent
+enqueue: PostgreSQL's waiter `created_at` may precede the order in which
+transactions return to Python. Direct proxies now sort by the committed waiter
+timestamp and request ID, exactly matching the ledger's selection order. Without
+this, one endpoint could keep retrying a later request while an earlier waiter
+remained queued. The optional synthetic load harness is
+`tests/benchmarks/bench_dispatch.py`; run it explicitly against the guarded
+disposable `runtime_test` database. It uses mock serving, not LLM jobs. Its
+end-to-end latency includes database admission/settlement and must be measured
+again on stage hardware before declaring a throughput target met. On the
+disposable PostgreSQL database, 100 QA requests at 100/s across four endpoints
+with 1,000 background waiters all completed against mock serving, but
+enqueue-commit to send-intent was p95 730 ms/p99 747 ms, above the planned
+50 ms/200 ms dispatch target. The 10,000-waiter and 30-minute soak gates remain
+unverified; do not count this synthetic run as a load acceptance pass.
+
+Version `0.2.0rc15` adds migration `0006` and endpoint-scoped llama.cpp
+backpressure. Apply `python -m alembic upgrade head` before starting rc15 API,
+executor and reconciler processes; build the pinned wheel with `uv build` or
+`make build`. Keep old worker images for Temporal histories pinned to earlier
+build IDs. The schema is additive and old attempt owners retain their lease path.
+
+For llama.cpp, `admission.target` is an endpoint enable/drain setting, while
+`transport_limit` bounds all accepted HTTP inference and
+`background_transport_limit` bounds **combined** non-QA direct and durable
+inference. The engine's own parallel slots and FIFO remain its serving authority.
+For a measured answer/tool setup of 2/8 non-QA slots, set respectively
+`target=hard_ceiling=background_transport_limit=2` and `=8`, with
+`transport_limit=64` on each endpoint to leave QA headroom. The GPU group ceiling
+does not serialize LLM endpoints; native speech/embedding/rerank group limits
+remain. Set engine `--parallel` independently to 2/8 only after serving
+qualification. The default executor count is 8 and each LLM pool starts at most
+its lower-class cap in workers. These values are safety bounds, not a 4:1
+scheduling ratio or a measured production capacity claim.
+
+Authenticated application adapters bind `inference_scope` to a trusted workload
+class (`qa`, `user_task`, `background`, `maintenance`). QA classification follows
+the request through summary/tool subcalls. `DirectBinding.stream_events` exposes
+ordered `waiting`, `resumed`, `recovering`, `generation_reset` and token events;
+a stream is successful only after `[DONE]`. Waiting streams emit SSE heartbeats
+at most 15 seconds apart. No client retries uncertain inference. The host
+watchdog first calls `quiesce-engine --pool ... --epoch ... --token ...`, then
+`inspect-engine --pool ...`; only independently verified old container/child
+termination permits `confirm-epoch-stopped --pool ... --epoch ... --evidence
+'{...}' --recover`. After updating the engine epoch and running `configure`,
+runtime may retry a bounded leaf generation. A still-live engine may be resumed
+only by the same token via `resume-engine --pool ... --epoch ... --token ...` after
+unsettled compute reaches zero. Timeout alone never grants recovery.
+
+Version `0.2.0rc10` adds `DirectBinding`, `DirectRouting` and `inference_scope` for
+application callers. The binding supplies a scoped HTTP auth adapter and a direct
+profile URL; it never submits a workflow, changes payloads or retries inference.
+Bind verified request identity around the full response, including streaming, and
+propagate context into worker threads. Trusted startup probes use an explicit service
+identity. Missing identity or an unqualified endpoint/model fails before dispatch.
+Clients must disable their own SDK/stream retry loops and preserve native model
+configuration for compatibility checks. A binding alone does not cover every caller;
+complete the application inventory before enabling shared-pool production traffic.
+Schema remains `0005`; upgrade runtime API/executor/reconciler together first.
+
+Version `0.2.0rc9` extends direct HTTP admission to embedding and native reranking;
+schema remains `0005`. With `direct_enabled: true`, embedding uses its existing
+qualified profile at `/v1/direct/{model_profile}/api/v1/embed`. A rerank pool declares
+`kind="rerank"`, `character_limit` and `max_batch_size`; its `rerank` configuration
+contains `validated_profile_id`, `termination_contract="termination-v1"` and
+`max_response_bytes`. The native model/config revision must pin its candidate cap
+to this same batch size. `/v1/direct/{model_profile}/api/v1/rerank` preserves payload,
+top_k and score scale, accounting for the prefix that native serving processes.
+Empty candidate lists return locally without inference. Rerank has no background
+executor or new Temporal workflow type. Qualified bounds are required; no pool is
+enabled by default.
+
+Embedding/rerank require matching attempt, termination and model-revision evidence.
+Successful bodies are bounded and validated before publication: vector dimensions,
+batch count and model for embedding; finite scores and unique, valid original indices
+for rerank. Unknown termination remains accounted for even if HTTP has returned.
+Caller routing and coordinated deployment are still required for global coverage.
+
+Version `0.2.0rc8` adds migration `0005` and opt-in direct LLM admission. Apply the
+migration before upgrading runtime API/executors/reconciler together. Old executors
+do not count direct reservations: keep direct callers disabled until every runtime
+process uses this version. Existing worker-pinned workflows retain their images.
+The new endpoint does not submit Temporal workflows or persist conversation bytes.
+
+Set `direct_enabled: true` on one pool per model profile with its qualified
+`prompt_sizing` contract. Trusted services call
+`POST /v1/direct/{model_profile}/chat/completions` with the runtime service bearer
+token and verified `X-Tenant-ID`. The original OpenAI body is forwarded after
+validation. Omitting the output limit reserves the pool's full context bound;
+the proxy does not silently add or reduce an output limit. Capacity exhaustion
+returns 429 with `Retry-After`; clients must not retry uncertain inference silently.
+
+Foreground and background share pool/group counters, including drain, metrics,
+epoch confirmation and UNKNOWN reconciliation. Every fifth grant leaves a turn
+for a compatible READY background operation. Disconnect detaches the consumer;
+the proxy drains upstream until termination. A truncated stream, read timeout or
+process shutdown retains UNKNOWN rather than returning capacity. Epoch shutdown
+must be confirmed through the existing operator procedure. Runtime configuration
+and caller routing must both be deployed before claiming shared admission across
+the application; this release alone does not change AI/BE caller destinations.
+Embedding/rerank HTTP routes were added in rc9 as described above.
+
+Version `0.2.0rc7` restricts `llm_outcome` to known terminal inference errors.
+Exhausted root budgets, admission/policy failures, invalid configuration and
+unconfirmed transport failures propagate; they cannot become a successful content
+fallback. It retains `embedding_outcome` from rc6 and schema migration `0004`.
+Sampling, accepted-policy, speech, buffering, artifact and deadline contracts remain.
+Keep earlier worker images for executions pinned to their build; this changes the
+workflow branch taken after policy failures and requires a new deployment version.
+It is a release candidate;
+never replace an earlier wheel under the same filename. Commit each passing phase, build immutable images from
+that commit, then deploy and smoke-test those images before the next phase.
+
+The AI translation integration suite exercises partial batch acceptance, finite
+repair, publication retry and Continue-As-New through real Temporal/PostgreSQL.
+It uses fake inference and the application's real Markdown parser/renderer;
+these tests do not declare a production migration or measured serving capacity.
+
+The opt-in `tests/test_be_ingestion_parse.py` suite runs native BE text parsing
+through real Temporal/PostgreSQL. A downstream lost acknowledgement, root rollover
+and replay reuse the immutable parsed checkpoint without repeating source reads or
+parsing. It preserves accepted flags, source bytes and document ownership. Enable
+`RUNTIME_TEST_BE_FEATURES=yes` in the BE dependency environment; this case does not
+qualify external OCR, embedding, index publication or public ingestion routing.
+
+`tests/test_be_ingestion_chunk.py` adds native semantic/hybrid chunking and final
+embedding checkpoints. Lost record/publication acknowledgements, root and child
+rollovers and history replay repeat no committed embedding. Model vectors and
+parsed source are fixtures; the native CPU splitter/process, Temporal and budget
+ledger are real. These checks do not publish to application indexes.
+
+`tests/test_be_ingestion_publication.py` exercises the native BE publication worker
+with 65 generation-addressed batches, lost batch/receipt ACKs and root/child
+rollover/replay. Besides the BE opt-in, it requires explicit
+`INGESTION_TEST_MONGO_URI`, `INGESTION_TEST_ELASTIC_URL` and `INGESTION_TEST_QDRANT_URL`.
+It creates and removes only its UUID-named test database/indexes/collection. Real
+Temporal/PostgreSQL and index stores are used; parsed text/vectors are fixtures,
+and page-image publication/public ingestion routing are outside this case.
+
+`tests/test_be_ingestion_root.py` runs the application's `ingestion.document/v1`
+with native parsing and splitting, shared root embedding accounting, real publication
+stores and dedup. Lost dedup/embedding-record/publication ACKs and replay of every
+child/rollover retain one decision and the accepted configuration. A scoped alias
+does no embedding or index publication. Inference and page storage are fixtures;
+packaged PDF/DOCX/MinIO checks belong to infrastructure phase deployment. Public
+submission, cancellation and promotion-on-delete remain separate integration work.
+
+The opt-in `tests/test_ai_pptx_models.py` suite sends the application's native
+condense and brief prompts through real Temporal/PostgreSQL and the broker ledger.
+It verifies publication retry and history replay without new inference.
+`tests/test_ai_pptx_context.py` also exercises native document/corpus reading,
+bounded child windows, source and accepted-policy retention, mid-phase rollover,
+designated-primary selection and root accounting across all replayed histories.
+`tests/test_ai_pptx_planning.py` extends reading through deck planning, recorded
+schema repair, split batches and publication retry. It replays every child and
+planning rollover, verifies retained policy/output limits and settled root usage.
+`tests/test_ai_pptx_manuscript.py` qualifies manuscript waves, bounded native
+parse/audit repairs and a failed batch retaining the other slides. Lost join and
+publication acknowledgements, rollover and replay keep root usage settled without
+new inference. `tests/test_ai_pptx_validation.py` adds whole-deck coherence,
+ordered repair windows, layout persistence, lost acknowledgements and replay.
+An oversized audit is rejected by request preparation before admission; native
+deterministic repairs continue, and only dispatched repairs spend root budget.
+`tests/test_ai_pptx_render.py` runs a separate render queue, losing render and
+publication acknowledgements before replay. It verifies Temporal cancellation
+reaches the export subprocess through heartbeats and prevents publication.
+It also runs the application's complete `pptx/v1` root through all five phases,
+retains accepted queue/model/flags and tenant/root accounting, and replays every
+child and rollover without repeating inference or rendering on publication retry.
+Model/tokenizer responses, rendered file contents and feature artifacts are
+fixtures; Chromium image verification and public PPTX cutover remain application work.
+
+`tests/test_ai_pptx_webhook.py` hands a committed SQLite webhook outbox to
+`pptx.webhook/v1`, loses one receiver acknowledgement and restarts the worker: each
+delivery keeps one identity, secrets stay out of history and no inference is used.
+`tests/test_ai_pptx_native.py` does the same for `pptx.native/v1`: the native task
+row and its handoff are committed together, the worker dies mid-generation, and the
+retry replays the recorded model completion instead of calling the model again.
+A late retry of a completed task returns its status without generating twice.
+
+`RuntimeClient.llm_profile()` reads the authenticated
+`GET /v1/llm/profiles/{model_profile}` descriptor: context limit, profile identity,
+validated response formats and tool support. Persist it with agent planning state
+and reject a changed profile before reusing its journal; it is configuration, not
+live capacity or an admission permit. The HTTP driver preserves explicit boolean
+`parallel_tool_calls` alongside the tool transcript, while still issuing exactly
+one completion per admitted attempt and rejecting caller-controlled routing.
+
+Submission may include a separate immutable `configuration` artifact selected by
+the trusted application. Request identity remains the input digest and submission
+key; concurrent retries retain the first committed configuration and one start
+event. `TaskContext.configuration` carries that reference through children and
+Continue-As-New. Keep enable flags and credentials outside this snapshot.
+`map_children(window=...)` bounds each feature phase within `TaskPolicy.child_window`;
+it does not reserve inference capacity. Runs that record the
+`intramind.map_children.rolling` patch refill a finished child's slot at once; older
+histories replay the batch-barrier schedule. When `TaskContext.rolling_children()`
+is true, a feature that sliced items into window-sized calls may pass them in one
+call. These additions require matching API/SDK
+builds and are not present in the previously published wheel.
+
+`RuntimeClient.buffer()` accepts tenant-scoped immutable input/configuration
+artifacts, a partition key, a stable submission key, delay and batch size. Enable
+`buffering` bounds in the task catalog explicitly. The outbox process seals due
+inputs and starts a regular durable workflow; only one batch per tenant/task/partition
+is active. Lost artifact/submit ACKs reuse the frozen batch and root. Policy changes
+start a subsequent batch. Pending records do not expire or get trimmed; backpressure
+rejects new inputs. `get_buffered(item_id)` reports pending, root state or an explicit
+dispatch deadline failure. This facility does not require Celery Beat or Redis.
+
+`prepare(..., attempt_timeout_seconds=...)` carries a trusted total attempt limit
+outside the model payload. Values must be finite, positive numbers up to 86,400
+seconds. Existing operations without this field retain a 1,800-second default;
+the root deadline can shorten it. These are runtime bounds, not GPU capacity
+recommendations. Reservation time comes from PostgreSQL, and send intent rechecks
+expiry against its clock. The executor converts the remaining duration to an
+asyncio timer for payload loading and transport, then stops that timer before
+persisting a completed result. Transport timeouts remain separate limits.
+
+Expiry before transport permits retry/refund; expiry after send enters `UNKNOWN`
+and retains compute/budget accounting until termination is established. Neither
+the attempt deadline nor the worker lease proves that a backend has stopped.
+SDK calls without an explicit attempt limit retain the earlier activity command
+shape; new feature histories and policy schemas still require matching pinned
+worker builds. Reservation now includes its derived `attempt_deadline`; no new
+database column is needed because attempt creation time, operation policy and
+root deadline are already durable.
+
+An optional absolute `deadline` on `ctx.llm`, `ctx.speech`, `ctx.embedding` and `ctx.activity`
+bounds a feature phase across queueing, retries and worker recovery. Derive it
+once from the workflow clock and reuse it for every effect in that phase.
+`OperationDeadlineExceeded` lets the feature apply its explicit timeout policy;
+it is never replayed as a model error that permits schema repair. A broker outage
+cannot extend this wait. Operations already submitted retain their ledger and
+deadline even when the waiting activity times out.
+
+Expiry marks the operation terminal while independently running compute remains
+accounted for. Late output is retained as `late_terminal`, usage settles once,
+and neither lease recovery nor a late result can resurrect the operation. Only
+confirmed not-sent work can refund its reservation. Calls without a phase deadline
+keep their prior activity command shape. This is a source contract addition;
+upgrade the API, broker and SDK together and retain pinned workers for old histories.
+
+Embedding uses `TaskContext.embedding` and the same operation/attempt ledger,
+root attempt limit and resource-group admission. The trusted task catalog allocates
+`resource_budgets: {"embedding_characters": <positive limit>}` independently of LLM
+tokens and speech. Usage is the sum of input character counts, with a one-unit
+minimum per batch, including an all-empty batch. This is accounting, not a token
+or GPU-memory estimate. Migration `0004` extends the existing budget constraints;
+apply it before starting rc5 runtime services, keeping pinned workers for prior runs.
+
+An embedding pool declares `admission.kind="embedding"`, `character_limit` and
+`max_batch_size`. Its `embedding` configuration supplies `validated_profile_id`,
+`termination_contract="termination-v1"`, `model`, `dimension`, `max_text_characters`
+and `max_response_bytes`. Model revision, profile, per-text/batch bounds and vector
+dimensions must be qualified together. No embedding capacity is enabled by default.
+The app snapshots `embedding_profile`, calls `prepare_embedding`, and checkpoints
+each returned batch through `ctx.embedding`. The runtime preserves input order,
+empty texts and document/query semantics; it neither truncates input nor normalizes
+vectors. Chunking and model-native truncation policies belong to the accepted
+application/deployment profile.
+
+The embedding driver requires matching attempt/termination headers and the pinned
+model/config revision. A timeout or unconfirmed compute failure keeps UNKNOWN
+resource accounting. A completed response with invalid dimensions, nonfinite values
+or excessive bytes cannot be published; artifact persistence retries reuse the
+completed vectors. A real Temporal/PostgreSQL test covers batch accounting,
+downstream lost acknowledgement, rollover and history replay with fixture inference.
+
+Speech uses `TaskContext.speech` / `speech_outcome` with the same operation/attempt
+ledger, root attempt limit and resource-group admission. Its character budget is
+separate from LLM tokens: the trusted task catalog must allocate
+`resource_budgets: {"speech_characters": <positive limit>}`. Missing allocation is
+rejected, and retries/fallback do not receive a new root budget. Migration `0002`
+adds the resource ledger and labels existing attempts as `tokens`; it preserves
+their active reservations. Install it before starting the new runtime processes.
+
+A speech pool declares `admission.kind="speech"` and `character_limit` instead
+of `context_limit`. The pool's `speech` configuration contains
+`validated_profile_id`, `termination_contract="termination-v1"`, `sample_rate`,
+`max_audio_bytes` and the allowed `voices`. The validated profile ID must match
+the admission profile. `base_url` belongs to this deployment configuration;
+`api_key_env` is optional for an isolated, unauthenticated serving deployment.
+Pool/group ceilings and profile limits require measurement; no speech capacity
+is enabled by the example configuration.
+
+The consuming app checkpoints `GET /v1/speech/profiles/{model_profile}`, then uses
+`prepare_speech` with that profile ID and its captured attempt timeout. Changed
+profiles fail explicitly. The driver requires the serving response to echo its
+attempt ID, `X-Intramind-TTS-Contract: termination-v1` and a compute state of
+`not_started` or `terminated`. Unconfirmed responses/timeouts retain UNKNOWN
+accounting. Headers are termination evidence, not idempotency or remote fencing.
+There is no backend status/cancel API; unresolved compute still needs reconciliation.
+WAV bytes and their result manifest are immutable, separately recorded artifacts;
+persistence retry never synthesizes again. Binary data never enters workflow history.
+
+Artifact uploads stream into a temporary file before MinIO publication. JSON and
+`+json` media types retain a 16 MiB input limit; binary artifacts default to 128 MiB
+to cover long WAV fallback. `RUNTIME_ARTIFACT_MAX_BYTES` may lower the shared API
+and storage limit, and `RUNTIME_ARTIFACT_UPLOAD_CONCURRENCY` defaults to two uploads
+per API process. Excess uploads receive 503 with Retry-After before reading the
+body. Declared and received lengths are checked independently. MinIO multipart
+upload uses one part worker, and checksum verification reads fixed-size chunks.
+Temporary files and upload capacity are retained until storage I/O has stopped
+on cancellation; only verified objects produce a reference. Orphan immutable
+objects from lost responses still need the artifact retention/cleanup policy.
+
+Provision temporary storage for the configured simultaneous uploads (256 MiB at
+the defaults). If `/tmp` is a tmpfs, that space counts against container memory;
+this upload bound does not qualify download/render memory or GPU capacity. Custom
+`ArtifactPort` adapters must support seekable, caller-owned files via `put_file`.
+The existing published wheel does not include this contract extension.
+
+Service commands are `intramind-runtime api|worker|executor|outbox|reconciler|configure`.
+They require explicit `RUNTIME_*` configuration. An application installs matching
+schema migrations and provisions its namespace, storage bucket and pools before
+starting workers. The API never initializes tables at startup.
