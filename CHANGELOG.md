@@ -101,7 +101,7 @@
   dispatch p95 medians were 834.13 ms (rc16) and 903.26 ms (rc17): +8.3%,
   within the accepted 15% release guard. The p95 50 ms/p99 200 ms dispatch
   target remains open for separate coordinator architecture work; all individual
-  paired p95 values are recorded in README.
+  paired p95 values are recorded in docs/contracts.md.
 
 ## 0.2.0rc16 — unreleased
 
